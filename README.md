@@ -1,5 +1,7 @@
 # wp-static-clone
 
+[![ci](https://github.com/upchui/wp-static-clone/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/upchui/wp-static-clone/actions/workflows/ci.yml)
+
 Pulls a **self-contained static mirror** of a WordPress site (or any other CMS site): sitemap-driven crawl, all assets mirrored, URL structure preserved 1:1, plus ready-to-use nginx/Docker deployment files and a verification report.
 
 The result renders exactly like the live site when served over HTTP — without a single request to the origin domain for its own resources.
