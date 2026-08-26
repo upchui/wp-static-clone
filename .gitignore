@@ -1,0 +1,46 @@
+# --- generated export mirrors (output of -o/--out) ------------------------
+# Default output is ./export; any mirror produced via --out, together with the
+# generated deploy files (public/, report.*, nginx.conf, Dockerfile,
+# server.sh, mobile-variants/), is reproducible and does not belong
+# in the repo.
+/export/
+/export-*/
+/out/
+/output/
+
+# If output directories live elsewhere, they are recognizable by these
+# generated markers -- ignore them name-independently as well, to be safe:
+**/public/
+report.txt
+report.json
+mobile-variants/
+
+# --- Python ---------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Test / tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# --- Editors / OS ----------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
