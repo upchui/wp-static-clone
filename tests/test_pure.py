@@ -167,3 +167,26 @@ def test_normalize_html_detects_real_difference(mod):
     a = mod.normalize_html(b"<h1>Desktop</h1>")
     b = mod.normalize_html(b"<h1>Mobile</h1>")
     assert a != b
+
+
+# -- decode_text_asset / robots_rule_re -------------------------------------
+
+class _FakeResp:
+    def __init__(self, content, ctype):
+        self.content = content
+        self.headers = {"Content-Type": ctype}
+
+
+def test_decode_text_asset_quoted_charset(mod):
+    r = _FakeResp("a{content:'ü'}".encode("iso-8859-15"),
+                  'text/css; charset="iso-8859-15"')
+    assert "ü" in mod.decode_text_asset(r)
+    r2 = _FakeResp("a{content:'→'}".encode("utf-8"), "text/css")
+    assert "→" in mod.decode_text_asset(r2)
+
+
+def test_robots_rule_re(mod):
+    assert mod.robots_rule_re("/privat/").match("/privat/x")
+    assert not mod.robots_rule_re("/privat/").match("/x/privat/")
+    assert mod.robots_rule_re("/*.zip$").match("/dl/a.zip")
+    assert not mod.robots_rule_re("/*.zip$").match("/dl/a.zipx")

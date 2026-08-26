@@ -280,3 +280,129 @@ def test_safe_redirect_rules_keeps_query(exporter):
     ]
     rules = exporter._safe_redirect_rules()
     assert rules == [("/a", "/b?x=1")]          # query kept; query-source dropped
+
+
+# -- v1.3.0: redirect regressions, ports, robots, exclude, streaming --------
+
+def test_query_self_redirect_emits_no_rule(exporter):
+    exporter.redirects = [
+        {"from": "https://example.at/a/", "to": "https://example.at/a/?x=1",
+         "status": 301},
+        {"from": "https://example.at/alt", "to": "https://example.at/neu/",
+         "status": 301},
+    ]
+    assert exporter._safe_redirect_rules() == [("/alt", "/neu/")]
+
+
+def test_redirect_rule_suffix_only_with_query(mod, tmp_path):
+    e = mod.Exporter(mod.Config(base_url="https://example.at",
+                                out_dir=tmp_path / "o"))
+    e.public_dir.mkdir(parents=True)
+    e.redirects = [
+        {"from": "https://example.at/q", "to": "https://example.at/z/?r=1",
+         "status": 301},
+        {"from": "https://example.at/p", "to": "https://example.at/z/",
+         "status": 301},
+    ]
+    e.write_deploy_files()
+    inc = (e.cfg.out_dir / "redirects.inc").read_text()
+    assert 'rewrite "^/q$" "/z/?r=1?" permanent;' in inc     # own query: no args
+    assert 'rewrite "^/p$" "/z/" permanent;' in inc          # visitor args survive
+
+
+def test_default_ports_internal(exporter):
+    assert exporter.is_internal("https://example.at:443/x")
+    assert exporter.is_internal("http://example.at:80/x")
+    assert not exporter.is_internal("https://example.at:8443/x")
+    assert exporter.localize_text("https://example.at:443/x") == "/x"
+
+
+def test_loc_prefix_forwarded_proto(mod, tmp_path):
+    e = mod.Exporter(mod.Config(
+        base_url="http://10.0.0.5:8080", host_header="example.at",
+        extra_headers={"X-Forwarded-Proto": "https"}, out_dir=tmp_path / "o"))
+    assert e._loc_prefix() == "https://example.at"
+    e2 = mod.Exporter(mod.Config(base_url="http://127.0.0.1:8123",
+                                 out_dir=tmp_path / "o2"))
+    assert e2._loc_prefix() == "http://127.0.0.1:8123"
+
+
+def test_policy_check_exact_names_below_top_level(mod, tmp_path):
+    e = mod.Exporter(mod.Config(base_url="https://example.at",
+                                out_dir=tmp_path / "o"))
+    up = e.public_dir / "wp-content" / "uploads"
+    up.mkdir(parents=True)
+    (up / "wp-login-screenshot.png").write_bytes(b"x")       # innocent
+    (up / "wp-json").mkdir()                                 # real artifact
+    (e.public_dir / "wp-login.php").write_bytes(b"x")        # top-level prefix
+    (e.public_dir / "index.html").write_text("<html></html>")
+    e.verify_export()
+    flagged = {v["file"] for v in e.verify_unexpected}
+    assert "wp-login.php" in flagged
+    assert "wp-content/uploads/wp-json" in flagged
+    assert not any("screenshot" in f for f in flagged)
+
+
+def test_origin_sitemap_paths_get_301(mod, tmp_path):
+    e = mod.Exporter(mod.Config(base_url="https://example.at",
+                                out_dir=tmp_path / "o"))
+    e.public_dir.mkdir(parents=True)
+    e.generated_sitemap = {"url_count": 1}
+    e.origin_sitemap_paths = ["/sitemap_index.xml", "/page-sitemap.xml"]
+    e.write_deploy_files()
+    inc = (e.cfg.out_dir / "redirects.inc").read_text()
+    assert 'rewrite "^/sitemap_index\\.xml$" "/sitemap.xml" permanent;' in inc
+    assert 'rewrite "^/page\\-sitemap\\.xml$" "/sitemap.xml" permanent;' in inc
+    assert "/sitemap_index.xml /sitemap.xml 301" in \
+        (e.public_dir / "_redirects").read_text()
+
+
+def test_write_bytes_returns_written_path(exporter, tmp_path):
+    exporter.public_dir.mkdir(parents=True, exist_ok=True)
+    t = exporter.public_dir / "a.txt"
+    assert exporter.write_bytes(t, b"x") == t
+    assert exporter.write_bytes(t, b"y") is None            # first write wins
+    d = exporter.public_dir / "dir"
+    d.mkdir()
+    assert exporter.write_bytes(d, b"z") == d / "index.html"
+
+
+def test_exclude_patterns(mod, tmp_path):
+    e = mod.Exporter(mod.Config(base_url="https://example.at",
+                                out_dir=tmp_path / "o",
+                                excludes=[r"^/members/", r"\.zip$"]))
+    assert e.normalize_page_url("https://example.at/members/x/") is None
+    assert e.normalize_page_url("https://example.at/blog/") is not None
+    assert e.is_excluded("https://example.at/dl/a.zip")
+    assert "/members/x/" in e.excluded_urls
+
+
+def test_respect_robots_rules(mod, tmp_path):
+    e = mod.Exporter(mod.Config(base_url="https://example.at",
+                                out_dir=tmp_path / "o", respect_robots=True))
+    e._parse_robots("User-agent: Googlebot\nDisallow: /only-google/\n\n"
+                    "User-agent: *\nDisallow: /privat/\nAllow: /privat/ok/\n"
+                    "Crawl-delay: 2\n")
+    assert e.robots_crawl_delay == 2.0
+    assert e.is_excluded("/privat/x")
+    assert not e.is_excluded("/privat/ok/y")                # longest match wins
+    assert not e.is_excluded("/only-google/x")              # other UA group
+
+
+def test_write_stream(exporter):
+    exporter.public_dir.mkdir(parents=True, exist_ok=True)
+
+    class FakeStream:
+        closed = False
+        def iter_content(self, chunk_size):
+            yield b"%PDF-1.4 "
+            yield b"data" * 1000
+        def close(self):
+            self.closed = True
+
+    target = exporter.public_dir / "doc.pdf"
+    resp = FakeStream()
+    assert exporter.write_stream(target, resp)
+    assert resp.closed
+    assert target.read_bytes().startswith(b"%PDF-1.4")
+    assert not exporter.write_stream(target, FakeStream())  # first write wins

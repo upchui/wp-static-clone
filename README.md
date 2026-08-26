@@ -10,7 +10,7 @@ The result renders exactly like the live site when served over HTTP — without 
 
 ## Installation
 
-Only `requests` and `beautifulsoup4` are required (Python 3.10+).
+Only `requests` and `beautifulsoup4` are required (Python 3.10+, Linux/macOS — URLs containing NTFS-illegal characters produce per-file warnings on Windows).
 
 ```bash
 python3 -m venv .venv
@@ -110,7 +110,7 @@ Form submissions (e.g. WPForms), consent/analytics AJAX and WordPress search nee
 The export is SEO-complete out of the box:
 
 - **Generated sitemap** — a fresh `/sitemap.xml` is written from the URL set the origin sitemap declared and the export contains: `noindex` pages, redirect sources and canonical mismatches are excluded, and pages only discovered via links (WP attachment pages, cache artifacts) stay out unless you pass `--sitemap-include-linked`. `<lastmod>` comes from the `Last-Modified` header. The `robots.txt` `Sitemap:` line is pointed at it (a missing robots.txt is generated). `--no-generate-sitemap` keeps the origin sitemap files instead (unchanged except the localized XSL reference). After a domain move, submit `/sitemap.xml` in Search Console once.
-- **One canonical URL per page** — the generated nginx config 301s `/page` → `/page/` (matching the exported structure) and serves the redirects observed on the origin as real 301s (`redirects.inc`). Redirect stubs carry `noindex`; `/404.html` answers 404 instead of an indexable 200.
+- **One canonical URL per page** — the generated nginx config 301s `/page` → `/page/` (matching the exported structure) and serves the redirects observed on the origin as real 301s (`redirects.inc`), visitor query strings included; old origin sitemap URLs 301 onto the generated `/sitemap.xml`. Redirect stubs carry `noindex`; `/404.html` answers 404 instead of an indexable 200. On Netlify and Apache the trailing-slash canonicalization comes from the platform itself (Pretty URLs / `DirectorySlash`, both on by default).
 - **WordPress cruft removed** — generator meta, wp-json/oEmbed/feed discovery, EditURI/RSD, wlwmanifest, pingback, `?p=` shortlinks and the Cloudflare Insights beacon (which only produces CORS errors off Cloudflare) are stripped. `canonical`, `hreflang`, `og:*`/`twitter:*` and JSON-LD stay. Disable with `--no-strip-wp-cruft`.
 - **Image optimization** — `loading="lazy"` + `decoding="async"` on images (except each page's first image and plugin-lazyloaded ones) and `width`/`height` attributes read straight from the local PNG/JPEG/GIF/WebP headers (CLS). Disable with `--no-optimize-images`.
 
@@ -154,9 +154,13 @@ For non-Docker nginx, check the module with `nginx -V 2>&1 | grep -o with-http_s
 | `--staging` | full noindex mode (robots.txt, `X-Robots-Tag`, meta robots) for previews |
 | `--target-domain D` | hard-rewrite canonical/og/JSON-LD/sitemap URLs to domain `D` (Netlify/Apache) |
 | `--sitemap-include-linked` | also list link-discovered pages in the generated sitemap |
-| `--fail-on {none,errors,verify}` | CI exit-code policy (`verify` → exit 2 on verification findings) |
+| `--fail-on {none,errors,verify}` | CI exit-code policy, see below |
+| `--exclude REGEX` | skip pages and assets whose URL path matches (repeatable) |
+| `--respect-robots` | honor robots.txt Allow/Disallow (`*`/`$` supported) and Crawl-delay |
 | `-q, --quiet` | suppress per-round progress output |
 | `--version` | print version and exit |
+
+**Exit codes**: `0` success · `1` no page exported, or (with `--fail-on errors|verify`) page/asset errors or a `--max-pages`-truncated crawl · `2` (with `--fail-on verify`) the self-containedness verification found problems · `130` aborted with Ctrl-C.
 
 Full list including examples: `wp-static-export.py --help`.
 

@@ -14,7 +14,9 @@ from test_pure import png_bytes
 FIXTURE_SRC = Path(__file__).parent / "fixture"
 
 REDIRECTS = {"/alt/": "/ueber-uns/", "/alt": "/ueber-uns/",
-             "/alt2": "/ueber-uns/?ref=alt2", "/alt2/": "/ueber-uns/?ref=alt2"}
+             "/alt2": "/ueber-uns/?ref=alt2", "/alt2/": "/ueber-uns/?ref=alt2",
+             # query-only self-redirect (consent/region plugin pattern)
+             "/loop": "/loop/?x=1", "/loop/": "/loop/?x=1"}
 
 
 def _make_handler(root: Path):
@@ -24,7 +26,7 @@ def _make_handler(root: Path):
 
         def do_GET(self):
             path = self.path.split("?", 1)[0]
-            if path in REDIRECTS:
+            if path in REDIRECTS and "?" not in self.path:
                 self.send_response(301)
                 self.send_header("Location", REDIRECTS[path])
                 self.end_headers()
@@ -87,6 +89,7 @@ def export(mod, tmp_path_factory):
                        ("lazyplugin.png", 100, 50), ("bg.png", 10, 10),
                        ("inline.png", 10, 10), ("notfound.png", 20, 20)):
         (uploads / name).write_bytes(png_bytes(w, h))
+    (uploads / "dokument.pdf").write_bytes(b"%PDF-1.4\n" + b"stream" * 500)
 
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -168,10 +171,42 @@ def test_robots_points_at_generated_sitemap(export):
 
 def test_redirects_keep_query(export):
     inc = (export["out"] / "redirects.inc").read_text()
-    assert 'rewrite "^/alt/$" "/ueber-uns/?" permanent;' in inc
-    assert 'rewrite "^/alt2/$" "/ueber-uns/?ref=alt2?" permanent;' in inc  # A4
+    # queryless target: NO trailing ? -- visitor args (?utm_...) must be
+    # forwarded by nginx
+    assert 'rewrite "^/alt/$" "/ueber-uns/" permanent;' in inc
+    assert 'rewrite "^/alt2/$" "/ueber-uns/?ref=alt2?" permanent;' in inc
     ht = (export["public"] / ".htaccess").read_text()
     assert 'RedirectMatch 301 "^/alt2/$" "/ueber-uns/?ref=alt2"' in ht
+
+
+def test_query_self_redirect_no_loop(export):
+    # /loop/ 301s to /loop/?x=1 on the origin -- the export must contain the
+    # real page and NO rule (a rule would 301-loop forever)
+    inc = (export["out"] / "redirects.inc").read_text()
+    assert "/loop" not in inc
+    page = (export["public"] / "loop" / "index.html").read_text()
+    assert "Echter Inhalt der Loop-Seite" in page
+    xml = (export["public"] / "sitemap.xml").read_text()
+    assert f"<loc>{export['origin']}/loop/</loc>" in xml
+
+
+def test_query_redirect_different_path_gets_stub(export):
+    # /alt2/ redirects onto /ueber-uns/?ref=alt2 -- a noindex stub, never a
+    # duplicate copy of the target page
+    stub = (export["public"] / "alt2" / "index.html").read_text()
+    assert 'content="noindex"' in stub
+    assert "url=/ueber-uns/?ref=alt2" in stub
+    assert "Fixture" not in stub                # no copied page body
+
+
+def test_origin_sitemap_301(export):
+    inc = (export["out"] / "redirects.inc").read_text()
+    assert 'rewrite "^/sitemap_index\\.xml$" "/sitemap.xml" permanent;' in inc
+
+
+def test_media_streamed(export):
+    pdf = export["public"] / "wp-content" / "uploads" / "dokument.pdf"
+    assert pdf.read_bytes().startswith(b"%PDF-1.4")
 
 
 def test_redirect_stub_noindexed(export):
