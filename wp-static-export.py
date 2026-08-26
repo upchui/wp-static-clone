@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 #
 # wp-static-export -- SEO-aware static site exporter for WordPress (or any CMS).
-# Copyright (C) 2026 huthanslhd@gmail.com
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -35,15 +34,35 @@ What it does
 
 SEO behaviour
 -------------
-* robots.txt, every sitemap XML and their XSL stylesheets are part of the
-  export, so the static site still exposes its sitemap to crawlers.
+* A fresh /sitemap.xml is generated from the URL set that actually made it
+  into the export (noindex'ed pages, redirect sources and canonical
+  mismatches excluded, <lastmod> from the Last-Modified header), and the
+  robots.txt Sitemap: line is pointed at it. --no-generate-sitemap instead
+  keeps the origin sitemaps byte-for-byte, XSL stylesheets included.
+  A missing robots.txt is generated.
 * By default, same-site URLs are rewritten to root-relative -- in ALL the
   forms page builders emit them: plain absolute, protocol-relative
   (//host/...), JSON-escaped (backslash-escaped slashes) in inline scripts,
   and base64-encoded lazy-load attributes (Slider Revolution data-dbsrc).
   The export is self-contained and renders 1:1 from any hostname.
-  canonical / rel=alternate links, og:*/twitter:* meta tags and JSON-LD
-  are intentionally left absolute (SEO data, never fetched by browsers).
+  canonical / rel=alternate links, og:*/twitter:* meta tags, JSON-LD and
+  sitemap <loc> entries are intentionally left absolute (SEO data, never
+  fetched by browsers). The generated nginx config swaps the origin host
+  for the actually requested one at serve time (sub_filter), so those
+  signals are correct on ANY domain without re-exporting; for hosts
+  without serve-time substitution (Netlify, Apache), --target-domain
+  hard-rewrites them to the new domain at export time instead.
+* WordPress head cruft that only points at dynamic origin infrastructure
+  (generator meta, wp-json REST + oEmbed + feed discovery, EditURI/RSD,
+  wlwmanifest, pingback, ?p= shortlinks) is stripped; --no-strip-wp-cruft
+  keeps it. canonical / hreflang / og: / twitter: / JSON-LD stay.
+* <img> tags get loading="lazy" + decoding="async" (except the first image
+  per page and plugin-lazyloaded ones) and, where the local file's header
+  reveals them, width/height attributes against layout shift (CLS).
+  Disable with --no-optimize-images.
+* --staging deploys the mirror invisible to search engines: robots.txt
+  'Disallow: /', an X-Robots-Tag: noindex header in the server configs and
+  a noindex robots meta injected into every page.
 * --no-rewrite instead keeps HTML pages BYTE-IDENTICAL to the server
   response (nothing re-serialized); the export then only renders correctly
   when served under the original hostname.
@@ -79,8 +98,13 @@ pages. Disable the comparison with --no-mobile-check.
 
 Deployment helpers
 ------------------
-nginx.conf and a Dockerfile are generated next to the export, so
-`docker build` in the output directory gives you a ready-to-run container.
+nginx.conf (serve-time domain substitution, active 301s for the redirects
+observed on the origin, trailing-slash canonicalization, a non-indexable
+404.html) plus redirects.inc and a Dockerfile are generated next to the
+export, so `docker build` in the output directory gives you a ready-to-run
+container. public/_redirects (Netlify) and public/.htaccess (Apache) cover
+the same redirects on those platforms -- combine with --target-domain
+there, since neither substitutes the host at serve time.
 
 Usage
 -----
@@ -116,6 +140,7 @@ import unicodedata
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from urllib.parse import urljoin, urlsplit, urlunsplit, unquote, quote
 
@@ -125,7 +150,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 TOOL_NAME = "wp-static-export"
-VERSION = "1.0.1"
+VERSION = "1.1.0"
 
 # --------------------------------------------------------------------------
 # Classification helpers
@@ -244,6 +269,67 @@ def try_b64_url(val: str) -> str | None:
     return None
 
 
+def read_image_size(path: Path) -> tuple[int, int] | None:
+    """Pixel size straight from the file header -- PNG/GIF/JPEG/WebP,
+    no image library needed. None for other formats or malformed files."""
+    try:
+        with path.open("rb") as fh:
+            head = fh.read(32)
+            if head.startswith(b"\x89PNG\r\n\x1a\n") and head[12:16] == b"IHDR":
+                w = int.from_bytes(head[16:20], "big")
+                h = int.from_bytes(head[20:24], "big")
+                return (w, h) if w and h else None
+            if head[:6] in (b"GIF87a", b"GIF89a"):
+                w = int.from_bytes(head[6:8], "little")
+                h = int.from_bytes(head[8:10], "little")
+                return (w, h) if w and h else None
+            if head.startswith(b"RIFF") and head[8:12] == b"WEBP":
+                fmt = head[12:16]
+                if fmt == b"VP8X":
+                    return (int.from_bytes(head[24:27], "little") + 1,
+                            int.from_bytes(head[27:30], "little") + 1)
+                if fmt == b"VP8L" and len(head) >= 25 and head[20] == 0x2F:
+                    bits = int.from_bytes(head[21:25], "little")
+                    return (bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1
+                if fmt == b"VP8 " and head[23:26] == b"\x9d\x01\x2a":
+                    w = int.from_bytes(head[26:28], "little") & 0x3FFF
+                    h = int.from_bytes(head[28:30], "little") & 0x3FFF
+                    return (w, h) if w and h else None
+                return None
+            if head.startswith(b"\xff\xd8"):        # JPEG: scan for a SOF marker
+                fh.seek(2)
+                while True:
+                    marker = fh.read(2)
+                    if len(marker) < 2 or marker[0] != 0xFF:
+                        return None
+                    code = marker[1]
+                    while code == 0xFF:             # fill bytes
+                        nxt = fh.read(1)
+                        if not nxt:
+                            return None
+                        code = nxt[0]
+                    if code in (0x01,) or 0xD0 <= code <= 0xD8:
+                        continue                    # standalone marker
+                    seg = fh.read(2)
+                    if len(seg) < 2:
+                        return None
+                    seglen = int.from_bytes(seg, "big")
+                    if seglen < 2:
+                        return None
+                    if code in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
+                                0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
+                        body = fh.read(5)
+                        if len(body) < 5:
+                            return None
+                        h = int.from_bytes(body[1:3], "big")
+                        w = int.from_bytes(body[3:5], "big")
+                        return (w, h) if w and h else None
+                    fh.seek(seglen - 2, 1)
+    except OSError:
+        return None
+    return None
+
+
 class HostResolveAdapter(HTTPAdapter):
     """HTTPAdapter that pins TLS SNI / certificate verification to a fixed
     hostname while the URL targets an IP address -- the requests-level
@@ -287,6 +373,11 @@ class Config:
     extra_sitemaps: list = field(default_factory=list)
     mobile_check: bool = True
     mobile_user_agent: str = MOBILE_UA
+    generate_sitemap: bool = True
+    strip_wp_cruft: bool = True
+    optimize_images: bool = True
+    staging: bool = False
+    target_domain: str | None = None
 
 
 @dataclass
@@ -304,6 +395,9 @@ class PageRecord:
     content_type: str = ""
     source: str = "sitemap"          # sitemap | link | manual
     mobile: str = ""                 # same | different | dynamic | check-failed
+    last_modified: str = ""          # raw Last-Modified response header
+    save_url: str = ""               # canonical URL the content was saved under
+                                     # (differs from url for redirect sources)
 
 
 class Exporter:
@@ -323,6 +417,11 @@ class Exporter:
         if cfg.host_header and self.connect_norm != self.base_norm:
             self.internal_norms.add(self.connect_norm)
         self.public_dir = cfg.out_dir / "public"
+        # --target-domain: SEO-bearing origin URLs (canonical, og:*, JSON-LD,
+        # sitemap <loc>, robots.txt) get this prefix instead of staying on
+        # the origin host -- for hosts without serve-time substitution
+        self.target_prefix = (f"https://{cfg.target_domain}"
+                              if cfg.target_domain else "")
 
         # host-matching regexes for URL localization; cover the www. variant
         # and every textual form page builders emit: plain absolute,
@@ -378,6 +477,14 @@ class Exporter:
         self.pages: list[PageRecord] = []
         self.asset_errors: list[dict] = []
         self.redirects: list[dict] = []
+        self.robots_txt_found = False
+        self.robots_action = "unchanged"   # what finalize_robots() did
+        self.generated_sitemap: dict | None = None
+        self.cruft_removed: dict[str, int] = {}
+        self.stats_lock = threading.Lock()
+        self.img_stats = {"lazy": 0, "dimensions": 0,
+                          "skipped_plugin": 0, "unparsed": 0}
+        self.deploy_info: dict = {}
         self.skipped_query_urls: set[str] = set()
         self.external_hosts: set[str] = set()
         self.sitemap_files: list[str] = []
@@ -541,12 +648,14 @@ class Exporter:
         try:
             resp = self.fetch(robots_url)
             if resp.ok and resp.content:
+                self.robots_txt_found = True
                 target = self.local_path_for(robots_url, is_page=False)
                 if target:
                     self.write_bytes(target, resp.content)
                 for m in SITEMAP_LINE_RE.finditer(resp.text):
                     sitemap_candidates.append(m.group(1).strip())
-                if re.search(r"(?im)^\s*disallow:\s*/\s*$", resp.text):
+                if not self.cfg.staging and re.search(
+                        r"(?im)^\s*disallow:\s*/\s*$", resp.text):
                     self.warnings.append(
                         "robots.txt contains 'Disallow: /' -- the site is blocked "
                         "for crawlers. Intentional?")
@@ -616,29 +725,35 @@ class Exporter:
         if local_name(root.tag) not in ("sitemapindex", "urlset"):
             return []
 
-        # keep the sitemap file itself in the export
-        data = resp.content
-        if self.cfg.rewrite:
-            # localize the xml-stylesheet PI so the sitemap renders without
-            # the origin; <loc> entries deliberately stay absolute (SEO)
-            pi = XML_STYLESHEET_RE.search(data[:2048].decode("utf-8", "replace"))
-            if pi:
-                xsl_abs = urljoin(url, pi.group(1))
-                if self.is_internal(xsl_abs):
-                    local = self.localize_url(self.to_base_host(xsl_abs))
-                    data = data.replace(pi.group(1).encode("utf-8"),
-                                        local.encode("utf-8"), 1)
-        target = self.local_path_for(url, is_page=False)
-        if target:
-            self.write_bytes(target, data)
-            self.sitemap_files.append(urlsplit(url).path)
+        # keep the origin sitemap file itself in the export -- only when no
+        # fresh sitemap is generated from the exported URL set (default is
+        # generation; shipping both, with the origin one listing dropped
+        # query URLs / noindexed / redirected pages, would be worse)
+        if not self.cfg.generate_sitemap:
+            data = resp.content
+            if self.cfg.rewrite:
+                # localize the xml-stylesheet PI so the sitemap renders
+                # without the origin; <loc> entries deliberately stay
+                # absolute (SEO)
+                pi = XML_STYLESHEET_RE.search(
+                    data[:2048].decode("utf-8", "replace"))
+                if pi:
+                    xsl_abs = urljoin(url, pi.group(1))
+                    if self.is_internal(xsl_abs):
+                        local = self.localize_url(self.to_base_host(xsl_abs))
+                        data = data.replace(pi.group(1).encode("utf-8"),
+                                            local.encode("utf-8"), 1)
+            target = self.local_path_for(url, is_page=False)
+            if target:
+                self.write_bytes(target, data)
+                self.sitemap_files.append(urlsplit(url).path)
 
-        # XSL stylesheet referenced via processing instruction
-        head = resp.content[:2048].decode("utf-8", "replace")
-        for m in XML_STYLESHEET_RE.finditer(head):
-            xsl = urljoin(url, m.group(1))
-            if self.is_internal(xsl):
-                self.asset_urls_seen.add(self.to_base_host(xsl))
+            # XSL stylesheet referenced via processing instruction
+            head = resp.content[:2048].decode("utf-8", "replace")
+            for m in XML_STYLESHEET_RE.finditer(head):
+                xsl = urljoin(url, m.group(1))
+                if self.is_internal(xsl):
+                    self.asset_urls_seen.add(self.to_base_host(xsl))
 
         urls: list[str] = []
         if local_name(root.tag) == "sitemapindex":
@@ -753,6 +868,7 @@ class Exporter:
         rec.status = resp.status_code
         rec.final_url = resp.url
         rec.content_type = (resp.headers.get("Content-Type") or "").split(";")[0]
+        rec.last_modified = resp.headers.get("Last-Modified", "")
 
         if resp.history:
             self.redirects.append({
@@ -807,15 +923,19 @@ class Exporter:
             self.vary_ua_pages.append(url)
 
         save_url = self.normalize_page_url(self.to_base_host(resp.url)) or url
+        rec.save_url = save_url
         if resp.history and self.cfg.rewrite and save_url != url:
             # keep redirect sources working in the static mirror: a
-            # meta-refresh stub at the original path points to the target
+            # meta-refresh stub at the original path points to the target.
+            # noindex'ed so the weak meta-refresh signal never competes with
+            # the real page (the nginx config 301s this path anyway).
             src_target = self.local_path_for(url, is_page=True)
             if src_target:
                 dest = self.localize_url(save_url)
                 stub = ('<!doctype html><html><head><meta charset="utf-8">'
+                        '<meta name="robots" content="noindex">'
                         f'<meta http-equiv="refresh" content="0;url={dest}">'
-                        f'<link rel="canonical" href="{save_url}">'
+                        f'<link rel="canonical" href="{self.retarget_url(save_url)}">'
                         '<title>Redirect</title></head>'
                         f'<body><a href="{dest}">{dest}</a></body></html>')
                 self.write_bytes(src_target, stub.encode("utf-8"))
@@ -897,9 +1017,17 @@ class Exporter:
                 elif "?" in u:
                     self.warnings.append(
                         f"AMP variant uses a query-string URL and was skipped: {absolute}")
-            elif tag_name == "link" and rel & {"canonical", "alternate", "next",
-                                               "prev", "shortlink", "pingback"}:
+            elif tag_name == "link" and rel & {"next", "prev"}:
+                # paginated archives often surface only here
+                n = self.normalize_page_url(absolute)
+                if n:
+                    new_pages.append(n)
+            elif tag_name == "link" and rel & {"canonical", "alternate",
+                                               "shortlink", "pingback"}:
                 return  # SEO/meta links, never fetched as assets
+            elif (tag_name == "link" and rel & {"wlwmanifest", "edituri"}
+                    and self.cfg.rewrite and self.cfg.strip_wp_cruft):
+                return  # tag gets stripped -- don't mirror its target either
             else:
                 if PAGE_SKIP_PATTERNS.search(urlsplit(absolute).path):
                     return  # dynamic endpoints (wp-json, xmlrpc, ...) --
@@ -999,6 +1127,8 @@ class Exporter:
         target = save_as or self.local_path_for(page_url, is_page=True)
         if target:
             if self.cfg.rewrite:
+                if self.cfg.strip_wp_cruft:
+                    self.strip_wp_cruft(soup)
                 self.rewrite_soup_relative(soup)
                 self.write_bytes(target, str(soup).encode("utf-8"))
             else:
@@ -1088,17 +1218,35 @@ class Exporter:
             rel += "#" + s.fragment
         return rel
 
-    def localize_text(self, text: str) -> str:
-        """Host-strip every textual URL form (plain, protocol-relative,
-        JSON-escaped) inside JS/CSS/JSON text."""
+    def _replace_host(self, text: str, prefix: str) -> str:
+        """Replace every textual origin-URL form (plain, protocol-relative,
+        JSON-escaped): prefix '' localizes to root-relative, an
+        'https://new.tld' prefix retargets to that domain."""
         def plain(m: re.Match) -> str:
-            return canon_ref(m.group(1) or "/")
+            return prefix + canon_ref(m.group(1) or "/")
 
         def escaped(m: re.Match) -> str:
             ref = (m.group(1) or "").replace("\\/", "/")
-            return canon_ref(ref or "/").replace("/", "\\/")
+            return (prefix + canon_ref(ref or "/")).replace("/", "\\/")
 
         return self.esc_url_re.sub(escaped, self.text_url_re.sub(plain, text))
+
+    def localize_text(self, text: str) -> str:
+        """Host-strip every textual URL form (plain, protocol-relative,
+        JSON-escaped) inside JS/CSS/JSON text."""
+        return self._replace_host(text, "")
+
+    def retarget_text(self, text: str) -> str:
+        """--target-domain twin of localize_text for SEO-bearing text
+        (meta content, JSON-LD)."""
+        return self._replace_host(text, self.target_prefix)
+
+    def retarget_url(self, u: str) -> str:
+        """Same-site URL moved onto --target-domain; unchanged without one."""
+        cand = ("https:" + u) if u.startswith("//") else u
+        if not self.target_prefix or not self.is_internal(cand):
+            return u
+        return self.target_prefix + self.localize_url(cand)
 
     def localize_b64(self, val: str) -> str:
         decoded = try_b64_url(val)
@@ -1109,6 +1257,48 @@ class Exporter:
             return val
         return base64.b64encode(localized.encode("utf-8")).decode("ascii")
 
+    def strip_wp_cruft(self, soup: BeautifulSoup) -> None:
+        """Remove WordPress head elements that only point at dynamic origin
+        infrastructure a static mirror does not have (REST/oEmbed/RSD/feed
+        discovery, pingback, wlwmanifest, ?p= shortlinks) plus the
+        version-revealing generator meta. canonical / hreflang / og: /
+        twitter: / JSON-LD stay untouched."""
+        removed: dict[str, int] = {}
+
+        def drop(tag, kind: str) -> None:
+            tag.decompose()
+            removed[kind] = removed.get(kind, 0) + 1
+
+        for meta in soup.find_all(
+                "meta", attrs={"name": re.compile("^generator$", re.I)}):
+            drop(meta, "generator-meta")
+        for link in soup.find_all("link"):
+            rel_attr = link.get("rel")
+            rel = {r.lower() for r in (rel_attr if isinstance(rel_attr, list)
+                                       else (rel_attr or "").split())}
+            hit = rel & {"pingback", "shortlink", "wlwmanifest", "edituri"}
+            if hit:
+                drop(link, sorted(hit)[0])
+                continue
+            if any("api.w.org" in r for r in rel):
+                drop(link, "rest-api-discovery")
+                continue
+            ltype = (link.get("type") or "").lower()
+            # feed/oEmbed discovery only -- hreflang alternates carry no type
+            if "alternate" in rel and (
+                    "oembed" in ltype or "rss+xml" in ltype or "atom+xml" in ltype):
+                drop(link, "oembed-discovery" if "oembed" in ltype
+                     else "feed-discovery")
+        # Cloudflare-injected RUM beacon: reports to Cloudflare for the
+        # ORIGIN zone -- off Cloudflare it only produces console/CORS errors
+        for script in soup.find_all("script", src=True):
+            if "cloudflareinsights.com" in script["src"]:
+                drop(script, "cloudflare-beacon")
+        if removed:
+            with self.stats_lock:
+                for kind, n in removed.items():
+                    self.cruft_removed[kind] = self.cruft_removed.get(kind, 0) + n
+
     def rewrite_soup_relative(self, soup: BeautifulSoup) -> None:
         """Rewrite same-site URLs to root-relative -- in every form page
         builders emit them: plain absolute, protocol-relative, JSON-escaped
@@ -1116,21 +1306,30 @@ class Exporter:
 
         canonical / rel=alternate / wp-json <link>s, <meta> tags (og:*,
         twitter:*) and JSON-LD stay absolute on purpose: SEO data, never
-        fetched by browsers."""
+        fetched by browsers. With --target-domain they are rewritten onto
+        the new domain instead of staying on the origin."""
         for tag in soup.find_all(True):
             if tag.name == "meta":
+                if self.target_prefix:
+                    content = tag.get("content")
+                    if (isinstance(content, str)
+                            and self.host_probe_re.search(content)):
+                        tag["content"] = self.retarget_text(content)
                 continue
             rel_attr = tag.get("rel")
             rel = {r.lower() for r in (rel_attr if isinstance(rel_attr, list)
                                        else (rel_attr or "").split())}
-            if tag.name == "link" and (
-                    rel & {"canonical", "alternate"}
-                    or PAGE_SKIP_PATTERNS.search(
-                        urlsplit(tag.get("href") or "").path)):
-                continue  # SEO links and dynamic-endpoint metadata (wp-json,
-                          # xmlrpc EditURI/pingback) stay absolute: browsers
-                          # never fetch them, and localizing them would just
-                          # create dead same-origin links
+            if tag.name == "link":
+                href = tag.get("href") or ""
+                skip_href = PAGE_SKIP_PATTERNS.search(urlsplit(href).path)
+                if rel & {"canonical", "alternate"} or skip_href:
+                    # SEO links and dynamic-endpoint metadata (wp-json,
+                    # xmlrpc EditURI/pingback) stay absolute: browsers
+                    # never fetch them, and localizing them would just
+                    # create dead same-origin links
+                    if self.target_prefix and href and not skip_href:
+                        tag["href"] = self.retarget_url(href)
+                    continue
             for attr, val in list(tag.attrs.items()):
                 if not isinstance(val, str) or not val:
                     continue
@@ -1180,7 +1379,12 @@ class Exporter:
         for script in soup.find_all("script"):
             stype = (script.get("type") or "").lower()
             if "ld+json" in stype:
-                continue  # SEO structured data stays absolute
+                # SEO structured data stays absolute (or moves to the
+                # --target-domain as one piece)
+                if (self.target_prefix and script.string
+                        and self.host_probe_re.search(script.string)):
+                    script.string = self.retarget_text(script.string)
+                continue
             if script.string and self.host_probe_re.search(script.string):
                 script.string = self.localize_text(script.string)
 
@@ -1325,6 +1529,190 @@ class Exporter:
             pass
 
     # ----------------------------------------------------------------------
+    # Phase 3c: SEO finalization -- sitemap, robots.txt, HTML post-process
+    # ----------------------------------------------------------------------
+
+    def canonical_target(self, p: PageRecord) -> str | None:
+        """Normalized internal canonical URL of a page, or None."""
+        if p.canonical and self.is_internal(p.canonical):
+            return self.normalize_page_url(self.to_base_host(p.canonical))
+        return None
+
+    def _loc_prefix(self) -> str:
+        """scheme://host for generated sitemap <loc> / robots Sitemap: lines.
+        Stays on the origin (the nginx sub_filter localizes it at serve
+        time) unless --target-domain retargets the whole export."""
+        return self.target_prefix or f"{self.scheme}://{self.host}"
+
+    def write_generated_sitemap(self) -> None:
+        """Write /sitemap.xml describing the exported URL set. The origin
+        sitemaps may list dropped query URLs, noindexed or redirected pages
+        -- this one is truthful about what the mirror actually serves."""
+        entries: dict[str, str] = {}            # save_url -> lastmod ISO date
+        excluded_noindex = excluded_canonical = excluded_redirects = 0
+        for p in self.pages:
+            if p.error or "html" not in p.content_type:
+                continue
+            sm_url = p.save_url or p.url
+            if sm_url != p.url:
+                excluded_redirects += 1         # source path not listed; the
+                                                # redirect target still is
+            if p.noindex:
+                excluded_noindex += 1
+                continue
+            if (p.canonical and self.is_internal(p.canonical)
+                    and self.canonical_target(p) != sm_url):
+                excluded_canonical += 1         # page declares another URL as
+                continue                        # canonical -- list that one
+            lastmod = ""
+            if p.last_modified:
+                try:
+                    lastmod = parsedate_to_datetime(
+                        p.last_modified).date().isoformat()
+                except (TypeError, ValueError):
+                    pass
+            if sm_url not in entries or (lastmod and not entries[sm_url]):
+                entries[sm_url] = lastmod
+
+        def xml_escape(s: str) -> str:
+            return (s.replace("&", "&amp;").replace("<", "&lt;")
+                     .replace(">", "&gt;"))
+
+        prefix = self._loc_prefix()
+        lines = ['<?xml version="1.0" encoding="UTF-8"?>',
+                 '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">']
+        for url in sorted(entries):
+            lines.append("  <url>")
+            lines.append(f"    <loc>{xml_escape(prefix + urlsplit(url).path)}"
+                         "</loc>")
+            if entries[url]:
+                lines.append(f"    <lastmod>{entries[url]}</lastmod>")
+            lines.append("  </url>")
+        lines.append("</urlset>")
+        # written directly, not via write_bytes(): its first-write-wins
+        # bookkeeping must never block regenerating this well-known path
+        (self.public_dir / "sitemap.xml").write_text(
+            "\n".join(lines) + "\n", encoding="utf-8")
+        self.generated_sitemap = {
+            "path": "/sitemap.xml",
+            "url_count": len(entries),
+            "excluded_noindex": excluded_noindex,
+            "excluded_canonical_mismatch": excluded_canonical,
+            "redirected_source_urls_not_listed": excluded_redirects,
+        }
+        print(f"[seo] sitemap.xml generated: {len(entries)} URLs"
+              + (f" ({excluded_noindex} noindex excluded)"
+                 if excluded_noindex else ""))
+
+    def finalize_robots(self) -> None:
+        """Bring robots.txt in line with the export: --staging blocks
+        everything, otherwise the Sitemap: line points at the (generated)
+        sitemap and a missing robots.txt is created. Direct writes on
+        purpose -- write_bytes() first-write-wins already holds the origin
+        copy of this path."""
+        robots_path = self.public_dir / "robots.txt"
+        if self.cfg.staging:
+            robots_path.write_text("User-agent: *\nDisallow: /\n",
+                                   encoding="utf-8")
+            self.robots_action = "staging-disallow-all"
+            return
+        sitemap_line = (f"Sitemap: {self._loc_prefix()}/sitemap.xml"
+                        if self.generated_sitemap else None)
+        if robots_path.is_file():
+            if not sitemap_line:
+                return                          # --no-generate-sitemap: keep
+            text = SITEMAP_LINE_RE.sub("", robots_path.read_text(
+                "utf-8", errors="replace"))
+            text = re.sub(r"\n{3,}", "\n\n", text).strip("\n")
+            robots_path.write_text(
+                (text + "\n\n" if text else "") + sitemap_line + "\n",
+                encoding="utf-8")
+            self.robots_action = "sitemap-line-rewritten"
+        else:
+            body = "User-agent: *\nAllow: /\n"
+            if sitemap_line:
+                body += "\n" + sitemap_line + "\n"
+            robots_path.write_text(body, encoding="utf-8")
+            self.robots_action = "generated"
+
+    def postprocess_html(self) -> None:
+        """Final pass over the written HTML (before verification): image
+        loading attributes / intrinsic sizes and the --staging noindex meta.
+        Runs on the files because image files may only exist after later
+        crawl rounds than the page that references them."""
+        if not self.cfg.rewrite:
+            return
+        do_images = self.cfg.optimize_images
+        do_staging = self.cfg.staging
+        if not (do_images or do_staging):
+            return
+        for html_file in sorted(self.public_dir.rglob("*.html")):
+            soup = BeautifulSoup(html_file.read_bytes(), "html.parser")
+            changed = False
+            if do_staging:
+                changed |= self._inject_staging_meta(soup)
+            if do_images:
+                changed |= self._optimize_images(soup)
+            if changed:
+                html_file.write_bytes(str(soup).encode("utf-8"))
+
+    def _inject_staging_meta(self, soup: BeautifulSoup) -> bool:
+        robots = soup.find("meta", attrs={"name": re.compile("^robots$", re.I)})
+        if robots is not None:
+            content = robots.get("content") or ""
+            if "noindex" in content.lower():
+                return False
+            robots["content"] = f"noindex, {content}" if content else "noindex"
+            return True
+        head = soup.find("head")
+        if head is None:
+            return False
+        tag = soup.new_tag("meta")
+        tag["name"] = "robots"
+        tag["content"] = "noindex"
+        head.insert(0, tag)
+        return True
+
+    def _optimize_images(self, soup: BeautifulSoup) -> bool:
+        changed = False
+        first = True
+        for img in soup.find_all("img"):
+            is_first = first
+            first = False
+            classes = " ".join(img.get("class") or []).lower()
+            plugin_lazy = (img.has_attr("data-src")
+                           or img.has_attr("data-lazy-src")
+                           or "lazy" in classes)
+            if plugin_lazy:
+                self.img_stats["skipped_plugin"] += 1
+            elif (not img.has_attr("loading") and not is_first
+                    and (img.get("fetchpriority") or "").lower() != "high"):
+                # first image per page stays eager (LCP protection)
+                img["loading"] = "lazy"
+                if not img.has_attr("decoding"):
+                    img["decoding"] = "async"
+                self.img_stats["lazy"] += 1
+                changed = True
+            if img.has_attr("width") or img.has_attr("height") or plugin_lazy:
+                continue
+            src = (img.get("src") or "").strip()
+            if not src.startswith("/") or src.startswith("//"):
+                continue
+            path = unicodedata.normalize(
+                "NFC", unquote(src.split("?", 1)[0].split("#", 1)[0]))
+            if path_extension(path) not in ("png", "jpg", "jpeg", "gif", "webp"):
+                continue
+            target = self.public_dir / path.lstrip("/")
+            size = read_image_size(target) if target.is_file() else None
+            if size:
+                img["width"], img["height"] = str(size[0]), str(size[1])
+                self.img_stats["dimensions"] += 1
+                changed = True
+            else:
+                self.img_stats["unparsed"] += 1
+        return changed
+
+    # ----------------------------------------------------------------------
     # Phase 3b: post-export verification
     # ----------------------------------------------------------------------
 
@@ -1348,7 +1736,8 @@ class Exporter:
                      "ref": "dynamic endpoint artifact in export"})
         if not self.cfg.rewrite:
             return
-        origin_404 = {urlsplit(a["url"]).path for a in self.asset_errors}
+        origin_404 = {unicodedata.normalize("NFC", unquote(urlsplit(a["url"]).path))
+                      for a in self.asset_errors}
         missing_seen: set[tuple[str, str]] = set()
         unexpected_seen: set[tuple[str, str]] = set()
 
@@ -1387,7 +1776,8 @@ class Exporter:
             missing_seen.add(key)
             self.verify_missing.append({
                 "file": rel_file, "ref": ref,
-                "origin_error": ref.split("?")[0] in origin_404})
+                "origin_error": unicodedata.normalize(
+                    "NFC", unquote(ref.split("?")[0])) in origin_404})
 
         for html_file in sorted(self.public_dir.rglob("*.html")):
             rel_file = html_file.relative_to(self.public_dir).as_posix()
@@ -1398,7 +1788,9 @@ class Exporter:
                 rel_attr = tag.get("rel")
                 rel = {r.lower() for r in (rel_attr if isinstance(rel_attr, list)
                                            else (rel_attr or "").split())}
-                allowed_abs = tag.name == "link" and (
+                # with --target-domain NO origin reference may survive, so
+                # the SEO-link allowance disappears entirely
+                allowed_abs = not self.cfg.target_domain and tag.name == "link" and (
                     rel & {"canonical", "alternate"}
                     or PAGE_SKIP_PATTERNS.search(
                         urlsplit(tag.get("href") or "").path))
@@ -1426,7 +1818,13 @@ class Exporter:
                     check_ref(rel_file, m.group(1))
             for script in soup.find_all("script"):
                 stype = (script.get("type") or "").lower()
-                if "ld+json" in stype or not script.string:
+                if "ld+json" in stype:
+                    if (self.cfg.target_domain and script.string
+                            and self.host_probe_re.search(script.string)):
+                        note_unexpected(rel_file,
+                                        "<script ld+json> origin URL")
+                    continue
+                if not script.string:
                     continue
                 if self.host_probe_re.search(script.string):
                     note_unexpected(rel_file, "<script> block")
@@ -1453,36 +1851,148 @@ class Exporter:
                     ref = posixpath.normpath(posixpath.join(css_dir, ref))
                 check_ref(rel_file, ref)
 
+        # every <loc> in the generated sitemap must resolve in the export
+        if self.generated_sitemap:
+            try:
+                root = ET.fromstring(
+                    (self.public_dir / "sitemap.xml").read_bytes())
+            except (OSError, ET.ParseError):
+                root = None
+            if root is not None:
+                for u in root:
+                    loc = next((c.text for c in u
+                                if local_name(c.tag) == "loc"), None)
+                    if not loc:
+                        continue
+                    path = urlsplit(loc.strip()).path or "/"
+                    if not exists_local(path):
+                        self.verify_missing.append(
+                            {"file": "sitemap.xml (generated)", "ref": path})
+
     # ----------------------------------------------------------------------
     # Phase 4: deployment files + report
     # ----------------------------------------------------------------------
 
-    def write_deploy_files(self) -> None:
-        rewrites = ""
-        internal_redirects = [
-            r for r in self.redirects
-            if self.is_internal(r["to"]) and urlsplit(r["from"]).path != urlsplit(r["to"]).path
-        ]
-        if internal_redirects:
-            lines = [f"    rewrite ^{re.escape(urlsplit(r['from']).path)}$ "
-                     f"{urlsplit(r['to']).path} permanent;"
-                     for r in internal_redirects]
-            rewrites = ("\n    # Redirects observed on the origin site "
-                        "(review before enabling)\n" + "\n".join(f"#{l}" for l in lines) + "\n")
+    def _sub_filter_hosts(self) -> list[str]:
+        """Host spellings that can appear in the exported files -- the only
+        forms the __init__ regexes ever match, plus --target-domain ones."""
+        hosts: list[str] = []
+        try:                              # www. variant is nonsense for IPs
+            ipaddress.ip_address(self.base_norm.rsplit(":", 1)[0])
+            candidates = (self.base_norm, self.connect_norm)
+        except ValueError:
+            candidates = (f"www.{self.base_norm}", self.base_norm,
+                          self.connect_norm)
+        for h in candidates:
+            if h and h not in hosts and norm_host(h) in self.internal_norms:
+                hosts.append(h)
+        if self.cfg.target_domain:
+            td = self.cfg.target_domain
+            for h in (td, f"www.{norm_host(td)}", norm_host(td)):
+                if h not in hosts:
+                    hosts.append(h)
+        return hosts
 
-        nginx_conf = f"""server {{
+    def _sub_filter_lines(self) -> str:
+        """nginx sub_filter directives swapping the origin host for the one
+        actually requested ($host) at serve time -- canonical / og:url /
+        JSON-LD / sitemap <loc> / robots.txt stay correct on ANY domain
+        without re-exporting. Every pattern is anchored with a trailing /
+        or \" so a substring host (example.at inside example.athletic.de)
+        can never match; the JSON-LD form matches escaped https:\\/\\/
+        (nginx unescapes '\\\\' in quoted strings to a literal backslash)."""
+        lines = []
+        for h in self._sub_filter_hosts():
+            for scheme in ("https", "http"):
+                lines.append(f"    sub_filter '{scheme}://{h}/' "
+                             "'$canonical_scheme://$host/';")
+                lines.append(f"    sub_filter '{scheme}://{h}\"' "
+                             "'$canonical_scheme://$host\"';")
+                lines.append(f"    sub_filter '{scheme}:\\\\/\\\\/{h}\\\\/' "
+                             "'$canonical_scheme:\\\\/\\\\/$host\\\\/';")
+        return "\n".join(lines)
+
+    def write_deploy_files(self) -> None:
+        # internal redirects observed on the origin, deduped against the
+        # generic trailing-slash rule the nginx config carries anyway
+        redirect_rules: list[tuple[str, str]] = []
+        seen_from: set[str] = set()
+        for r in self.redirects:
+            if not self.is_internal(r["to"]):
+                continue
+            fp = urlsplit(r["from"]).path
+            tp = urlsplit(r["to"]).path
+            if fp == tp or tp == fp + "/" or fp in seen_from:
+                continue
+            seen_from.add(fp)
+            redirect_rules.append((fp, tp))
+
+        inc_lines = ["# Redirects observed on the origin site, served as real"
+                     " 301s (generated)."]
+        if not redirect_rules:
+            inc_lines.append("# none observed during the export")
+        inc_lines += [f"rewrite ^{re.escape(fp)}$ {tp} permanent;"
+                      for fp, tp in redirect_rules]
+        (self.cfg.out_dir / "redirects.inc").write_text(
+            "\n".join(inc_lines) + "\n", encoding="utf-8")
+
+        staging_hdr = ""
+        if self.cfg.staging:
+            staging_hdr = ('\n    # --staging: keep the mirror out of every '
+                           'index\n    add_header X-Robots-Tag '
+                           '"noindex, nofollow" always;\n')
+
+        nginx_conf = f"""# generated by {TOOL_NAME} {VERSION}
+# map must sit at http level -- conf.d/*.conf is included there. Behind a
+# TLS-terminating proxy the canonical scheme comes from X-Forwarded-Proto,
+# standalone from the connection itself.
+map $http_x_forwarded_proto $canonical_scheme {{
+    default $scheme;
+    https   https;
+    http    http;
+}}
+
+server {{
     listen 80;
     server_name _;
 
     root /usr/share/nginx/html;
     index index.html;
 
+    # relative Location headers -- with server_name _ an absolute redirect
+    # would advertise the literal host "_"
+    absolute_redirect off;
+
+    # Serve-time domain substitution (ngx_http_sub_module): the export keeps
+    # the origin host in canonical/og:url/JSON-LD/sitemap/robots.txt; these
+    # filters swap it for the host actually requested, so the SEO signals
+    # are correct on any domain without re-exporting.
+    # NOTE: never add gzip_static here -- sub_filter cannot look inside
+    # precompressed files (the on-the-fly gzip below runs after sub_filter).
+    sub_filter_once off;
+    sub_filter_last_modified on;
+    sub_filter_types text/xml text/plain application/xml;
+{self._sub_filter_lines()}
+
     error_page 404 /404.html;
-{rewrites}
+    # direct hits on /404.html answer 404 (via error_page), not an
+    # indexable 200
+    location = /404.html {{ internal; }}
+
+    include /etc/nginx/conf.d/redirects.inc;
+
     location / {{
+        # one canonical URL per page: /page -> /page/ (matches the export's
+        # trailing-slash structure; without this both answer 200)
+        if (-d $request_filename) {{
+            rewrite ^(.*[^/])$ $1/ permanent;
+        }}
         try_files $uri $uri/ =404;
     }}
 
+    # deploy artifacts for other platforms (.htaccess) are not content
+    location ~ /\\.(?!well-known) {{ deny all; }}
+{staging_hdr}
     location ~* \\.(css|js|mjs|png|jpe?g|gif|svg|webp|avif|ico|woff2?|ttf|otf)$ {{
         expires 30d;
         add_header Cache-Control "public";
@@ -1490,7 +2000,7 @@ class Exporter:
 
     location = /robots.txt  {{ access_log off; }}
     gzip on;
-    gzip_types text/html text/css application/javascript application/json
+    gzip_types text/css application/javascript application/json
                image/svg+xml application/xml;
 }}
 """
@@ -1498,9 +2008,52 @@ class Exporter:
 
         dockerfile = """FROM nginx:alpine
 COPY nginx.conf /etc/nginx/conf.d/default.conf
+COPY redirects.inc /etc/nginx/conf.d/redirects.inc
 COPY public/ /usr/share/nginx/html/
 """
         (self.cfg.out_dir / "Dockerfile").write_text(dockerfile, encoding="utf-8")
+
+        # Netlify: _redirects in the publish dir; 404.html is automatic there
+        netlify = ["# generated -- Netlify has no serve-time host substitution:",
+                   "# for correct canonical/og/JSON-LD URLs re-export with"
+                   " --target-domain"]
+        netlify += [f"{fp} {tp} 301" for fp, tp in redirect_rules]
+        (self.public_dir / "_redirects").write_text(
+            "\n".join(netlify) + "\n", encoding="utf-8")
+
+        # Apache: mod_substitute cannot interpolate %{HTTP_HOST} into
+        # replacements, so Apache deployments need --target-domain as well
+        htaccess = ["# generated -- Apache has no serve-time host substitution:",
+                    "# for correct canonical/og/JSON-LD URLs re-export with"
+                    " --target-domain",
+                    "ErrorDocument 404 /404.html"]
+        htaccess += [f"Redirect 301 {fp} {tp}" for fp, tp in redirect_rules]
+        htaccess += ["<IfModule mod_expires.c>",
+                     "  ExpiresActive on",
+                     '  ExpiresByType text/css "access plus 30 days"',
+                     '  ExpiresByType application/javascript "access plus 30 days"',
+                     '  ExpiresByType image/png "access plus 30 days"',
+                     '  ExpiresByType image/jpeg "access plus 30 days"',
+                     '  ExpiresByType image/gif "access plus 30 days"',
+                     '  ExpiresByType image/svg+xml "access plus 30 days"',
+                     '  ExpiresByType image/webp "access plus 30 days"',
+                     '  ExpiresByType image/avif "access plus 30 days"',
+                     '  ExpiresByType font/woff2 "access plus 30 days"',
+                     "</IfModule>"]
+        if self.cfg.staging:
+            htaccess += ["<IfModule mod_headers.c>",
+                         '  Header set X-Robots-Tag "noindex, nofollow"',
+                         "</IfModule>"]
+        (self.public_dir / ".htaccess").write_text(
+            "\n".join(htaccess) + "\n", encoding="utf-8")
+
+        self.deploy_info = {
+            "nginx_sub_filter_hosts": self._sub_filter_hosts(),
+            "redirects_301": len(redirect_rules),
+            "netlify_redirects": "public/_redirects",
+            "apache_htaccess": "public/.htaccess",
+            "staging_noindex_header": self.cfg.staging,
+        }
 
         # docker-compose.yml: builds an image with the content baked in (via
         # the Dockerfile's COPY -- no bind mount, so re-exports never leave a
@@ -1603,6 +2156,15 @@ esac
             "assets_exported": self.asset_count,
             "asset_errors": self.asset_errors,
             "sitemaps_exported": self.sitemap_files,
+            "sitemap": {
+                "generated": bool(self.generated_sitemap),
+                **(self.generated_sitemap or {}),
+            },
+            "robots_txt": {
+                "origin_found": self.robots_txt_found,
+                "action": self.robots_action,
+            },
+            "deploy": self.deploy_info,
             "redirects": self.redirects,
             "pages_found_only_via_links_not_in_sitemap": [p.url for p in link_only],
             "seo": {
@@ -1614,6 +2176,10 @@ esac
                 "pages_without_meta_description": [p.url for p in no_desc],
                 "pages_without_viewport_meta": [p.url for p in no_viewport],
                 "skipped_query_string_urls": sorted(self.skipped_query_urls),
+                "wp_cruft_removed": self.cruft_removed,
+                "image_optimization": self.img_stats,
+                "staging_noindex": self.cfg.staging,
+                "target_domain": self.cfg.target_domain,
             },
             "mobile": {
                 "checked": self.cfg.mobile_check,
@@ -1652,7 +2218,25 @@ esac
             "",
             f"Pages exported:  {len(ok_pages)}",
             f"Assets exported: {self.asset_count}",
-            f"Sitemap files:   {len(self.sitemap_files)}",
+            (f"Sitemap:         generated /sitemap.xml "
+             f"({self.generated_sitemap['url_count']} URLs, "
+             f"{self.generated_sitemap['excluded_noindex']} noindex excluded)"
+             if self.generated_sitemap else
+             f"Sitemap files:   {len(self.sitemap_files)} (origin, verbatim)"),
+            f"robots.txt:      {self.robots_action}"
+            + ("" if self.robots_txt_found else " (origin had none)"),
+            "WP cruft removed: " + (", ".join(
+                f"{k}={v}" for k, v in sorted(self.cruft_removed.items()))
+                or "none"),
+            (f"Images:          {self.img_stats['lazy']}x loading=lazy, "
+             f"{self.img_stats['dimensions']}x width/height injected, "
+             f"{self.img_stats['skipped_plugin']}x plugin-lazyload skipped"
+             if self.cfg.optimize_images and self.cfg.rewrite else
+             "Images:          optimization disabled"),
+            *([f"Staging:         noindex everywhere (robots.txt, "
+               f"X-Robots-Tag, meta robots)"] if self.cfg.staging else []),
+            *([f"Target domain:   {self.cfg.target_domain} (canonical/og/"
+               f"JSON-LD/sitemap rewritten)"] if self.cfg.target_domain else []),
             "",
             section("Failed pages", failed_pages, lambda p: f"{p.url} ({p.error})"),
             section("Asset errors", self.asset_errors,
@@ -1715,6 +2299,10 @@ esac
         self.crawl(seeds)
         self.capture_404()
         self.capture_favicon()
+        if self.cfg.generate_sitemap:
+            self.write_generated_sitemap()
+        self.finalize_robots()
+        self.postprocess_html()
         self.verify_export()
         self.write_deploy_files()
         self.write_report()
@@ -1724,6 +2312,20 @@ esac
         print()
         print(f"[done] {ok} pages, {self.asset_count} assets exported "
               f"-> {self.public_dir}")
+        if self.cruft_removed:
+            print(f"[seo] stripped {sum(self.cruft_removed.values())} WP/CDN "
+                  f"head elements "
+                  f"({', '.join(sorted(self.cruft_removed))})")
+        if self.cfg.rewrite and self.cfg.optimize_images:
+            print(f"[seo] images: {self.img_stats['lazy']}x loading=lazy, "
+                  f"{self.img_stats['dimensions']}x width/height injected")
+        if self.cfg.staging:
+            print("[staging] export is noindexed everywhere "
+                  "(robots.txt, X-Robots-Tag, meta robots)")
+        elif not self.cfg.target_domain:
+            print("[seo] canonical/og/JSON-LD/sitemap keep the origin host; "
+                  "the generated nginx.conf substitutes the served domain "
+                  "at runtime (sub_filter)")
         if self.cfg.mobile_check:
             if self.mobile_diff:
                 print(f"[done] Mobile: {len(self.mobile_diff)} pages serve "
@@ -1787,6 +2389,14 @@ examples:
 
   # keep HTML byte-identical to the origin (only works under the same hostname)
   wp-static-export https://www.example.at --no-rewrite
+
+  # staging/preview deployment that must never compete with the live site:
+  # robots.txt Disallow, X-Robots-Tag header and meta noindex everywhere
+  wp-static-export https://www.example.at --staging
+
+  # deploy to a NEW domain on a host without serve-time substitution
+  # (Netlify, Apache): hard-rewrite canonical/og/JSON-LD/sitemap URLs
+  wp-static-export https://www.example.at --target-domain neue-domain.at
 
   # bake the serving port into the generated compose file / server.sh
   wp-static-export https://www.example.at --port 9000
@@ -1855,6 +2465,36 @@ Notes:
     ap.add_argument("--mobile-user-agent", default=None,
                     help="user agent used for the mobile comparison "
                          "(default: iPhone Safari)")
+    ap.add_argument("--no-generate-sitemap", dest="generate_sitemap",
+                    action="store_false",
+                    help="keep the origin sitemap files verbatim instead of "
+                         "generating a fresh /sitemap.xml from the exported "
+                         "URL set (noindex/redirected/canonical-mismatch "
+                         "pages excluded, lastmod from Last-Modified)")
+    ap.add_argument("--no-strip-wp-cruft", dest="strip_wp_cruft",
+                    action="store_false",
+                    help="keep WordPress head cruft (generator meta, wp-json/"
+                         "oEmbed/feed discovery, EditURI, wlwmanifest, "
+                         "pingback, shortlink, Cloudflare beacon) that only "
+                         "points at dynamic origin infrastructure. "
+                         "No effect with --no-rewrite")
+    ap.add_argument("--no-optimize-images", dest="optimize_images",
+                    action="store_false",
+                    help="skip injecting loading=lazy/decoding=async and "
+                         "width/height attributes into <img> tags. "
+                         "No effect with --no-rewrite")
+    ap.add_argument("--staging", action="store_true",
+                    help="deploy invisible to search engines: robots.txt "
+                         "'Disallow: /', X-Robots-Tag noindex header in the "
+                         "server configs, meta robots noindex in every page "
+                         "(meta injection needs rewrite mode)")
+    ap.add_argument("--target-domain", default=None, metavar="DOMAIN",
+                    help="hard-rewrite SEO-bearing URLs (canonical, og:*, "
+                         "JSON-LD, sitemap <loc>, robots.txt) to this domain "
+                         "at export time -- for hosts without serve-time "
+                         "substitution (Netlify, Apache). The generated "
+                         "nginx.conf makes this unnecessary on nginx/Docker. "
+                         "Needs rewrite mode for the HTML parts")
     args = ap.parse_args(argv)
 
     base = args.base_url.strip()
@@ -1864,6 +2504,14 @@ Notes:
 
     host_header = (args.host_header or "").strip()
     host_header = re.sub(r"^https?://", "", host_header).rstrip("/") or None
+
+    target_domain = (args.target_domain or "").strip()
+    target_domain = re.sub(r"^https?://", "", target_domain).rstrip("/") or None
+    if target_domain:
+        logical_host = host_header or urlsplit(base).netloc
+        if norm_host(target_domain) == norm_host(logical_host):
+            ap.error("--target-domain equals the site's own host -- the "
+                     "default export already keeps SEO URLs on that domain")
 
     extra_headers: dict = {}
     for raw in args.header:
@@ -1895,6 +2543,11 @@ Notes:
         extra_sitemaps=args.extra_sitemap,
         mobile_check=args.mobile_check,
         port=args.port,
+        generate_sitemap=args.generate_sitemap,
+        strip_wp_cruft=args.strip_wp_cruft,
+        optimize_images=args.optimize_images,
+        staging=args.staging,
+        target_domain=target_domain,
     )
     if args.user_agent:
         cfg.user_agent = args.user_agent
