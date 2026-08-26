@@ -2068,7 +2068,7 @@ services:
     container_name: wpstatic-__SITE_SLUG__
     ports:
       - "${PORT:-__PORT__}:80"
-    restart: unless-stopped
+    restart: always
 """.replace("__SITE_SLUG__", site_slug).replace("__PORT__", str(self.cfg.port))
         (self.cfg.out_dir / "docker-compose.yml").write_text(compose, encoding="utf-8")
 
