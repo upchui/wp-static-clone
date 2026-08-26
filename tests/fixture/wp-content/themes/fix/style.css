@@ -1,0 +1,2 @@
+body { background: url('__ORIGIN__/wp-content/uploads/bg.png'); }
+h1::after { content: "→ü"; }

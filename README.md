@@ -12,8 +12,10 @@ Only `requests` and `beautifulsoup4` are required (Python 3.10+).
 
 ```bash
 python3 -m venv .venv
-.venv/bin/pip install requests beautifulsoup4
+.venv/bin/pip install -r requirements.txt
 ```
+
+For development (test suite): `.venv/bin/pip install -r requirements-dev.txt`, then `pytest`.
 
 All examples below use `.venv/bin/python`; if you have the packages installed globally, `python3` works too.
 
@@ -29,7 +31,9 @@ All examples below use `.venv/bin/python`; if you have the packages installed gl
 .venv/bin/python wp-static-export.py https://www.example.at -o ./export --clean --delay 0.2
 ```
 
-Afterwards the site is under `./export/public/`, along with `report.txt` / `report.json`, an `nginx.conf`, a `redirects.inc`, a `Dockerfile`, a `docker-compose.yml` and a `server.sh` (plus `_redirects` / `.htaccess` inside `public/` for Netlify/Apache).
+Afterwards the site is under `./export/public/`, along with `report.txt` / `report.json`, an `nginx.conf`, a `redirects.inc`, a `Dockerfile`, a `docker-compose.yml` (healthcheck included), a `.dockerignore` and a `server.sh` (plus `_redirects` / `.htaccess` inside `public/` for Netlify/Apache). If the mobile check finds UA-specific HTML, the mobile variants land under `./export/mobile-variants/` (removed by `--clean` like `public/`).
+
+Note: `--delay` is a **global** minimum spacing between any two requests, shared across all workers — `-c 8 --delay 0.2` really means ~5 requests/second.
 
 ---
 
@@ -103,7 +107,7 @@ Form submissions (e.g. WPForms), consent/analytics AJAX and WordPress search nee
 
 The export is SEO-complete out of the box:
 
-- **Generated sitemap** — a fresh `/sitemap.xml` is written from the URL set that actually made it into the export: `noindex` pages, redirect sources and canonical mismatches are excluded, `<lastmod>` comes from the `Last-Modified` header. The `robots.txt` `Sitemap:` line is pointed at it (a missing robots.txt is generated). `--no-generate-sitemap` keeps the origin sitemap files verbatim instead. After a domain move, submit `/sitemap.xml` in Search Console once.
+- **Generated sitemap** — a fresh `/sitemap.xml` is written from the URL set the origin sitemap declared and the export contains: `noindex` pages, redirect sources and canonical mismatches are excluded, and pages only discovered via links (WP attachment pages, cache artifacts) stay out unless you pass `--sitemap-include-linked`. `<lastmod>` comes from the `Last-Modified` header. The `robots.txt` `Sitemap:` line is pointed at it (a missing robots.txt is generated). `--no-generate-sitemap` keeps the origin sitemap files instead (unchanged except the localized XSL reference). After a domain move, submit `/sitemap.xml` in Search Console once.
 - **One canonical URL per page** — the generated nginx config 301s `/page` → `/page/` (matching the exported structure) and serves the redirects observed on the origin as real 301s (`redirects.inc`). Redirect stubs carry `noindex`; `/404.html` answers 404 instead of an indexable 200.
 - **WordPress cruft removed** — generator meta, wp-json/oEmbed/feed discovery, EditURI/RSD, wlwmanifest, pingback, `?p=` shortlinks and the Cloudflare Insights beacon (which only produces CORS errors off Cloudflare) are stripped. `canonical`, `hreflang`, `og:*`/`twitter:*` and JSON-LD stay. Disable with `--no-strip-wp-cruft`.
 - **Image optimization** — `loading="lazy"` + `decoding="async"` on images (except each page's first image and plugin-lazyloaded ones) and `width`/`height` attributes read straight from the local PNG/JPEG/GIF/WebP headers (CLS). Disable with `--no-optimize-images`.
@@ -121,7 +125,7 @@ For non-Docker nginx, check the module with `nginx -V 2>&1 | grep -o with-http_s
 
 ### Staging deployments
 
-`--staging` keeps a preview mirror out of every index — `robots.txt` `Disallow: /`, an `X-Robots-Tag: noindex, nofollow` header in the nginx/Apache configs and a `noindex` robots meta injected into every page — so it never competes with the live site as duplicate content.
+`--staging` keeps a preview mirror out of every index — `robots.txt` `Disallow: /`, an `X-Robots-Tag: noindex, nofollow` header in the nginx/Apache configs (assets included) and a `noindex` robots meta injected into every page (rewrite mode) — so it never competes with the live site as duplicate content.
 
 ---
 
@@ -142,11 +146,15 @@ For non-Docker nginx, check the module with `nginx -V 2>&1 | grep -o with-http_s
 | `--insecure` | skip TLS certificate verification |
 | `--extra-sitemap URL` | additional sitemap URL (repeatable) |
 | `--max-pages N` | page cap (default 5000) |
-| `--no-generate-sitemap` | keep origin sitemap files verbatim instead of generating `/sitemap.xml` |
+| `--no-generate-sitemap` | keep origin sitemap files instead of generating `/sitemap.xml` |
 | `--no-strip-wp-cruft` | keep WP head cruft (generator, wp-json/oEmbed discovery, shortlink, …) |
 | `--no-optimize-images` | skip `loading=lazy` / `width`/`height` injection |
 | `--staging` | full noindex mode (robots.txt, `X-Robots-Tag`, meta robots) for previews |
 | `--target-domain D` | hard-rewrite canonical/og/JSON-LD/sitemap URLs to domain `D` (Netlify/Apache) |
+| `--sitemap-include-linked` | also list link-discovered pages in the generated sitemap |
+| `--fail-on {none,errors,verify}` | CI exit-code policy (`verify` → exit 2 on verification findings) |
+| `-q, --quiet` | suppress per-round progress output |
+| `--version` | print version and exit |
 
 Full list including examples: `wp-static-export.py --help`.
 
