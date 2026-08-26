@@ -1,4 +1,4 @@
-# wp-static-export
+# wp-static-clone
 
 Pulls a **self-contained static mirror** of a WordPress site (or any other CMS site): sitemap-driven crawl, all assets mirrored, URL structure preserved 1:1, plus ready-to-use nginx/Docker deployment files and a verification report.
 
