@@ -2447,42 +2447,77 @@ services:
 # The image is built from the Dockerfile with the content baked in (no bind
 # mount), so it survives re-exports cleanly. Service/container are named
 # after the site host (see docker-compose.yml).
-#
-# Usage:
-#   ./server.sh [up|down|restart|status|logs|build] [PORT]   (default: up, port __PORT__)
-#   ./server.sh up 9000          # publish on port 9000
-#   PORT=9000 ./server.sh up     # same, via environment
 set -eu
 cd "$(dirname "$0")"
+
+usage() {
+  cat <<EOF
+usage: $0 [up|down|restart|status|logs|build|help] [PORT]
+
+  up|start     build the image and start the container (default)
+  down|stop    stop and remove the container
+  restart      rebuild + recreate (after a re-export)
+  status|ps    show container state
+  logs         follow nginx logs
+  build        build the image only
+
+PORT precedence: argument > \$PORT environment > __PORT__ (baked in):
+  $0 up 9000         # publish on port 9000
+  PORT=9000 $0 up    # same, via environment
+EOF
+}
+
+case "${1:-}" in
+  -h|--help|help) usage; exit 0 ;;
+esac
+
+command -v docker >/dev/null 2>&1 || {
+  echo "error: docker not found -- install it first:" \
+       "https://docs.docker.com/get-docker/" >&2
+  exit 1
+}
+if docker compose version >/dev/null 2>&1; then
+  compose() { docker compose "$@"; }
+elif command -v docker-compose >/dev/null 2>&1; then
+  # legacy standalone docker-compose (v1) fallback
+  compose() { docker-compose "$@"; }
+else
+  echo "error: neither 'docker compose' nor 'docker-compose' is available" >&2
+  exit 1
+fi
 
 cmd="${1:-up}"
 # explicit argument beats environment beats baked-in default
 PORT="${2:-${PORT:-__PORT__}}"
+case "$PORT" in
+  ''|*[!0-9]*) echo "error: PORT must be a number, got: '$PORT'" >&2; exit 1 ;;
+esac
 export PORT
 
 case "$cmd" in
   up|start)
-    docker compose up -d --build
+    compose up -d --build
     echo "up -> http://localhost:${PORT}"
     ;;
   down|stop)
-    docker compose down
+    compose down
     ;;
   restart)
-    docker compose up -d --build --force-recreate
+    compose up -d --build --force-recreate
     echo "restarted -> http://localhost:${PORT}"
     ;;
   status|ps)
-    docker compose ps
+    compose ps
     ;;
   logs)
-    docker compose logs -f
+    compose logs -f
     ;;
   build)
-    docker compose build
+    compose build
     ;;
   *)
-    echo "usage: $0 [up|down|restart|status|logs|build] [PORT]" >&2
+    echo "error: unknown command: '$cmd'" >&2
+    usage >&2
     exit 1
     ;;
 esac
