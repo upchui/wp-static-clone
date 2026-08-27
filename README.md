@@ -30,7 +30,7 @@ On hosts whose `python3` is older than 3.10, `pip install -r requirements.txt` f
 ./run-docker.sh http://10.0.0.5:8080 --host example.at -o ./export --clean
 ```
 
-The wrapper uses `python:3.12-slim` with `--network host` (internal origin IPs stay reachable) and your own uid (export files belong to you, not root). And if the machine is only meant to **serve** an existing clone, you don't need Python at all — copy the `export/` directory over and run `./server.sh up`.
+The wrapper uses `python:3.12-slim` with `--network host` (internal origin IPs stay reachable) and your own uid (export files belong to you, not root). Relative output paths (`-o ./static`) resolve in **your current directory**, so you can call it from any per-site folder; keep `-o` relative (only the current directory is mounted into the container). And if the machine is only meant to **serve** an existing clone, you don't need Python at all — copy the `export/` directory over and run `./server.sh up`.
 
 ---
 
