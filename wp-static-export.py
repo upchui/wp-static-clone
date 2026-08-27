@@ -142,6 +142,7 @@ import posixpath
 import random
 import re
 import shutil
+import socket
 import string
 import sys
 import threading
@@ -164,7 +165,7 @@ if sys.version_info < (3, 10):
              f"(running {sys.version.split()[0]})")
 
 TOOL_NAME = "wp-static-export"
-VERSION = "1.4.2"
+VERSION = "1.4.3"
 
 # --------------------------------------------------------------------------
 # Classification helpers
@@ -273,6 +274,41 @@ PRIVATE_NET_RE = re.compile(
     r"|localhost\b"
     r"|[\w.-]+\.local\b"
     r")(?::\d+)?", re.IGNORECASE)
+
+# generic absolute-URL host extraction (homepage probe / same-site checks)
+ABS_HOST_RE = re.compile(r"https?://([A-Za-z0-9._-]+(?::\d+)?)", re.IGNORECASE)
+# a foreign host serving wp-content/wp-includes paths is very likely the
+# same WordPress install under another name (siteurl != public domain)
+FOREIGN_WP_RE = re.compile(
+    r"https?://([A-Za-z0-9._-]+(?::\d+)?)/wp-(?:content|includes)/",
+    re.IGNORECASE)
+
+
+def resolves_private(host: str) -> bool:
+    """True when the host resolves EXCLUSIVELY to private/loopback/
+    link-local addresses from this machine. With split-horizon DNS that
+    means: internal infrastructure (e.g. a WP admin domain) -- browsers
+    would hit the Local Network Access permission prompt for it.
+    Resolution failure -> False (dead for clients too, no LNA concern)."""
+    name = host.partition(":")[0].strip("[]")
+    if not name:
+        return False
+    try:
+        infos = socket.getaddrinfo(name, None)
+    except OSError:
+        return False
+    addrs = {info[4][0] for info in infos}
+    if not addrs:
+        return False
+    try:
+        ips = [ipaddress.ip_address(a.partition("%")[0]) for a in addrs]
+    except ValueError:
+        return False
+    # loopback/unspecified answers are DNS-sinkhole blocklists (Pi-hole &
+    # co. answer tracker domains with 0.0.0.0/127.x) -- NOT internal sites
+    return all(ip.is_private and not ip.is_loopback and not ip.is_unspecified
+               for ip in ips)
+
 
 CD_FILENAME_STAR_RE = re.compile(r"filename\*\s*=\s*[\w-]+''([^;]+)",
                                  re.IGNORECASE)
@@ -594,6 +630,7 @@ class Config:
     respect_robots: bool = False
     sr7_hydrate: bool = True
     internal_hosts: list = field(default_factory=list)
+    resolve_internal: bool = True
 
 
 @dataclass
@@ -651,34 +688,7 @@ class Exporter:
         self.target_prefix = (f"https://{cfg.target_domain}"
                               if cfg.target_domain else "")
 
-        # host-matching regexes for URL localization; cover the www. variant,
-        # both IDN spellings, and every textual form page builders emit:
-        # plain absolute, protocol-relative (//host/...) and JSON-escaped
-        # (https:\/\/host\/...). internal_norms already includes the connect
-        # address when --host is used (staging-IP leaks in slider configs).
-        # The lookahead anchors the host: without it example.at would match
-        # inside example.athletic.de (and localize_text would destroy that
-        # external URL), and example.at:8443 -- a DIFFERENT origin -- would
-        # half-match. A port is only matched when it is part of base_norm.
-        spellings: set[str] = set()
-        for n in self.internal_norms:
-            spellings |= host_spellings(n)
-        # scheme-default ports are the same origin: https://host:443/ and
-        # http://host:80/ occasionally leak into markup. (Known limitation:
-        # a trailing-dot FQDN spelling "host." is not matched.)
-        for s in list(spellings):
-            if ":" not in s:
-                spellings.add(f"{s}:443")
-                spellings.add(f"{s}:80")
-        hp = (r"(?:"
-              + "|".join(rf"(?:www\.)?{re.escape(s)}" for s in sorted(spellings))
-              + r")(?![\w.-]|:\d)")
-        self.text_url_re = re.compile(
-            rf"(?:https?:)?//{hp}(/[^\s'\"<>()\\]*)?", re.IGNORECASE)
-        self.esc_url_re = re.compile(
-            rf"(?:https?:)?\\/\\/{hp}((?:\\/[^\s'\"<>()\\]*)*)", re.IGNORECASE)
-        self.host_probe_re = re.compile(
-            rf"(?:https?:)?(?:\\?/){{2}}{hp}", re.IGNORECASE)
+        self._build_host_regexes()
 
         self.session = requests.Session()
         retry = Retry(total=2, backoff_factor=0.4,
@@ -736,6 +746,10 @@ class Exporter:
         # and per-module count of slides whose layers were embedded
         self._sr7_rest_cache: dict[str, dict | None] = {}
         self.sr7_hydrated: dict[str, int] = {}
+        # split-DNS detection of additional same-site hosts
+        self._dns_cache: dict[str, bool] = {}
+        self.auto_internal_hosts: list[str] = []
+        self.foreign_wp_hosts: set[str] = set()
         self.generated_sitemap: dict | None = None
         self.sitemap_discovery_ok = False  # a usable origin sitemap was found
         self.cruft_removed: dict[str, int] = {}
@@ -767,6 +781,93 @@ class Exporter:
         # Revolution module lists): fetched if the origin has them, silently
         # skipped if not -- a 404 here is not an export error
         self.speculative_urls: set[str] = set()
+
+    def _build_host_regexes(self) -> None:
+        """(Re)build the host-matching regexes for URL localization from
+        the CURRENT internal_norms; called again when hosts are absorbed
+        later (split-DNS detection). Covers the www. variant, both IDN
+        spellings, and every textual form page builders emit: plain
+        absolute, protocol-relative (//host/...) and JSON-escaped
+        (https:\\/\\/host\\/...). internal_norms already includes the
+        connect address when --host is used (staging-IP leaks in slider
+        configs). The lookahead anchors the host: without it example.at
+        would match inside example.athletic.de (and localize_text would
+        destroy that external URL), and example.at:8443 -- a DIFFERENT
+        origin -- would half-match. A port is only matched when it is part
+        of the spelling itself."""
+        spellings: set[str] = set()
+        for n in self.internal_norms:
+            spellings |= host_spellings(n)
+        # scheme-default ports are the same origin: https://host:443/ and
+        # http://host:80/ occasionally leak into markup. (Known limitation:
+        # a trailing-dot FQDN spelling "host." is not matched.)
+        for s in list(spellings):
+            if ":" not in s:
+                spellings.add(f"{s}:443")
+                spellings.add(f"{s}:80")
+        hp = (r"(?:"
+              + "|".join(rf"(?:www\.)?{re.escape(s)}" for s in sorted(spellings))
+              + r")(?![\w.-]|:\d)")
+        self.text_url_re = re.compile(
+            rf"(?:https?:)?//{hp}(/[^\s'\"<>()\\]*)?", re.IGNORECASE)
+        self.esc_url_re = re.compile(
+            rf"(?:https?:)?\\/\\/{hp}((?:\\/[^\s'\"<>()\\]*)*)", re.IGNORECASE)
+        self.host_probe_re = re.compile(
+            rf"(?:https?:)?(?:\\?/){{2}}{hp}", re.IGNORECASE)
+
+    def _dns_private(self, host: str) -> bool:
+        if host not in self._dns_cache:
+            self._dns_cache[host] = resolves_private(host)
+        return self._dns_cache[host]
+
+    def _absorb_private_hosts(self) -> None:
+        """Split-horizon DNS detection: probe the homepage for absolute
+        hosts and treat every one that resolves to a private address (from
+        THIS machine, which sits next to the origin) as another spelling of
+        the site -- e.g. the internal WP admin domain the siteurl points
+        at. Runs single-threaded before the crawl so the localization
+        regexes can be rebuilt safely."""
+        if not self.cfg.resolve_internal:
+            return
+        try:
+            resp = self.fetch(f"{self.scheme}://{self.host}/")
+        except requests.RequestException:
+            return
+        text = resp.text.replace("\\/", "/")
+        seen: set[str] = set()
+        for m in ABS_HOST_RE.finditer(text):
+            norm = norm_host(m.group(1))
+            if norm in seen or norm in self.internal_norms:
+                continue
+            seen.add(norm)
+            if self._dns_private(norm):
+                self.internal_norms.add(norm)
+                self.auto_internal_hosts.append(norm)
+                self.say(f"[discover] host {norm} resolves to a private "
+                         f"address -- treating as internal")
+        if self.auto_internal_hosts:
+            self._build_host_regexes()
+
+    def _warn_foreign_site_hosts(self) -> None:
+        """Post-crawl safety net for same-site hosts that slipped through:
+        privately-resolving stragglers and foreign hosts serving wp-content
+        paths (likely the same WP install; not auto-localized because it
+        could be a real upload CDN)."""
+        if self.cfg.resolve_internal:
+            for host in sorted(self.external_hosts):
+                norm = norm_host(host)
+                if norm not in self.internal_norms and self._dns_private(norm):
+                    self.warnings.append(
+                        f"host {host} resolves to a private address but was "
+                        f"first seen after the crawl started -- re-run with "
+                        f"--internal-host {host}")
+        for host in sorted(self.foreign_wp_hosts):
+            if norm_host(host) in self.internal_norms:
+                continue
+            self.warnings.append(
+                f"host {host} serves wp-content paths -- it is very likely "
+                f"THIS WordPress site under another name; re-run with "
+                f"--internal-host {host} (ignore if it is a real CDN)")
 
     def say(self, msg: str) -> None:
         """Progress chatter -- silenced by --quiet (warnings and the final
@@ -1458,6 +1559,10 @@ class Exporter:
                     script.string = text[:m.end()] + new_blob + text[end:]
                     with self.stats_lock:
                         self.sr7_hydrated[dom_id] = merged
+                    # REST layers may carry the siteurl host (admin domain)
+                    for fw in FOREIGN_WP_RE.finditer(new_blob):
+                        if norm_host(fw.group(1)) not in self.internal_norms:
+                            self.foreign_wp_hosts.add(fw.group(1))
                 still = [1 for v in pending.values()
                          if len(v.get("layers") or []) == 0]
                 if still:
@@ -1564,6 +1669,8 @@ class Exporter:
             host = urlsplit(u).netloc
             if host:
                 self.external_hosts.add(host)
+                if FOREIGN_WP_RE.match(u):
+                    self.foreign_wp_hosts.add(host)
 
         def handle_candidate(u: str, tag_name: str, rel: set[str]) -> None:
             u = u.strip()
@@ -3154,6 +3261,8 @@ esac
                 "amp_variants_exported": sorted(self.amp_links),
             },
             "external_hosts_referenced": sorted(self.external_hosts),
+            "auto_internal_hosts": self.auto_internal_hosts,
+            "foreign_wp_hosts": sorted(self.foreign_wp_hosts),
             "verification": {
                 # policy checks (homepage at root, dynamic-endpoint
                 # artifacts) always run; reference resolution needs rewrite
@@ -3243,6 +3352,11 @@ esac
                     sorted(self.excluded_urls)),
             section("External hosts (linked as-is, intentionally NOT "
                     "downloaded)", sorted(self.external_hosts)),
+            section("Hosts auto-detected as internal (private DNS)",
+                    self.auto_internal_hosts),
+            section("Foreign hosts serving wp-content paths (likely the "
+                    "same site -- consider --internal-host)",
+                    sorted(self.foreign_wp_hosts)),
             section("Verification: referenced local files missing",
                     self.verify_missing,
                     lambda v: f"{v['file']} -> {v['ref']}"
@@ -3298,6 +3412,7 @@ esac
 
         seeds = self.discover()
         self.say(f"[discover] {len(set(seeds))} unique pages from sitemaps")
+        self._absorb_private_hosts()
         self.crawl(seeds)
 
         # a crash in ANY post-crawl step must never discard the report
@@ -3311,6 +3426,7 @@ esac
 
         step("404 capture", self.capture_404)
         step("favicon capture", self.capture_favicon)
+        step("internal-host detection", self._warn_foreign_site_hosts)
         if self.cfg.generate_sitemap:
             step("sitemap generation", self.write_generated_sitemap)
         step("robots.txt finalization", self.finalize_robots)
@@ -3338,6 +3454,13 @@ esac
             print(f"[seo] SR7: {sum(self.sr7_hydrated.values())} lazy "
                   f"slide(s) hydrated into {len(self.sr7_hydrated)} "
                   f"slider(s) -- no runtime wp-json requests needed")
+        if self.auto_internal_hosts:
+            print(f"[done] auto-detected internal hosts (private DNS): "
+                  f"{', '.join(self.auto_internal_hosts)}")
+        if self.foreign_wp_hosts:
+            print(f"[warn] foreign hosts serving wp-content paths -- likely "
+                  f"the same site; consider --internal-host: "
+                  f"{', '.join(sorted(self.foreign_wp_hosts))}")
         if self.cfg.staging:
             print("[staging] export is noindexed everywhere "
                   "(robots.txt, X-Robots-Tag, meta robots)")
@@ -3556,6 +3679,11 @@ Notes:
                          "WordPress siteurl points at -- URLs on these hosts "
                          "get localized like the main domain instead of "
                          "surviving as (possibly private) absolute links")
+    ap.add_argument("--no-resolve-internal", dest="resolve_internal",
+                    action="store_false",
+                    help="skip the split-DNS detection that treats hosts "
+                         "resolving to private addresses (from this machine) "
+                         "as additional spellings of the site")
     ap.add_argument("--no-sr7-hydrate", dest="sr7_hydrate",
                     action="store_false",
                     help="do not embed lazy Slider Revolution 7 slides into "
@@ -3630,6 +3758,7 @@ Notes:
         sr7_hydrate=args.sr7_hydrate,
         internal_hosts=[re.sub(r"^https?://", "", h.strip()).rstrip("/")
                         for h in args.internal_hosts if h.strip()],
+        resolve_internal=args.resolve_internal,
     )
     if args.user_agent:
         cfg.user_agent = args.user_agent

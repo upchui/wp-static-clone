@@ -129,7 +129,9 @@ def export(mod, tmp_path_factory):
     thread.start()
     out = tmp / "export"
     try:
-        code = mod.main([origin, "-o", str(out), "--clean"])
+        # --no-resolve-internal: no real DNS lookups in CI
+        code = mod.main([origin, "-o", str(out), "--clean",
+                         "--no-resolve-internal"])
     finally:
         server.shutdown()
     assert code == 0

@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.4.3 (2026-08-27)
+
+### Added
+- **Split-DNS auto-detection**: hosts found on the homepage that resolve
+  (from the export machine) exclusively to private addresses — e.g. an
+  internal WP admin domain the siteurl points at — are automatically
+  treated as additional spellings of the site and localized. Disable with
+  `--no-resolve-internal`. Privately-resolving hosts first seen later in
+  the crawl produce a warning with a ready-made `--internal-host` hint.
+- Foreign hosts serving `/wp-content/`/`/wp-includes/` paths (in markup or
+  SR7 REST layers) are reported prominently as "very likely the same
+  WordPress site under another name" with the exact `--internal-host`
+  command to use — not auto-localized, since they could be a real upload
+  CDN.
+
 ## 1.4.2 (2026-08-27)
 
 ### Fixed

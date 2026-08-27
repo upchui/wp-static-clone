@@ -88,7 +88,7 @@ If the target server has no DNS entry (e.g. an origin behind a CDN, reachable di
 
 All connections go to the IP, but URL classification and rewriting run on the logical host, so the HTML is localized cleanly to local paths.
 
-If the WordPress `siteurl` points at yet another (internal) domain — an admin host like `example-admin.internal.corp` — its URLs can leak into markup and REST responses. Declare it with `--internal-host example-admin.internal.corp` (repeatable) so those URLs get localized too instead of surviving as absolute links that browsers may treat as local-network access.
+If the WordPress `siteurl` points at yet another (internal) domain — an admin host like `example-admin.internal.corp` — its URLs can leak into markup and REST responses. Such hosts are usually **detected automatically**: any host on the homepage that resolves to a private address from the export machine is treated as another spelling of the site and localized (`--no-resolve-internal` disables this). For hosts the detection can't see (public DNS via a WAF), declare them with `--internal-host example-admin.internal.corp` (repeatable); the report lists candidates under "Foreign hosts serving wp-content paths".
 
 ### WordPress origin behind an HTTPS proxy
 

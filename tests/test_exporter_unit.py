@@ -618,3 +618,84 @@ def test_verify_private_in_js_and_websocket(mod, tmp_path):
     refs = " | ".join(v["ref"] for v in e.verify_unexpected)
     assert "wss://192.168.1.5" in refs
     assert "10.99.0.1" in refs and "JS" in refs
+
+
+# -- v1.4.3: split-DNS auto-detection of same-site hosts --------------------
+
+def test_resolves_private(mod, monkeypatch):
+    def fake_gai(results):
+        return lambda host, port: [(0, 0, 0, "", (a, 0)) for a in results]
+
+    monkeypatch.setattr(mod.socket, "getaddrinfo", fake_gai(["10.1.2.3"]))
+    assert mod.resolves_private("admin.internal.test")
+    monkeypatch.setattr(mod.socket, "getaddrinfo",
+                        fake_gai(["45.60.155.222"]))
+    assert not mod.resolves_private("public.test")
+    monkeypatch.setattr(mod.socket, "getaddrinfo",
+                        fake_gai(["10.1.2.3", "45.60.155.222"]))
+    assert not mod.resolves_private("mixed.test")       # public record wins
+
+    # DNS-sinkhole answers (adblockers) must NOT count as internal
+    monkeypatch.setattr(mod.socket, "getaddrinfo", fake_gai(["0.0.0.0"]))
+    assert not mod.resolves_private("clarity.ms")
+    monkeypatch.setattr(mod.socket, "getaddrinfo", fake_gai(["127.0.0.1"]))
+    assert not mod.resolves_private("tracker.test")
+
+    def boom(host, port):
+        raise OSError("NXDOMAIN")
+    monkeypatch.setattr(mod.socket, "getaddrinfo", boom)
+    assert not mod.resolves_private("nope.test")
+
+
+def test_absorb_private_hosts(mod, tmp_path, monkeypatch):
+    e = mod.Exporter(mod.Config(base_url="https://example.at",
+                                out_dir=tmp_path / "o"))
+
+    class FakeResp:
+        ok = True
+        is_redirect = is_permanent_redirect = False
+        text = ('<img src="https://admin.internal.test/wp-content/x.jpg">'
+                '<script src="https://cdn.public.test/lib.js"></script>')
+
+    e.fetch = lambda url, **kw: FakeResp()
+    monkeypatch.setattr(mod, "resolves_private",
+                        lambda h: h == "admin.internal.test")
+    e._absorb_private_hosts()
+    assert e.auto_internal_hosts == ["admin.internal.test"]
+    assert e.is_internal("https://admin.internal.test/x")
+    # regex rebuild took effect: localization now covers the new host
+    assert e.localize_text("https://admin.internal.test/wp-content/x.jpg") \
+        == "/wp-content/x.jpg"
+    assert e.localize_text("https://cdn.public.test/lib.js") \
+        == "https://cdn.public.test/lib.js"
+
+
+def test_absorb_disabled_by_flag(mod, tmp_path, monkeypatch):
+    e = mod.Exporter(mod.Config(base_url="https://example.at",
+                                out_dir=tmp_path / "o",
+                                resolve_internal=False))
+    e.fetch = lambda url, **kw: (_ for _ in ()).throw(AssertionError("fetched"))
+    e._absorb_private_hosts()                           # must not fetch
+    assert e.auto_internal_hosts == []
+
+
+def test_foreign_wp_host_warning(mod, tmp_path, monkeypatch):
+    e = mod.Exporter(mod.Config(base_url="https://example.at",
+                                out_dir=tmp_path / "o"))
+    monkeypatch.setattr(mod, "resolves_private", lambda h: False)
+    e.foreign_wp_hosts.add("example-admin.at.zurich.com")
+    e.external_hosts.add("fonts.googleapis.com")
+    e._warn_foreign_site_hosts()
+    assert any("--internal-host example-admin.at.zurich.com" in w
+               for w in e.warnings)
+
+
+def test_private_straggler_warning(mod, tmp_path, monkeypatch):
+    e = mod.Exporter(mod.Config(base_url="https://example.at",
+                                out_dir=tmp_path / "o"))
+    monkeypatch.setattr(mod, "resolves_private",
+                        lambda h: h == "late.internal.test")
+    e.external_hosts.add("late.internal.test")
+    e._warn_foreign_site_hosts()
+    assert any("late.internal.test" in w and "--internal-host" in w
+               for w in e.warnings)
