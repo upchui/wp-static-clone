@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.3.1 (2026-08-27)
+
+### Fixed
+- **Dynamic download endpoints work statically**: extensionless URLs like
+  `/download/123/?tmstv=…` (Download Monitor & co., served with
+  `Content-Disposition: attachment`) are now materialized as real files
+  next to their URL path (`/download/123/Vollmacht-04.2021.pdf`, name from
+  Content-Disposition incl. RFC 5987 `filename*`), all HTML links are
+  rewritten onto the file, and the old endpoint URLs (with or without
+  trailing slash, any cache-buster query) 301 onto it in all three deploy
+  formats. Previously these were saved as a misplaced extensionless file
+  and every download link 404'd.
+- Query-string links additionally queue their bare-path variant for
+  crawling, so such endpoints are discovered even when no sitemap lists
+  them.
+
 ## 1.3.0 (2026-08-26)
 
 ### Fixed

@@ -31,6 +31,19 @@ def _make_handler(root: Path):
                 self.send_header("Location", REDIRECTS[path])
                 self.end_headers()
                 return
+            if path in ("/download/9", "/download/9/"):
+                # dynamic download endpoint (Download Monitor pattern)
+                body = b"%PDF-1.4\nvollmacht"
+                self.send_response(200)
+                self.send_header("Content-Type", "application/pdf")
+                self.send_header(
+                    "Content-Disposition",
+                    'attachment; filename="Vollmacht-04.2021.pdf"; '
+                    "filename*=UTF-8''Vollmacht-04.2021.pdf")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             if path in ("/dynamic", "/dynamic/"):
                 # uniqid()-style noise fresh on every request -- must be
                 # classified "same", not "dynamic", by the mobile check
@@ -207,6 +220,22 @@ def test_origin_sitemap_301(export):
 def test_media_streamed(export):
     pdf = export["public"] / "wp-content" / "uploads" / "dokument.pdf"
     assert pdf.read_bytes().startswith(b"%PDF-1.4")
+
+
+def test_download_endpoint_materialized(export):
+    f = export["public"] / "download" / "9" / "Vollmacht-04.2021.pdf"
+    assert f.read_bytes().startswith(b"%PDF-1.4")
+    # link rewritten onto the file, cache-buster query gone
+    html = (export["public"] / "index.html").read_text(encoding="utf-8")
+    assert 'href="/download/9/Vollmacht-04.2021.pdf"' in html
+    assert "tmstv" not in html
+    # old endpoint URLs 301 onto the file
+    inc = (export["out"] / "redirects.inc").read_text()
+    assert ('rewrite "^/download/9/$" "/download/9/Vollmacht-04.2021.pdf" '
+            "permanent;") in inc
+    assert '"^/download/9$"' in inc
+    assert export["report"]["downloads"] == {
+        "/download/9/": "/download/9/Vollmacht-04.2021.pdf"}
 
 
 def test_redirect_stub_noindexed(export):
