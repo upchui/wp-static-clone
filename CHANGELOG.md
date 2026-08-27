@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.4.1 (2026-08-27)
+
+### Fixed
+- **No more browser "Local Network Access" prompts**: WordPress behind a
+  mapped port (crawled via `10.x.x.x:81`, running on `:80` inside a
+  container) emits some URLs — e.g. in SR7 REST responses — with the bare
+  IP and no port. That spelling wasn't recognized as internal, survived
+  unlocalized, and made browsers prompt before loading slide images from
+  the private IP. Every port spelling of the connect address is now
+  treated as internal and localized.
+- New verification safety net: any leftover private/loopback URL
+  (RFC 1918, 169.254, 127.x, localhost, `*.local`) whose host is not the
+  site's own is flagged in the report.
+
 ## 1.4.0 (2026-08-27)
 
 ### Fixed

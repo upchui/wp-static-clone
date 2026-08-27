@@ -540,3 +540,36 @@ def test_hydrate_sr7_noop_without_lazy_slides(mod, tmp_path):
     html = SR7_HTML.replace('"3":{"slide":{"id":3},"layers":[]},', "")
     e._hydrate_sr7(BeautifulSoup(html, "html.parser"))
     assert calls == []                                    # no wp-json request
+
+
+# -- v1.4.1: private origin IP handling -------------------------------------
+
+def test_connect_address_all_port_spellings_internal(mod, tmp_path):
+    e = mod.Exporter(mod.Config(base_url="http://10.11.16.10:81",
+                                host_header="www.example.at",
+                                out_dir=tmp_path / "o"))
+    assert e.is_internal("http://10.11.16.10:81/x")
+    assert e.is_internal("http://10.11.16.10/x")          # portless (WP :80)
+    assert e.localize_text("http://10.11.16.10/wp-content/u/x.jpg") \
+        == "/wp-content/u/x.jpg"
+    assert e.localize_text("http://10.11.16.10:81/wp-content/u/x.jpg") \
+        == "/wp-content/u/x.jpg"
+    # a DIFFERENT private IP stays foreign
+    assert e.localize_text("http://10.99.0.1/x.jpg") == "http://10.99.0.1/x.jpg"
+    assert not e.is_internal("http://10.99.0.1/x.jpg")
+
+
+def test_verify_flags_foreign_private_urls(mod, tmp_path):
+    e = mod.Exporter(mod.Config(base_url="http://127.0.0.1:8123",
+                                out_dir=tmp_path / "o"))
+    e.public_dir.mkdir(parents=True)
+    (e.public_dir / "index.html").write_text(
+        '<html><head><link rel="canonical" href="http://127.0.0.1:8123/">'
+        '</head><body>'
+        '<script>var s={"img":"http://10.99.0.1/wp-content/x.jpg"};</script>'
+        "</body></html>")
+    e.verify_export()
+    refs = [v["ref"] for v in e.verify_unexpected]
+    assert any("10.99.0.1" in r and "Local Network Access" in r for r in refs)
+    # the site's own (loopback) canonical is NOT flagged
+    assert not any("127.0.0.1" in r for r in refs)

@@ -164,7 +164,7 @@ if sys.version_info < (3, 10):
              f"(running {sys.version.split()[0]})")
 
 TOOL_NAME = "wp-static-export"
-VERSION = "1.4.0"
+VERSION = "1.4.1"
 
 # --------------------------------------------------------------------------
 # Classification helpers
@@ -260,6 +260,19 @@ def norm_host(host: str) -> str:
         host = head + sep + port
     return host
 
+
+# private/loopback/link-local hosts -- a URL like this in the export makes
+# browsers show the Local Network Access permission prompt (or just fail)
+PRIVATE_NET_RE = re.compile(
+    r"https?://(?:"
+    r"10\.\d{1,3}\.\d{1,3}\.\d{1,3}"
+    r"|192\.168\.\d{1,3}\.\d{1,3}"
+    r"|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}"
+    r"|169\.254\.\d{1,3}\.\d{1,3}"
+    r"|127\.\d{1,3}\.\d{1,3}\.\d{1,3}"
+    r"|localhost\b"
+    r"|[\w.-]+\.local\b"
+    r")(?::\d+)?", re.IGNORECASE)
 
 CD_FILENAME_STAR_RE = re.compile(r"filename\*\s*=\s*[\w-]+''([^;]+)",
                                  re.IGNORECASE)
@@ -619,6 +632,13 @@ class Exporter:
         self.internal_norms = {self.base_norm}
         if cfg.host_header and self.connect_norm != self.base_norm:
             self.internal_norms.add(self.connect_norm)
+            # the connect address is never a legitimate external link, so
+            # treat EVERY port spelling of it as internal: WordPress inside
+            # a container (crawled via 10.x.x.x:81) often emits its URLs
+            # portless (:80) -- e.g. in SR7 REST responses -- and an
+            # unlocalized private IP in the export makes browsers throw the
+            # Local Network Access permission prompt
+            self.internal_norms.add(self.connect_norm.partition(":")[0])
         self.public_dir = cfg.out_dir / "public"
         # --target-domain: SEO-bearing origin URLs (canonical, og:*, JSON-LD,
         # sitemap <loc>, robots.txt) get this prefix instead of staying on
@@ -2452,6 +2472,19 @@ class Exporter:
                 unexpected_seen.add(key)
                 self.verify_unexpected.append({"file": rel_file, "ref": ref})
 
+        def note_private(rel_file: str, text: str, where: str) -> None:
+            """Flag private/loopback URLs whose host is NOT one of our own
+            internal spellings (those get localized) -- leftovers make
+            browsers show the Local Network Access prompt."""
+            if "//" not in text:
+                return
+            for m in PRIVATE_NET_RE.finditer(text):
+                if not self.is_internal(m.group(0)):
+                    note_unexpected(
+                        rel_file,
+                        f"private-network URL {m.group(0)} in {where} -- "
+                        f"browsers prompt for Local Network Access")
+
         def exists_local(ref: str) -> bool:
             path = ref.split("#", 1)[0].split("?", 1)[0]
             path = unicodedata.normalize("NFC", unquote(path))
@@ -2496,6 +2529,9 @@ class Exporter:
             soup = BeautifulSoup(html_file.read_bytes(), "html.parser")
             for tag in soup.find_all(True):
                 if tag.name == "meta":
+                    content = tag.get("content")
+                    if isinstance(content, str) and content:
+                        note_private(rel_file, content, "<meta>")
                     continue
                 rel_attr = tag.get("rel")
                 rel = {r.lower() for r in (rel_attr if isinstance(rel_attr, list)
@@ -2511,6 +2547,7 @@ class Exporter:
                         continue
                     if not allowed_abs and self.host_probe_re.search(val):
                         note_unexpected(rel_file, f"<{tag.name} {attr}=...>")
+                    note_private(rel_file, val, f"<{tag.name} {attr}=...>")
                     if attr in SRCSET_ATTRS:
                         for cand in val.split(","):
                             cand = cand.strip().split(" ")[0]
@@ -2530,6 +2567,10 @@ class Exporter:
                     check_ref(rel_file, m.group(1))
             for script in soup.find_all("script"):
                 stype = (script.get("type") or "").lower()
+                if script.string:
+                    note_private(rel_file,
+                                 script.string.replace("\\/", "/"),
+                                 "<script> block")
                 if "ld+json" in stype:
                     if (self.cfg.target_domain and script.string
                             and self.host_probe_re.search(script.string)):
