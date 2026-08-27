@@ -2776,6 +2776,13 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
+
+# name the auto-created default network after the site (like the
+# container) -- otherwise every "-o ./static" deployment ends up with an
+# indistinguishable <dirname>_default network
+networks:
+  default:
+    name: wpstatic-__SITE_SLUG__
 """.replace("__SITE_SLUG__", site_slug).replace("__PORT__", str(self.cfg.port))
         (self.cfg.out_dir / "docker-compose.yml").write_text(compose, encoding="utf-8")
 
