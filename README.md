@@ -21,6 +21,17 @@ For development (test suite): `.venv/bin/pip install -r requirements-dev.txt`, t
 
 All examples below use `.venv/bin/python`; if you have the packages installed globally, `python3` works too.
 
+### System Python too old? (CentOS/RHEL 7, old Debian, …)
+
+On hosts whose `python3` is older than 3.10, `pip install -r requirements.txt` fails ("No matching distribution found for requests>=2.32" — requests 2.32 needs Python ≥3.8, the tool itself needs 3.10). Don't fight the system Python — run the exporter in a throwaway container instead (Docker is needed for serving anyway):
+
+```bash
+./run-docker.sh https://www.example.at -o ./export --clean
+./run-docker.sh http://10.0.0.5:8080 --host example.at -o ./export --clean
+```
+
+The wrapper uses `python:3.12-slim` with `--network host` (internal origin IPs stay reachable) and your own uid (export files belong to you, not root). And if the machine is only meant to **serve** an existing clone, you don't need Python at all — copy the `export/` directory over and run `./server.sh up`.
+
 ---
 
 ## Quick start
