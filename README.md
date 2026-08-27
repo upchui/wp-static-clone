@@ -10,12 +10,14 @@ The result renders exactly like the live site when served over HTTP — without 
 
 ## Installation
 
-Only `requests` and `beautifulsoup4` are required (Python 3.10+, Linux/macOS — URLs containing NTFS-illegal characters produce per-file warnings on Windows).
+Python 3.10+ (Linux/macOS — URLs containing NTFS-illegal characters produce per-file warnings on Windows). Required packages: `requests`, `beautifulsoup4` and — for the default minification — `rjsmin` + `rcssmin`:
 
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 ```
+
+**Updating an existing venv after a `git pull`**: run the same `pip install -r requirements.txt` again — a venv missing the minifier packages aborts with `error: minification (default on) needs the rjsmin and rcssmin packages …` (or run with `--no-minify`).
 
 For development (test suite): `.venv/bin/pip install -r requirements-dev.txt`, then `pytest`.
 
@@ -124,9 +126,11 @@ The export is SEO-complete out of the box:
 
 - **Generated sitemap** — a fresh `/sitemap.xml` is written from the URL set the origin sitemap declared and the export contains: `noindex` pages, redirect sources and canonical mismatches are excluded, and pages only discovered via links (WP attachment pages, cache artifacts) stay out unless you pass `--sitemap-include-linked`. `<lastmod>` comes from the `Last-Modified` header. The `robots.txt` `Sitemap:` line is pointed at it (a missing robots.txt is generated). `--no-generate-sitemap` keeps the origin sitemap files instead (unchanged except the localized XSL reference). After a domain move, submit `/sitemap.xml` in Search Console once.
 - **One canonical URL per page** — the generated nginx config 301s `/page` → `/page/` (matching the exported structure) and serves the redirects observed on the origin as real 301s (`redirects.inc`), visitor query strings included; old origin sitemap URLs 301 onto the generated `/sitemap.xml`. Redirect stubs carry `noindex`; `/404.html` answers 404 instead of an indexable 200. On Netlify and Apache the trailing-slash canonicalization comes from the platform itself (Pretty URLs / `DirectorySlash`, both on by default).
-- **WordPress cruft removed** — generator meta, wp-json/oEmbed/feed discovery, EditURI/RSD, wlwmanifest, pingback, `?p=` shortlinks and the Cloudflare Insights beacon (which only produces CORS errors off Cloudflare) are stripped. `canonical`, `hreflang`, `og:*`/`twitter:*` and JSON-LD stay. Disable with `--no-strip-wp-cruft`.
+- **WordPress cruft removed** — generator meta, wp-json/oEmbed/feed discovery, EditURI/RSD, wlwmanifest, pingback, `?p=` shortlinks, the Cloudflare Insights beacon (which only produces CORS errors off Cloudflare) and `dns-prefetch`/internal `preconnect` resource hints (which trigger browser Local-Network-Access prompts when they point at internal hosts) are stripped. `canonical`, `hreflang`, `og:*`/`twitter:*` and JSON-LD stay. Disable with `--no-strip-wp-cruft`.
 - **Image optimization** — `loading="lazy"` + `decoding="async"` on images (except each page's first image and plugin-lazyloaded ones) and `width`/`height` attributes read straight from the local PNG/JPEG/GIF/WebP headers (CLS). Disable with `--no-optimize-images`.
-- **Minification** — every exported HTML page (comments/indentation, conservative), CSS and JS file (rcssmin/rjsmin; `*.min.*` skipped) plus inline styles/scripts is minified; JSON-LD and `<pre>`/`<textarea>` content stay untouched. Disable with `--no-minify`.
+- **Minification** — every exported HTML page, CSS and JS file (incl. `*.min.*`) plus inline styles/scripts is minified, with **all comments removed**: license banners, IE conditional comments, CSS hack pairs. JSON-LD and `<pre>`/`<textarea>` content stay untouched; comment-lookalike *string literals* in plugin JS (e.g. SR7 WebGL shader placeholders) are functional code and remain. Disable with `--no-minify`.
+- **Slider Revolution 7 works statically** — SR7 lazy-loads later slides from `/wp-json/…` at runtime, which freezes the slider on slide 1 in a static mirror. The exporter fetches each slider's full object once at export time and embeds the missing slide layers into the page (the runtime's own cache check then makes zero requests), downloading the later-slide images along the way. Disable with `--no-sr7-hydrate`.
+- **Download endpoints become real files** — dynamic download URLs (`/download/123/?tmstv=…`, Download Monitor & co. serving `Content-Disposition: attachment`) are saved under their real file name (`/download/123/Vollmacht.pdf`), all links are rewritten onto the file, and the old endpoint URLs 301 onto it in every deploy format.
 
 ### Which domain do the SEO URLs point to?
 
@@ -173,6 +177,8 @@ For non-Docker nginx, check the module with `nginx -V 2>&1 | grep -o with-http_s
 | `--exclude REGEX` | skip pages and assets whose URL path matches (repeatable) |
 | `--internal-host H` | additional spelling of the same site (admin domain etc.), localized like the main domain (repeatable) |
 | `--respect-robots` | honor robots.txt Allow/Disallow (`*`/`$` supported) and Crawl-delay |
+| `--no-sr7-hydrate` | don't embed lazy Slider Revolution 7 slides (sliders may freeze statically) |
+| `--no-resolve-internal` | skip the split-DNS detection of additional same-site hosts |
 | `-q, --quiet` | suppress per-round progress output |
 | `--version` | print version and exit |
 
@@ -193,6 +199,12 @@ Every run writes `report.txt` (human-readable) and `report.json` (machine-readab
 - the verification result (missing local files, unexpected absolute references).
 
 If the verification section is empty, the mirror is self-contained.
+
+---
+
+## Changelog
+
+Release history: [CHANGELOG.md](CHANGELOG.md).
 
 ---
 
