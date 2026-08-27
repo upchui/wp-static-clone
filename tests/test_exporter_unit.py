@@ -256,7 +256,11 @@ def test_deploy_files(mod, tmp_path):
 
     compose = (out / "docker-compose.yml").read_text()
     assert "healthcheck:" in compose
-    assert "name: wpstatic-example-at" in compose        # named default network
+    lines = compose.splitlines()
+    assert "name: wpstatic-example-at" in lines          # top-level project name
+    assert "    name: wpstatic-example-at" in lines      # named default network
+    assert 'COMPOSE_PROJECT_NAME="wpstatic-example-at"' in \
+        (out / "server.sh").read_text()
     assert (out / ".dockerignore").is_file()
     assert '"${2:-${PORT:-' in (out / "server.sh").read_text()
 

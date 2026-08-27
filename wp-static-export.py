@@ -2763,6 +2763,12 @@ COPY public/ /usr/share/nginx/html/
         # host; the published port is overridable via $PORT.
         site_slug = re.sub(r"[^a-z0-9]+", "-", self.host.lower()).strip("-") or "site"
         compose = """\
+# explicit per-site project name: compose otherwise derives it from the
+# DIRECTORY name, so several sites deployed from folders all called
+# "static" would share one project -- their up/down runs would then treat
+# each other's containers as orphans and fight over the default network
+name: wpstatic-__SITE_SLUG__
+
 services:
   __SITE_SLUG__:
     build: .
@@ -2836,6 +2842,10 @@ else
 fi
 
 cmd="${1:-up}"
+# pin the compose project per site (belt-and-braces for compose versions
+# without top-level "name:" support and the docker-compose v1 fallback)
+COMPOSE_PROJECT_NAME="wpstatic-__SITE_SLUG__"
+export COMPOSE_PROJECT_NAME
 # explicit argument beats environment beats baked-in default
 PORT="${2:-${PORT:-__PORT__}}"
 case "$PORT" in
@@ -2870,7 +2880,7 @@ case "$cmd" in
     exit 1
     ;;
 esac
-'''.replace("__PORT__", str(self.cfg.port))
+'''.replace("__SITE_SLUG__", site_slug).replace("__PORT__", str(self.cfg.port))
         server_path = self.cfg.out_dir / "server.sh"
         server_path.write_text(server_sh, encoding="utf-8")
         server_path.chmod(0o755)
