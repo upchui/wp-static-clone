@@ -164,6 +164,13 @@ def test_external_lookalike_untouched(export):
     assert "https://example.athletic-shop.de/produkt" in html
 
 
+def test_resource_hints_stripped(export):
+    html = (export["public"] / "index.html").read_text(encoding="utf-8")
+    assert "dns-prefetch" not in html                    # always stripped
+    assert 'rel="preconnect"' in html                    # public font host stays
+    assert "fonts.gstatic.com" in html
+
+
 def test_wp_cruft_stripped(export):
     html = (export["public"] / "index.html").read_text(encoding="utf-8")
     for gone in ("generator", "shortlink", "EditURI", "oembed",

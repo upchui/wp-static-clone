@@ -164,7 +164,7 @@ if sys.version_info < (3, 10):
              f"(running {sys.version.split()[0]})")
 
 TOOL_NAME = "wp-static-export"
-VERSION = "1.4.1"
+VERSION = "1.4.2"
 
 # --------------------------------------------------------------------------
 # Classification helpers
@@ -264,7 +264,7 @@ def norm_host(host: str) -> str:
 # private/loopback/link-local hosts -- a URL like this in the export makes
 # browsers show the Local Network Access permission prompt (or just fail)
 PRIVATE_NET_RE = re.compile(
-    r"https?://(?:"
+    r"(?:https?|wss?)://(?:"
     r"10\.\d{1,3}\.\d{1,3}\.\d{1,3}"
     r"|192\.168\.\d{1,3}\.\d{1,3}"
     r"|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}"
@@ -593,6 +593,7 @@ class Config:
     excludes: list = field(default_factory=list)
     respect_robots: bool = False
     sr7_hydrate: bool = True
+    internal_hosts: list = field(default_factory=list)
 
 
 @dataclass
@@ -639,6 +640,10 @@ class Exporter:
             # unlocalized private IP in the export makes browsers throw the
             # Local Network Access permission prompt
             self.internal_norms.add(self.connect_norm.partition(":")[0])
+        # --internal-host: further spellings of the same site (e.g. the
+        # internal WP admin domain the siteurl points at)
+        for extra in cfg.internal_hosts:
+            self.internal_norms.add(norm_host(extra))
         self.public_dir = cfg.out_dir / "public"
         # --target-domain: SEO-bearing origin URLs (canonical, og:*, JSON-LD,
         # sitemap <loc>, robots.txt) get this prefix instead of staying on
@@ -1861,6 +1866,21 @@ class Exporter:
             if hit:
                 drop(link, sorted(hit)[0])
                 continue
+            # resource hints trigger connection attempts WITHOUT a visible
+            # network request -- pointing at an internal host they make
+            # browsers show the Local Network Access permission prompt.
+            # dns-prefetch is a pure WP automatism: always drop; preconnect
+            # only when it targets our own (localized) or a private host.
+            if "dns-prefetch" in rel:
+                drop(link, "resource-hints")
+                continue
+            if "preconnect" in rel:
+                href_abs = link.get("href") or ""
+                if href_abs.startswith("//"):
+                    href_abs = "https:" + href_abs
+                if self.is_internal(href_abs) or PRIVATE_NET_RE.match(href_abs):
+                    drop(link, "resource-hints")
+                    continue
             if any("api.w.org" in r for r in rel):
                 drop(link, "rest-api-discovery")
                 continue
@@ -2595,6 +2615,7 @@ class Exporter:
                 continue
             if self.host_probe_re.search(text):
                 note_unexpected(rel_file, "absolute origin URL in CSS")
+            note_private(rel_file, text, "CSS")
             css_dir = "/" + posixpath.dirname(rel_file)
             for m in list(CSS_URL_RE.finditer(text)) + list(CSS_IMPORT_RE.finditer(text)):
                 ref = m.group(1).strip()
@@ -2603,6 +2624,16 @@ class Exporter:
                 if not ref.startswith("/"):
                     ref = posixpath.normpath(posixpath.join(css_dir, ref))
                 check_ref(rel_file, ref)
+
+        for js_file in sorted(self.public_dir.rglob("*.js")):
+            rel_file = js_file.relative_to(self.public_dir).as_posix()
+            try:
+                text = js_file.read_text("utf-8", errors="replace")
+            except OSError:
+                continue
+            if self.host_probe_re.search(text):
+                note_unexpected(rel_file, "absolute origin URL in JS")
+            note_private(rel_file, text.replace("\\/", "/"), "JS")
 
         # every <loc> in the generated sitemap must resolve in the export
         if self.generated_sitemap:
@@ -2656,6 +2687,10 @@ class Exporter:
             if not h or norm_host(h) not in self.internal_norms:
                 continue
             for spelling in sorted(host_spellings(h)):
+                if spelling not in hosts:
+                    hosts.append(spelling)
+        for extra in self.cfg.internal_hosts:
+            for spelling in sorted(host_spellings(norm_host(extra))):
                 if spelling not in hosts:
                     hosts.append(spelling)
         if self.cfg.target_domain:
@@ -3514,6 +3549,13 @@ Notes:
                          "Disallow'ed paths ('*' and '$' supported, longest "
                          "match wins) and adopt Crawl-delay as a minimum "
                          "--delay. Off by default (you usually own the site)")
+    ap.add_argument("--internal-host", action="append", default=[],
+                    metavar="HOST", dest="internal_hosts",
+                    help="additional hostname/address of the SAME site "
+                         "(repeatable), e.g. an internal admin domain the "
+                         "WordPress siteurl points at -- URLs on these hosts "
+                         "get localized like the main domain instead of "
+                         "surviving as (possibly private) absolute links")
     ap.add_argument("--no-sr7-hydrate", dest="sr7_hydrate",
                     action="store_false",
                     help="do not embed lazy Slider Revolution 7 slides into "
@@ -3586,6 +3628,8 @@ Notes:
         excludes=args.exclude,
         respect_robots=args.respect_robots,
         sr7_hydrate=args.sr7_hydrate,
+        internal_hosts=[re.sub(r"^https?://", "", h.strip()).rstrip("/")
+                        for h in args.internal_hosts if h.strip()],
     )
     if args.user_agent:
         cfg.user_agent = args.user_agent

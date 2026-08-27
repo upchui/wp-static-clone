@@ -88,6 +88,8 @@ If the target server has no DNS entry (e.g. an origin behind a CDN, reachable di
 
 All connections go to the IP, but URL classification and rewriting run on the logical host, so the HTML is localized cleanly to local paths.
 
+If the WordPress `siteurl` points at yet another (internal) domain — an admin host like `example-admin.internal.corp` — its URLs can leak into markup and REST responses. Declare it with `--internal-host example-admin.internal.corp` (repeatable) so those URLs get localized too instead of surviving as absolute links that browsers may treat as local-network access.
+
 ### WordPress origin behind an HTTPS proxy
 
 Many WordPress origins force HTTPS and answer an HTTP request carrying the real Host header with a **301 to their `https://` URL**. In that case the `X-Forwarded-Proto` header that a CDN/proxy normally sets is missing. Just send it along:
@@ -167,6 +169,7 @@ For non-Docker nginx, check the module with `nginx -V 2>&1 | grep -o with-http_s
 | `--sitemap-include-linked` | also list link-discovered pages in the generated sitemap |
 | `--fail-on {none,errors,verify}` | CI exit-code policy, see below |
 | `--exclude REGEX` | skip pages and assets whose URL path matches (repeatable) |
+| `--internal-host H` | additional spelling of the same site (admin domain etc.), localized like the main domain (repeatable) |
 | `--respect-robots` | honor robots.txt Allow/Disallow (`*`/`$` supported) and Crawl-delay |
 | `-q, --quiet` | suppress per-round progress output |
 | `--version` | print version and exit |

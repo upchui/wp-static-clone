@@ -573,3 +573,48 @@ def test_verify_flags_foreign_private_urls(mod, tmp_path):
     assert any("10.99.0.1" in r and "Local Network Access" in r for r in refs)
     # the site's own (loopback) canonical is NOT flagged
     assert not any("127.0.0.1" in r for r in refs)
+
+
+# -- v1.4.2: resource hints, --internal-host, private URLs in assets --------
+
+def test_resource_hints_stripped_unit(exporter):
+    soup = BeautifulSoup(
+        '<link rel="dns-prefetch" href="//cdnjs.cloudflare.com">'
+        '<link rel="dns-prefetch" href="//example.at">'
+        '<link rel="preconnect" href="https://fonts.gstatic.com/">'
+        '<link rel="preconnect" href="http://10.11.16.10">'
+        '<link rel="preconnect" href="https://example.at">', "html.parser")
+    exporter.strip_wp_cruft(soup)
+    out = str(soup)
+    assert "dns-prefetch" not in out
+    assert "10.11.16.10" not in out                     # private preconnect
+    assert "https://example.at" not in out              # internal preconnect
+    assert out.count("preconnect") == 1                 # public font host stays
+    assert "fonts.gstatic.com" in out
+
+
+def test_internal_host_flag(mod, tmp_path):
+    e = mod.Exporter(mod.Config(base_url="https://example.at",
+                                out_dir=tmp_path / "o",
+                                internal_hosts=["admin.example.internal"]))
+    assert e.is_internal("https://admin.example.internal/x")
+    assert e.localize_text(
+        "https://admin.example.internal/wp-content/x.jpg") == "/wp-content/x.jpg"
+    assert e.localize_text(
+        r"https:\/\/admin.example.internal\/y") == r"\/y"
+    assert "admin.example.internal" in e._sub_filter_hosts()
+
+
+def test_verify_private_in_js_and_websocket(mod, tmp_path):
+    e = mod.Exporter(mod.Config(base_url="http://127.0.0.1:8123",
+                                out_dir=tmp_path / "o"))
+    e.public_dir.mkdir(parents=True)
+    (e.public_dir / "index.html").write_text(
+        "<html><body><script>var w=new WebSocket("
+        '"wss://192.168.1.5/socket");</script></body></html>')
+    (e.public_dir / "app.js").write_text(
+        'fetch("http://10.99.0.1/api/data");')
+    e.verify_export()
+    refs = " | ".join(v["ref"] for v in e.verify_unexpected)
+    assert "wss://192.168.1.5" in refs
+    assert "10.99.0.1" in refs and "JS" in refs

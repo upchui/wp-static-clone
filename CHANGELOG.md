@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.4.2 (2026-08-27)
+
+### Fixed
+- **Resource hints no longer trigger the Local Network Access prompt**:
+  WordPress emits `<link rel="dns-prefetch">`/`preconnect` for every
+  resource host — pointing at an internal host they make browsers attempt
+  a connection WITHOUT any visible network request. dns-prefetch hints are
+  now always stripped; preconnect hints are stripped when they target an
+  internal or private host (public font preconnects stay).
+
+### Added
+- `--internal-host HOST` (repeatable): declare additional spellings of the
+  same site (e.g. an internal WP admin domain the siteurl points at) —
+  their URLs are localized like the main domain.
+- Verification also scans standalone `.js` files and CSS for private/
+  loopback URLs (incl. `ws://`/`wss://`).
+
 ## 1.4.1 (2026-08-27)
 
 ### Fixed
