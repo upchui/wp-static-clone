@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.4.0 (2026-08-27)
+
+### Fixed
+- **Slider Revolution 7 sliders no longer freeze on slide 1**: SR7
+  lazy-loads slides whose inline layers are empty via
+  `/wp-json/sliderrevolution/sliders/<id>?slideid=…` at runtime — a request
+  that 404s on a static mirror, leaving the runtime awaiting a promise that
+  never resolves. The exporter now fetches the full slider object once per
+  slider at export time and embeds the missing layers into the inline
+  `SR7.JSON` blob; the runtime's own cache check then skips the fetch
+  entirely, and the later-slide images are discovered, downloaded and
+  localized for the first time. This is the only wp-json request the
+  exporter ever makes; disable with `--no-sr7-hydrate`. Stream-source
+  sliders (separate endpoint) are reported as a warning.
+
 ## 1.3.1 (2026-08-27)
 
 ### Fixed

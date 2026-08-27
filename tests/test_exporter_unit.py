@@ -474,3 +474,69 @@ def test_save_download(mod, tmp_path):
     assert (e.public_dir / "download" / "9" / "a b.pdf").read_bytes() == b"%PDF-1.4"
     # URL with extension: untouched
     assert e._save_download("https://example.at/x.pdf", FakeResp()) is None
+
+
+# -- v1.4.0: SR7 slide hydration --------------------------------------------
+
+SR7_HTML = """<sr7-module data-id="2" id="SR7_2_1"></sr7-module>
+<script>window.SR7 = window.SR7 || {}; SR7.JSON = SR7.JSON || {};
+SR7.JSON['SR7_2_1'] = {"slides":{"1":{"slide":{"id":1},"layers":{"5":{"x":1}}},"3":{"slide":{"id":3},"layers":[]},"9":{"slide":{"id":9,"global":true},"layers":[]}}};
+</script>"""
+
+
+def _sr7_exporter(mod, tmp_path, response):
+    e = mod.Exporter(mod.Config(base_url="https://example.at",
+                                out_dir=tmp_path / "o"))
+    calls = []
+
+    class FakeResp:
+        ok = response is not None
+        status_code = 200 if response is not None else 404
+        is_redirect = is_permanent_redirect = False
+
+        def json(self):
+            return response
+
+    def fake_fetch(url, **kw):
+        calls.append(url)
+        return FakeResp()
+
+    e.fetch = fake_fetch
+    return e, calls
+
+
+def test_hydrate_sr7_merges_lazy_slides(mod, tmp_path):
+    resp = {"success": True, "slides": {
+        "1": {"slide": {"id": 1}, "layers": {}},
+        "2": {"slide": {"id": 3}, "layers": {
+            "7": {"bg": {"image": {"src": "https://example.at/s2.png"}}}}},
+    }}
+    e, calls = _sr7_exporter(mod, tmp_path, resp)
+    soup = BeautifulSoup(SR7_HTML, "html.parser")
+    e._hydrate_sr7(soup)
+    out = str(soup)
+    assert '"slide":{"id":3},"layers":{"7":' in out       # lazy slide filled
+    assert '"layers":{"5":{"x":1}}' in out                # slide 1 untouched
+    assert '"global":true},"layers":[]' in out            # global untouched
+    assert e.sr7_hydrated == {"SR7_2_1": 1}
+    assert calls == ["https://example.at/wp-json/sliderrevolution/"
+                     "sliders/2?srengine=7"]
+    # second page with the same slider: served from the cache
+    e._hydrate_sr7(BeautifulSoup(SR7_HTML, "html.parser"))
+    assert len(calls) == 1
+
+
+def test_hydrate_sr7_rest_failure_warns(mod, tmp_path):
+    e, calls = _sr7_exporter(mod, tmp_path, None)         # 404
+    soup = BeautifulSoup(SR7_HTML, "html.parser")
+    e._hydrate_sr7(soup)
+    assert '"layers":[]' in str(soup)                     # blob unchanged
+    assert e.sr7_hydrated == {}
+    assert any("freeze" in w for w in e.warnings)
+
+
+def test_hydrate_sr7_noop_without_lazy_slides(mod, tmp_path):
+    e, calls = _sr7_exporter(mod, tmp_path, {"success": True, "slides": {}})
+    html = SR7_HTML.replace('"3":{"slide":{"id":3},"layers":[]},', "")
+    e._hydrate_sr7(BeautifulSoup(html, "html.parser"))
+    assert calls == []                                    # no wp-json request

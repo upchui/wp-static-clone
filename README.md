@@ -107,7 +107,7 @@ Many WordPress origins force HTTPS and answer an HTTP request carrying the real 
 
 - **External hosts** (Google Fonts, Gravatar, analytics, CDNs …) stay **linked in the HTML but are never downloaded**.
 - **Only the target site** is contacted: redirects are followed only while they stay on the target host; foreign sitemap references are skipped.
-- **`wp-admin`, `wp-json`, `xmlrpc.php`, `admin-ajax` & co.** are never requested.
+- **`wp-admin`, `xmlrpc.php`, `admin-ajax` & co.** are never requested. `wp-json` has exactly one read-only exception: the Slider Revolution endpoint, fetched once per slider at export time when a slider has lazy slides — without it SR7 sliders freeze on slide 1 in the static mirror (disable with `--no-sr7-hydrate`).
 - After the export a **verification pass** checks that every local reference resolves to a file on disk and that no unexpected absolute origin URLs remain (result in `report.txt` / `report.json`).
 
 ## What cannot work statically

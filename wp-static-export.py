@@ -164,7 +164,7 @@ if sys.version_info < (3, 10):
              f"(running {sys.version.split()[0]})")
 
 TOOL_NAME = "wp-static-export"
-VERSION = "1.3.1"
+VERSION = "1.4.0"
 
 # --------------------------------------------------------------------------
 # Classification helpers
@@ -579,6 +579,7 @@ class Config:
     quiet: bool = False
     excludes: list = field(default_factory=list)
     respect_robots: bool = False
+    sr7_hydrate: bool = True
 
 
 @dataclass
@@ -706,6 +707,10 @@ class Exporter:
         # dynamic download endpoints materialized as real files:
         # "/download/123/" -> "/download/123/Vollmacht.pdf"
         self.download_map: dict[str, str] = {}
+        # Slider Revolution 7 hydration: REST full-objects per slider id,
+        # and per-module count of slides whose layers were embedded
+        self._sr7_rest_cache: dict[str, dict | None] = {}
+        self.sr7_hydrated: dict[str, int] = {}
         self.generated_sitemap: dict | None = None
         self.sitemap_discovery_ok = False  # a usable origin sitemap was found
         self.cruft_removed: dict[str, int] = {}
@@ -1332,6 +1337,111 @@ class Exporter:
             self.check_mobile_variant(save_url, resp.content, rec)
         return new_pages, new_assets
 
+    def _sr7_full_object(self, slider_id: str) -> dict | None:
+        """Full slider object from the SR7 REST endpoint (all slides with
+        layers, no slideid parameter needed) -- fetched once per slider id.
+        This is the ONLY wp-json request the exporter ever makes, and only
+        when a slider actually has lazy slides (--no-sr7-hydrate disables)."""
+        with self.stats_lock:
+            if slider_id in self._sr7_rest_cache:
+                return self._sr7_rest_cache[slider_id]
+        data: dict | None = None
+        url = (f"{self.scheme}://{self.host}/wp-json/sliderrevolution/"
+               f"sliders/{slider_id}?srengine=7")
+        try:
+            resp = self.fetch(url)
+            if resp.ok and not self.off_site_redirect(resp):
+                obj = resp.json()
+                if isinstance(obj, dict) and obj.get("success"):
+                    data = obj
+        except (requests.RequestException, ValueError):
+            pass
+        with self.stats_lock:
+            self._sr7_rest_cache[slider_id] = data
+        return data
+
+    def _hydrate_sr7(self, soup: BeautifulSoup) -> None:
+        """Slider Revolution 7 lazy-loads slides whose inline `layers` are
+        empty via /wp-json/sliderrevolution/sliders/<id>?slideid=... at
+        runtime -- a request that can never succeed on a static mirror. The
+        runtime then awaits a promise that only resolves on success, so the
+        slider freezes on slide 1. Fix: fetch the full slider object once at
+        export time and merge the missing layers into the inline SR7.JSON
+        blob -- the runtime's own cache check (non-empty layers) then skips
+        the fetch entirely. Runs BEFORE discovery/rewrite, so the
+        later-slide images get downloaded and localized like everything
+        else."""
+        modules = soup.find_all("sr7-module")
+        if not modules:
+            return
+        decoder = json.JSONDecoder()
+
+        def is_lazy(entry: dict) -> bool:
+            slide = entry.get("slide") or {}
+            return (len(entry.get("layers") or []) == 0
+                    and not slide.get("global") and len(slide) > 0)
+
+        for mod in modules:
+            slider_id = (mod.get("data-id") or "").strip()
+            dom_id = (mod.get("id") or "").strip()
+            if not slider_id or not dom_id:
+                continue
+            marker_re = re.compile(
+                rf"SR7\.JSON\[['\"]{re.escape(dom_id)}['\"]\]\s*=\s*")
+            for script in soup.find_all("script"):
+                text = script.string or ""
+                m = marker_re.search(text)
+                if not m:
+                    continue
+                try:
+                    blob, end = decoder.raw_decode(text, m.end())
+                except ValueError:
+                    self.warnings.append(
+                        f"SR7 {dom_id}: inline JSON not parseable, "
+                        f"hydration skipped")
+                    break
+                slides = blob.get("slides") if isinstance(blob, dict) else None
+                if not isinstance(slides, dict):
+                    break
+                pending = {k: v for k, v in slides.items()
+                           if isinstance(v, dict) and is_lazy(v)}
+                if not pending:
+                    break
+                full = self._sr7_full_object(slider_id)
+                if full is None:
+                    self.warnings.append(
+                        f"SR7 slider {slider_id} ({dom_id}) has lazy slides "
+                        f"but the REST endpoint gave no usable answer -- the "
+                        f"slider will freeze in the static mirror")
+                    break
+                by_sid: dict[str, dict] = {}
+                for entry in (full.get("slides") or {}).values():
+                    if isinstance(entry, dict):
+                        sid = (entry.get("slide") or {}).get("id")
+                        if sid is not None:
+                            by_sid[str(sid)] = entry
+                merged = 0
+                for entry in pending.values():
+                    sid = str((entry.get("slide") or {}).get("id"))
+                    src = by_sid.get(sid)
+                    if src and len(src.get("layers") or []) > 0:
+                        entry["layers"] = src["layers"]
+                        merged += 1
+                if merged:
+                    new_blob = json.dumps(blob, ensure_ascii=False,
+                                          separators=(",", ":"))
+                    script.string = text[:m.end()] + new_blob + text[end:]
+                    with self.stats_lock:
+                        self.sr7_hydrated[dom_id] = merged
+                still = [1 for v in pending.values()
+                         if len(v.get("layers") or []) == 0]
+                if still:
+                    self.warnings.append(
+                        f"SR7 slider {slider_id} ({dom_id}): {len(still)} "
+                        f"lazy slide(s) not hydratable (stream source?) -- "
+                        f"the slider may freeze statically")
+                break
+
     def _save_download(self, url: str, resp: requests.Response) -> str | None:
         """Materialize a dynamic download endpoint (an extensionless URL
         like /download/123/ answering with a file) as a REAL file next to
@@ -1418,6 +1528,10 @@ class Exporter:
                             rec: PageRecord | None,
                             save_as: Path | None = None) -> tuple[list[str], list[str]]:
         soup = BeautifulSoup(raw, "html.parser")
+        if self.cfg.rewrite and self.cfg.sr7_hydrate:
+            # must run BEFORE discovery + rewrite: both need to see the
+            # hydrated SR7 blob (later-slide images!)
+            self._hydrate_sr7(soup)
         new_pages: list[str] = []
         new_assets: list[str] = []
 
@@ -2936,6 +3050,7 @@ esac
             },
             "deploy": self.deploy_info,
             "downloads": dict(sorted(self.download_map.items())),
+            "sr7_hydrated": dict(sorted(self.sr7_hydrated.items())),
             "redirects": redirects,
             "pages_found_only_via_links_not_in_sitemap": [p.url for p in link_only],
             "seo": {
@@ -2969,8 +3084,11 @@ esac
                 "policy_checks": True,
                 "reference_checks": self.cfg.rewrite,
                 "policy": "external hosts are linked as-is and never fetched;"
-                          " wp-admin/wp-json/xmlrpc/admin-ajax and other"
-                          " dynamic endpoints are never requested; redirects"
+                          " wp-admin/xmlrpc/admin-ajax and other dynamic"
+                          " endpoints are never requested; wp-json only for"
+                          " the read-only Slider Revolution endpoint when a"
+                          " slider has lazy slides (--no-sr7-hydrate"
+                          " disables); redirects"
                           " are only followed while they stay on the target"
                           " site",
                 "missing_local_files": self.verify_missing,
@@ -3021,6 +3139,9 @@ esac
             section("Download endpoints materialized as files",
                     sorted(self.download_map.items()),
                     lambda d: f"{d[0]} -> {d[1]}"),
+            section("SR7 sliders: lazy slides hydrated into the page",
+                    sorted(self.sr7_hydrated.items()),
+                    lambda s: f"{s[0]}: {s[1]} slide(s)"),
             section("Redirects observed", redirects,
                     lambda r: f"{r['from']} -> {r['to']} ({r['status']})"),
             section("Pages found via links but missing from sitemap", link_only,
@@ -3137,6 +3258,10 @@ esac
         if self.download_map:
             print(f"[seo] {len(self.download_map)} download endpoints "
                   f"materialized as files (links rewritten, 301s generated)")
+        if self.sr7_hydrated:
+            print(f"[seo] SR7: {sum(self.sr7_hydrated.values())} lazy "
+                  f"slide(s) hydrated into {len(self.sr7_hydrated)} "
+                  f"slider(s) -- no runtime wp-json requests needed")
         if self.cfg.staging:
             print("[staging] export is noindexed everywhere "
                   "(robots.txt, X-Robots-Tag, meta robots)")
@@ -3169,7 +3294,8 @@ esac
                   "search (dynamic endpoints).")
             print("[note] External hosts (font/analytics/CDN domains) stay "
                   "linked and are never downloaded; "
-                  "wp-admin/wp-json/xmlrpc are never requested.")
+                  "wp-admin/xmlrpc are never requested (wp-json only for "
+                  "the read-only SR7 slider endpoint when needed).")
         if failed or self.asset_errors or self.warnings:
             print(f"[done] {failed} page errors, {len(self.asset_errors)} "
                   f"asset errors, {len(self.warnings)} warnings -- see report.txt")
@@ -3236,7 +3362,8 @@ Notes:
   * A scheme-less base_url defaults to https:// -- type http://IP explicitly
     for plain-http servers.
   * External hosts (fonts/analytics/CDN) stay linked as-is and are never
-    downloaded; wp-admin / wp-json / xmlrpc are never requested.
+    downloaded; wp-admin / xmlrpc are never requested (wp-json only for the
+    read-only Slider Revolution endpoint when a slider has lazy slides).
   * report.txt / report.json summarize errors, redirects, SEO signals and a
     self-containedness verification pass.""")
     ap.add_argument("--version", action="version",
@@ -3346,6 +3473,13 @@ Notes:
                          "Disallow'ed paths ('*' and '$' supported, longest "
                          "match wins) and adopt Crawl-delay as a minimum "
                          "--delay. Off by default (you usually own the site)")
+    ap.add_argument("--no-sr7-hydrate", dest="sr7_hydrate",
+                    action="store_false",
+                    help="do not embed lazy Slider Revolution 7 slides into "
+                         "the pages. Without hydration SR7 sliders freeze on "
+                         "slide 1 statically (they fetch later slides from "
+                         "wp-json at runtime); hydration performs the only "
+                         "wp-json request the exporter ever makes")
     args = ap.parse_args(argv)
 
     for pattern in args.exclude:
@@ -3410,6 +3544,7 @@ Notes:
         quiet=args.quiet,
         excludes=args.exclude,
         respect_robots=args.respect_robots,
+        sr7_hydrate=args.sr7_hydrate,
     )
     if args.user_agent:
         cfg.user_agent = args.user_agent

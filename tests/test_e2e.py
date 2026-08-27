@@ -31,6 +31,26 @@ def _make_handler(root: Path):
                 self.send_header("Location", REDIRECTS[path])
                 self.end_headers()
                 return
+            if path == "/wp-json/sliderrevolution/sliders/2":
+                origin = f"http://{self.headers.get('Host')}"
+                body = json.dumps({
+                    "success": True, "message": "",
+                    "slides": {
+                        "1": {"id": 1, "slide": {"id": 1}, "layers": {}},
+                        "2": {"id": 3, "slide": {"id": 3}, "layers": {
+                            "7": {"type": "image", "bg": {"image": {
+                                "src": f"{origin}/wp-content/uploads/"
+                                       f"slide2.png"}}}}},
+                    },
+                    "addOns": [],
+                }).encode()
+                self.send_response(200)
+                self.send_header("Content-Type",
+                                 "application/json; charset=UTF-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             if path in ("/download/9", "/download/9/"):
                 # dynamic download endpoint (Download Monitor pattern)
                 body = b"%PDF-1.4\nvollmacht"
@@ -100,7 +120,8 @@ def export(mod, tmp_path_factory):
     uploads.mkdir(parents=True)
     for name, w, h in (("hero.png", 640, 480), ("plain.png", 320, 200),
                        ("lazyplugin.png", 100, 50), ("bg.png", 10, 10),
-                       ("inline.png", 10, 10), ("notfound.png", 20, 20)):
+                       ("inline.png", 10, 10), ("notfound.png", 20, 20),
+                       ("slide2.png", 400, 300)):
         (uploads / name).write_bytes(png_bytes(w, h))
     (uploads / "dokument.pdf").write_bytes(b"%PDF-1.4\n" + b"stream" * 500)
 
@@ -220,6 +241,20 @@ def test_origin_sitemap_301(export):
 def test_media_streamed(export):
     pdf = export["public"] / "wp-content" / "uploads" / "dokument.pdf"
     assert pdf.read_bytes().startswith(b"%PDF-1.4")
+
+
+def test_sr7_slides_hydrated(export):
+    html = (export["public"] / "sr7-page" / "index.html").read_text(
+        encoding="utf-8")
+    # lazy slide 3 got its layers embedded, image localized + downloaded
+    assert "/wp-content/uploads/slide2.png" in html
+    assert '"title":"Zweite"},"layers":{"7":' in html
+    assert '"global":true},"layers":[]' in html      # global slide untouched
+    assert (export["public"] / "wp-content" / "uploads" /
+            "slide2.png").is_file()
+    # nothing under wp-json may exist on disk (policy check stays green)
+    assert not (export["public"] / "wp-json").exists()
+    assert export["report"]["sr7_hydrated"] == {"SR7_2_1": 1}
 
 
 def test_download_endpoint_materialized(export):
