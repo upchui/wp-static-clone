@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.5.2 (2026-08-27)
+
+### Changed
+- HTML minification now removes IE conditional comments as well (the
+  downlevel-revealed pattern keeps its enclosed markup); CSS minification
+  strips the preserved IE5/Mac hack pair `/*\*/ ... /**/`. With that, no
+  comments remain in exported HTML/CSS/JS. Remaining `/*...*/` matches in
+  some JS files are string literals used by plugin code (SR7 WebGL shader
+  placeholders, injected style text) -- functional code, not comments,
+  intentionally untouched.
+
 ## 1.5.1 (2026-08-27)
 
 ### Changed

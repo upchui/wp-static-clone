@@ -205,7 +205,7 @@ def test_minify_html_bytes(mod):
            b"    <span>a</span>\n    <a>b</a>\n  </body>\n</html>")
     out = mod.minify_html_bytes(src)
     assert b"normal comment" not in out
-    assert b"<!--[if IE]>" in out                       # conditional stays
+    assert b"<!--" not in out                           # conditionals go too
     assert b"<pre>  keep   this\n      exactly  </pre>" in out
     assert b"<textarea>  raw\n   text </textarea>" in out
     assert b"var a = 1\nvar b = 2" in out               # script untouched
@@ -222,3 +222,19 @@ def test_minify_css_js(mod):
 def test_minify_strips_bang_comments(mod):
     assert mod.minify_css("/*! bang */body{color:red}") == "body{color:red}"
     assert "bang" not in mod.minify_js("/*! bang */var a=1;")
+
+
+def test_minify_removes_conditionals_and_hacks(mod):
+    # downlevel-revealed conditional: enclosed markup must survive
+    out = mod.minify_html_bytes(
+        b'<!--[if !(IE 8)]><!--><html class="no-js"><!--<![endif]-->'
+        b"<body>x</body></html>")
+    assert b"<!--" not in out
+    assert b'<html class="no-js">' in out
+    # IE5/Mac hack pair in CSS
+    css = mod.minify_css("a{x:1}/*\\*/b{y:2}/**/c{z:3}")
+    assert "/*" not in css
+    assert "a{x:1}" in css and "b{y:2}" in css and "c{z:3}" in css
+    # comment-lookalike STRING LITERALS in JS stay (functional code)
+    js = mod.minify_js('s.replace("/*easeName*/",x);')
+    assert '"/*easeName*/"' in js

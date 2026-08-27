@@ -171,7 +171,7 @@ if sys.version_info < (3, 10):
              f"(running {sys.version.split()[0]})")
 
 TOOL_NAME = "wp-static-export"
-VERSION = "1.5.1"
+VERSION = "1.5.2"
 
 # --------------------------------------------------------------------------
 # Classification helpers
@@ -582,7 +582,13 @@ INDENT_RE = re.compile(r"[ \t]*\n[ \t\n]*")
 def minify_css(text: str) -> str:
     # keep_bang_comments=False: /*! license banners */ go too -- explicit,
     # so a future library-default change can't bring them back
-    return rcssmin.cssmin(text, keep_bang_comments=False) if rcssmin else text
+    if not rcssmin:
+        return text
+    out = rcssmin.cssmin(text, keep_bang_comments=False)
+    # rcssmin deliberately preserves the ancient IE5/Mac hack pair
+    # ("/*\*/ rule /**/") -- obsolete for two decades, strip exactly
+    # those two tokens (nothing else matches this pattern)
+    return re.sub(r"/\*\\?\*/", "", out)
 
 
 def minify_js(text: str) -> str:
@@ -590,19 +596,17 @@ def minify_js(text: str) -> str:
 
 
 def minify_html_bytes(data: bytes) -> bytes:
-    """Conservative HTML minification: drop comments (conditional comments
-    stay) and collapse indentation to a single newline -- whitespace
-    between inline elements is render-relevant, so exactly one newline
-    survives (renders as one space, like before). pre/textarea/script/
-    style content is left byte-identical."""
-    def keep_conditional(m: re.Match) -> str:
-        c = m.group(0)
-        return c if ("[if" in c or "[endif]" in c) else ""
-
+    """Conservative HTML minification: drop ALL comments (including the
+    IE conditional-comment relics -- the downlevel-revealed pattern keeps
+    its enclosed markup, hidden IE-only blocks vanish entirely) and
+    collapse indentation to a single newline -- whitespace between inline
+    elements is render-relevant, so exactly one newline survives (renders
+    as one space, like before). pre/textarea/script/style content is left
+    byte-identical."""
     text = data.decode("utf-8", "replace")
     parts = MINIFY_PROTECT_RE.split(text)
     for i in range(0, len(parts), 2):       # even indexes = unprotected
-        part = HTML_COMMENT_ALL_RE.sub(keep_conditional, parts[i])
+        part = HTML_COMMENT_ALL_RE.sub("", parts[i])
         parts[i] = INDENT_RE.sub("\n", part)
     return "".join(parts).encode("utf-8")
 
@@ -3787,9 +3791,9 @@ Notes:
                          "surviving as (possibly private) absolute links")
     ap.add_argument("--no-minify", dest="minify", action="store_false",
                     help="skip minifying exported HTML, CSS and JS "
-                         "(conservative: comments/indentation only for HTML, "
-                         "rcssmin/rjsmin for CSS/JS incl. license banners in "
-                         "*.min.* files; JSON-LD untouched). "
+                         "(conservative: ALL comments removed incl. IE "
+                         "conditionals and license banners, indentation "
+                         "collapsed; JSON-LD and pre/textarea untouched). "
                          "No effect with --no-rewrite")
     ap.add_argument("--no-resolve-internal", dest="resolve_internal",
                     action="store_false",

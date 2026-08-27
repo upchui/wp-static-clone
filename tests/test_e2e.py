@@ -311,6 +311,12 @@ def test_deploy_files_present(export):
         assert (export["public"] / name).is_file(), name
 
 
+def test_no_html_comments_left(export):
+    html = (export["public"] / "index.html").read_text(encoding="utf-8")
+    assert "<!--" not in html                   # incl. IE conditionals
+    assert '<html lang="de">' in html           # revealed markup survives
+
+
 def test_min_files_lose_license_banners(export):
     css = (export["public"] / "wp-content" / "themes" / "fix" /
            "vendor.min.css").read_text()
