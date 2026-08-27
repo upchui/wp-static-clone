@@ -217,3 +217,8 @@ def test_minify_css_js(mod):
     assert mod.minify_css("body {  color : red ; }") == "body{color:red}"
     out = mod.minify_js("var a = 1;\n// comment\nvar b = 2;")
     assert "comment" not in out and "var a=1;" in out
+
+
+def test_minify_strips_bang_comments(mod):
+    assert mod.minify_css("/*! bang */body{color:red}") == "body{color:red}"
+    assert "bang" not in mod.minify_js("/*! bang */var a=1;")

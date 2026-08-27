@@ -309,3 +309,13 @@ def test_deploy_files_present(export):
         assert (out / name).is_file(), name
     for name in ("_redirects", ".htaccess"):
         assert (export["public"] / name).is_file(), name
+
+
+def test_min_files_lose_license_banners(export):
+    css = (export["public"] / "wp-content" / "themes" / "fix" /
+           "vendor.min.css").read_text()
+    assert "vendor banner" not in css
+    assert ".vendor{color:blue;margin:0}" in css
+    theme = (export["public"] / "wp-content" / "themes" / "fix" /
+             "style.css").read_text()
+    assert "/*" not in theme                    # no comments at all

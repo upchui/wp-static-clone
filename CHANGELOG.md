@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.5.1 (2026-08-27)
+
+### Changed
+- Minification also processes `*.min.css`/`*.min.js` files (safe near-no-op
+  for already-minified code) and explicitly drops `/*! license banner */`
+  bang comments everywhere.
+
 ## 1.5.0 (2026-08-27)
 
 ### Added

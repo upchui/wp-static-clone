@@ -171,7 +171,7 @@ if sys.version_info < (3, 10):
              f"(running {sys.version.split()[0]})")
 
 TOOL_NAME = "wp-static-export"
-VERSION = "1.5.0"
+VERSION = "1.5.1"
 
 # --------------------------------------------------------------------------
 # Classification helpers
@@ -580,11 +580,13 @@ INDENT_RE = re.compile(r"[ \t]*\n[ \t\n]*")
 
 
 def minify_css(text: str) -> str:
-    return rcssmin.cssmin(text) if rcssmin else text
+    # keep_bang_comments=False: /*! license banners */ go too -- explicit,
+    # so a future library-default change can't bring them back
+    return rcssmin.cssmin(text, keep_bang_comments=False) if rcssmin else text
 
 
 def minify_js(text: str) -> str:
-    return rjsmin.jsmin(text) if rjsmin else text
+    return rjsmin.jsmin(text, keep_bang_comments=False) if rjsmin else text
 
 
 def minify_html_bytes(data: bytes) -> bytes:
@@ -2293,8 +2295,9 @@ class Exporter:
 
                 new_text = CSS_IMPORT_RE.sub(
                     rel_import, CSS_URL_RE.sub(rel, text))
-                minify = (self._minify_on and ".min." not in
-                          posixpath.basename(urlsplit(url).path).lower())
+                # .min.* files run through as well: a safe near-no-op that
+                # still strips their /*! license banners */
+                minify = self._minify_on
                 if minify:
                     new_text = minify_css(new_text)
                 if new_text != text:
@@ -2316,8 +2319,7 @@ class Exporter:
                 new_text = text
                 if self.host_probe_re.search(new_text):
                     new_text = self.localize_text(new_text)
-                minify = (self._minify_on and ".min." not in
-                          posixpath.basename(urlsplit(url).path).lower())
+                minify = self._minify_on
                 if minify:
                     new_text = minify_js(new_text)
                 if new_text != text:
@@ -3786,8 +3788,9 @@ Notes:
     ap.add_argument("--no-minify", dest="minify", action="store_false",
                     help="skip minifying exported HTML, CSS and JS "
                          "(conservative: comments/indentation only for HTML, "
-                         "rcssmin/rjsmin for CSS/JS, *.min.* files and "
-                         "JSON-LD untouched). No effect with --no-rewrite")
+                         "rcssmin/rjsmin for CSS/JS incl. license banners in "
+                         "*.min.* files; JSON-LD untouched). "
+                         "No effect with --no-rewrite")
     ap.add_argument("--no-resolve-internal", dest="resolve_internal",
                     action="store_false",
                     help="skip the split-DNS detection that treats hosts "
