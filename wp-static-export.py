@@ -171,7 +171,7 @@ if sys.version_info < (3, 10):
              f"(running {sys.version.split()[0]})")
 
 TOOL_NAME = "wp-static-export"
-VERSION = "1.5.2"
+VERSION = "1.5.3"
 
 # --------------------------------------------------------------------------
 # Classification helpers
@@ -3808,6 +3808,13 @@ Notes:
                          "wp-json at runtime); hydration performs the only "
                          "wp-json request the exporter ever makes")
     args = ap.parse_args(argv)
+
+    if args.minify and args.rewrite and (rjsmin is None or rcssmin is None):
+        # a stale venv would otherwise silently produce an unminified
+        # export -- fail loudly with the fix instead
+        ap.error("minification (default on) needs the rjsmin and rcssmin "
+                 "packages -- run: pip install -r requirements.txt "
+                 "(or pass --no-minify)")
 
     for pattern in args.exclude:
         try:

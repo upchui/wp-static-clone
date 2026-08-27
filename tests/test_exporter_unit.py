@@ -729,3 +729,16 @@ def test_minify_missing_libs_warns(mod, tmp_path, monkeypatch):
                                 out_dir=tmp_path / "o"))
     assert not e._minify_on                             # graceful skip
     assert mod.minify_js("var a = 1;") == "var a = 1;"  # passthrough
+
+
+# -- v1.5.3: hard error on missing minifier packages ------------------------
+
+def test_missing_minifiers_fail_cli(mod, monkeypatch, capsys):
+    import pytest as _pytest
+    monkeypatch.setattr(mod, "rjsmin", None)
+    with _pytest.raises(SystemExit):
+        mod.parse_args(["https://example.at"])
+    assert "rjsmin" in capsys.readouterr().err
+    # --no-minify still works without the packages
+    cfg = mod.parse_args(["https://example.at", "--no-minify"])
+    assert cfg.minify is False

@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.5.3 (2026-08-27)
+
+### Changed
+- Missing `rjsmin`/`rcssmin` packages are now a hard CLI error (with the
+  `pip install -r requirements.txt` fix in the message) instead of a
+  warning that silently produced an unminified export from a stale venv.
+  `--no-minify` still allows running without them.
+
 ## 1.5.2 (2026-08-27)
 
 ### Changed
