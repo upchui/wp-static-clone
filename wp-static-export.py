@@ -2529,7 +2529,6 @@ map $http_host $served_host {{
 
 server {{
     listen 80;
-    listen [::]:80;
     server_name _;
     server_tokens off;
 
