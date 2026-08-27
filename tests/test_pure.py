@@ -190,3 +190,30 @@ def test_robots_rule_re(mod):
     assert not mod.robots_rule_re("/privat/").match("/x/privat/")
     assert mod.robots_rule_re("/*.zip$").match("/dl/a.zip")
     assert not mod.robots_rule_re("/*.zip$").match("/dl/a.zipx")
+
+
+# -- minification -----------------------------------------------------------
+
+def test_minify_html_bytes(mod):
+    src = (b"<html>\n  <head>\n    <title>x</title>\n"
+           b"    <!-- normal comment -->\n"
+           b"    <!--[if IE]><link href=ie.css><![endif]-->\n"
+           b"  </head>\n  <body>\n"
+           b"    <pre>  keep   this\n      exactly  </pre>\n"
+           b"    <textarea>  raw\n   text </textarea>\n"
+           b"    <script>var a = 1\nvar b = 2</script>\n"
+           b"    <span>a</span>\n    <a>b</a>\n  </body>\n</html>")
+    out = mod.minify_html_bytes(src)
+    assert b"normal comment" not in out
+    assert b"<!--[if IE]>" in out                       # conditional stays
+    assert b"<pre>  keep   this\n      exactly  </pre>" in out
+    assert b"<textarea>  raw\n   text </textarea>" in out
+    assert b"var a = 1\nvar b = 2" in out               # script untouched
+    assert b"</span>\n<a>" in out                       # one newline survives
+    assert b"    <span>" not in out                     # indentation gone
+
+
+def test_minify_css_js(mod):
+    assert mod.minify_css("body {  color : red ; }") == "body{color:red}"
+    out = mod.minify_js("var a = 1;\n// comment\nvar b = 2;")
+    assert "comment" not in out and "var a=1;" in out

@@ -1,2 +1,5 @@
-body { background: url('__ORIGIN__/wp-content/uploads/bg.png'); }
+/* theme styles -- this comment must be minified away */
+body {
+    background: url('__ORIGIN__/wp-content/uploads/bg.png');
+}
 h1::after { content: "→ü"; }

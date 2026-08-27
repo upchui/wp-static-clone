@@ -126,6 +126,7 @@ The export is SEO-complete out of the box:
 - **One canonical URL per page** — the generated nginx config 301s `/page` → `/page/` (matching the exported structure) and serves the redirects observed on the origin as real 301s (`redirects.inc`), visitor query strings included; old origin sitemap URLs 301 onto the generated `/sitemap.xml`. Redirect stubs carry `noindex`; `/404.html` answers 404 instead of an indexable 200. On Netlify and Apache the trailing-slash canonicalization comes from the platform itself (Pretty URLs / `DirectorySlash`, both on by default).
 - **WordPress cruft removed** — generator meta, wp-json/oEmbed/feed discovery, EditURI/RSD, wlwmanifest, pingback, `?p=` shortlinks and the Cloudflare Insights beacon (which only produces CORS errors off Cloudflare) are stripped. `canonical`, `hreflang`, `og:*`/`twitter:*` and JSON-LD stay. Disable with `--no-strip-wp-cruft`.
 - **Image optimization** — `loading="lazy"` + `decoding="async"` on images (except each page's first image and plugin-lazyloaded ones) and `width`/`height` attributes read straight from the local PNG/JPEG/GIF/WebP headers (CLS). Disable with `--no-optimize-images`.
+- **Minification** — every exported HTML page (comments/indentation, conservative), CSS and JS file (rcssmin/rjsmin; `*.min.*` skipped) plus inline styles/scripts is minified; JSON-LD and `<pre>`/`<textarea>` content stay untouched. Disable with `--no-minify`.
 
 ### Which domain do the SEO URLs point to?
 
@@ -164,6 +165,7 @@ For non-Docker nginx, check the module with `nginx -V 2>&1 | grep -o with-http_s
 | `--no-generate-sitemap` | keep origin sitemap files instead of generating `/sitemap.xml` |
 | `--no-strip-wp-cruft` | keep WP head cruft (generator, wp-json/oEmbed discovery, shortlink, …) |
 | `--no-optimize-images` | skip `loading=lazy` / `width`/`height` injection |
+| `--no-minify` | skip HTML/CSS/JS minification |
 | `--staging` | full noindex mode (robots.txt, `X-Robots-Tag`, meta robots) for previews |
 | `--target-domain D` | hard-rewrite canonical/og/JSON-LD/sitemap URLs to domain `D` (Netlify/Apache) |
 | `--sitemap-include-linked` | also list link-discovered pages in the generated sitemap |

@@ -160,12 +160,18 @@ from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+try:                        # optional: without them minification is skipped
+    import rcssmin
+    import rjsmin
+except ImportError:         # pragma: no cover
+    rcssmin = rjsmin = None
+
 if sys.version_info < (3, 10):
     sys.exit(f"wp-static-export needs Python 3.10+ "
              f"(running {sys.version.split()[0]})")
 
 TOOL_NAME = "wp-static-export"
-VERSION = "1.4.3"
+VERSION = "1.5.0"
 
 # --------------------------------------------------------------------------
 # Classification helpers
@@ -563,16 +569,68 @@ SVG_ATTR_CASE = {a.lower(): a for a in (
     "yChannelSelector zoomAndPan").split()}
 
 
-def serialize_soup(soup: BeautifulSoup) -> bytes:
+# minification: content of these tags must never be touched by the HTML
+# whitespace pass (pre/textarea render whitespace; script/style content is
+# minified separately by rjsmin/rcssmin, which know where newlines matter)
+MINIFY_PROTECT_RE = re.compile(
+    r"(<(?:pre|textarea|script|style)\b.*?</(?:pre|textarea|script|style)\s*>)",
+    re.IGNORECASE | re.DOTALL)
+HTML_COMMENT_ALL_RE = re.compile(r"<!--.*?-->", re.DOTALL)
+INDENT_RE = re.compile(r"[ \t]*\n[ \t\n]*")
+
+
+def minify_css(text: str) -> str:
+    return rcssmin.cssmin(text) if rcssmin else text
+
+
+def minify_js(text: str) -> str:
+    return rjsmin.jsmin(text) if rjsmin else text
+
+
+def minify_html_bytes(data: bytes) -> bytes:
+    """Conservative HTML minification: drop comments (conditional comments
+    stay) and collapse indentation to a single newline -- whitespace
+    between inline elements is render-relevant, so exactly one newline
+    survives (renders as one space, like before). pre/textarea/script/
+    style content is left byte-identical."""
+    def keep_conditional(m: re.Match) -> str:
+        c = m.group(0)
+        return c if ("[if" in c or "[endif]" in c) else ""
+
+    text = data.decode("utf-8", "replace")
+    parts = MINIFY_PROTECT_RE.split(text)
+    for i in range(0, len(parts), 2):       # even indexes = unprotected
+        part = HTML_COMMENT_ALL_RE.sub(keep_conditional, parts[i])
+        parts[i] = INDENT_RE.sub("\n", part)
+    return "".join(parts).encode("utf-8")
+
+
+def serialize_soup(soup: BeautifulSoup, minify: bool = False) -> bytes:
     """str(soup) with case-sensitive SVG attribute names restored inside
-    <svg> subtrees (viewBox, preserveAspectRatio, ...)."""
+    <svg> subtrees (viewBox, preserveAspectRatio, ...); with minify=True
+    inline CSS/JS is minified (JSON/JSON-LD/templates untouched) and the
+    HTML whitespace collapsed."""
     for svg in soup.find_all("svg"):
         for tag in (svg, *svg.find_all(True)):
             for attr in list(tag.attrs):
                 proper = SVG_ATTR_CASE.get(attr)
                 if proper and proper != attr:
                     tag.attrs[proper] = tag.attrs.pop(attr)
-    return str(soup).encode("utf-8")
+    if minify:
+        for style in soup.find_all("style"):
+            if style.string:
+                style.string = minify_css(style.string)
+        for script in soup.find_all("script"):
+            stype = (script.get("type") or "").lower()
+            if (script.get("src") or "json" in stype or "template" in stype
+                    or (stype and "javascript" not in stype)):
+                continue    # external / data blocks / non-JS types: untouched
+            if script.string:
+                script.string = minify_js(script.string)
+    out = str(soup).encode("utf-8")
+    if minify:
+        out = minify_html_bytes(out)
+    return out
 
 
 class HostResolveAdapter(HTTPAdapter):
@@ -631,6 +689,7 @@ class Config:
     sr7_hydrate: bool = True
     internal_hosts: list = field(default_factory=list)
     resolve_internal: bool = True
+    minify: bool = True
 
 
 @dataclass
@@ -750,6 +809,7 @@ class Exporter:
         self._dns_cache: dict[str, bool] = {}
         self.auto_internal_hosts: list[str] = []
         self.foreign_wp_hosts: set[str] = set()
+        self.minify_stats = {"html": 0, "css": 0, "js": 0, "bytes_saved": 0}
         self.generated_sitemap: dict | None = None
         self.sitemap_discovery_ok = False  # a usable origin sitemap was found
         self.cruft_removed: dict[str, int] = {}
@@ -868,6 +928,11 @@ class Exporter:
                 f"host {host} serves wp-content paths -- it is very likely "
                 f"THIS WordPress site under another name; re-run with "
                 f"--internal-host {host} (ignore if it is a real CDN)")
+
+    @property
+    def _minify_on(self) -> bool:
+        return (self.cfg.rewrite and self.cfg.minify
+                and rjsmin is not None and rcssmin is not None)
 
     def say(self, msg: str) -> None:
         """Progress chatter -- silenced by --quiet (warnings and the final
@@ -1818,7 +1883,13 @@ class Exporter:
                 if self.cfg.strip_wp_cruft:
                     self.strip_wp_cruft(soup)
                 self.rewrite_soup_relative(soup)
-                written = self.write_bytes(target, serialize_soup(soup))
+                out = serialize_soup(soup, self._minify_on)
+                written = self.write_bytes(target, out)
+                if written is not None and self._minify_on:
+                    with self.stats_lock:
+                        self.minify_stats["html"] += 1
+                        self.minify_stats["bytes_saved"] += max(
+                            0, len(raw) - len(out))
                 if written is not None:
                     with self.stats_lock:
                         # postprocess_html may only touch files WE
@@ -2222,18 +2293,40 @@ class Exporter:
 
                 new_text = CSS_IMPORT_RE.sub(
                     rel_import, CSS_URL_RE.sub(rel, text))
+                minify = (self._minify_on and ".min." not in
+                          posixpath.basename(urlsplit(url).path).lower())
+                if minify:
+                    new_text = minify_css(new_text)
                 if new_text != text:
                     # transcode only what we changed; the file is now UTF-8,
                     # so a declared legacy @charset must say so too
                     data = CSS_CHARSET_RE.sub('@charset "UTF-8"',
                                               new_text).encode("utf-8")
+                    if minify:
+                        with self.stats_lock:
+                            self.minify_stats["css"] += 1
+                            self.minify_stats["bytes_saved"] += max(
+                                0, len(resp.content) - len(data))
         elif ext in ("js", "mjs") or "javascript" in ctype:
             text = decode_text_asset(resp)
             page_refs, asset_refs = self.scan_text_for_urls(text)
             discovered_pages.extend(page_refs)
             discovered.extend(asset_refs)
-            if self.cfg.rewrite and self.host_probe_re.search(text):
-                data = self.localize_text(text).encode("utf-8")
+            if self.cfg.rewrite:
+                new_text = text
+                if self.host_probe_re.search(new_text):
+                    new_text = self.localize_text(new_text)
+                minify = (self._minify_on and ".min." not in
+                          posixpath.basename(urlsplit(url).path).lower())
+                if minify:
+                    new_text = minify_js(new_text)
+                if new_text != text:
+                    data = new_text.encode("utf-8")
+                    if minify:
+                        with self.stats_lock:
+                            self.minify_stats["js"] += 1
+                            self.minify_stats["bytes_saved"] += max(
+                                0, len(resp.content) - len(data))
 
         target = self.local_path_for(url, is_page=False)
         if target:
@@ -2470,7 +2563,7 @@ class Exporter:
                 changed |= self._rewrite_download_links(soup)
             if changed:
                 try:
-                    html_file.write_bytes(serialize_soup(soup))
+                    html_file.write_bytes(serialize_soup(soup, self._minify_on))
                 except OSError as exc:
                     self.warnings.append(f"postprocess: cannot write "
                                          f"{html_file.name}: {exc}")
@@ -3250,6 +3343,7 @@ esac
                 "crawl_truncated_at_max_pages": self.truncated,
                 "wp_cruft_removed": self.cruft_removed,
                 "image_optimization": self.img_stats,
+                "minified": self.minify_stats,
                 "staging_noindex": self.cfg.staging,
                 "target_domain": self.cfg.target_domain,
             },
@@ -3391,8 +3485,13 @@ esac
                     "(only the generated sitemap/robots.txt get the new "
                     "domain)")
             self.warnings.append(
-                "--no-rewrite: WP cruft stripping, image optimization and "
-                "redirect stub pages are disabled")
+                "--no-rewrite: WP cruft stripping, image optimization, "
+                "minification and redirect stub pages are disabled")
+        if (self.cfg.minify and self.cfg.rewrite
+                and (rjsmin is None or rcssmin is None)):
+            self.warnings.append(
+                "minification skipped: rjsmin/rcssmin not installed "
+                "(pip install rjsmin rcssmin)")
         if self.cfg.staging and self.cfg.target_domain:
             self.warnings.append(
                 "--staging blocks all indexing -- --target-domain only "
@@ -3450,6 +3549,11 @@ esac
         if self.download_map:
             print(f"[seo] {len(self.download_map)} download endpoints "
                   f"materialized as files (links rewritten, 301s generated)")
+        if self._minify_on and any(self.minify_stats.values()):
+            print(f"[seo] minified: {self.minify_stats['html']} HTML, "
+                  f"{self.minify_stats['css']} CSS, "
+                  f"{self.minify_stats['js']} JS files "
+                  f"({self.minify_stats['bytes_saved'] // 1024} KB saved)")
         if self.sr7_hydrated:
             print(f"[seo] SR7: {sum(self.sr7_hydrated.values())} lazy "
                   f"slide(s) hydrated into {len(self.sr7_hydrated)} "
@@ -3679,6 +3783,11 @@ Notes:
                          "WordPress siteurl points at -- URLs on these hosts "
                          "get localized like the main domain instead of "
                          "surviving as (possibly private) absolute links")
+    ap.add_argument("--no-minify", dest="minify", action="store_false",
+                    help="skip minifying exported HTML, CSS and JS "
+                         "(conservative: comments/indentation only for HTML, "
+                         "rcssmin/rjsmin for CSS/JS, *.min.* files and "
+                         "JSON-LD untouched). No effect with --no-rewrite")
     ap.add_argument("--no-resolve-internal", dest="resolve_internal",
                     action="store_false",
                     help="skip the split-DNS detection that treats hosts "
@@ -3759,6 +3868,7 @@ Notes:
         internal_hosts=[re.sub(r"^https?://", "", h.strip()).rstrip("/")
                         for h in args.internal_hosts if h.strip()],
         resolve_internal=args.resolve_internal,
+        minify=args.minify,
     )
     if args.user_agent:
         cfg.user_agent = args.user_agent

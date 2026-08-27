@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.5.0 (2026-08-27)
+
+### Added
+- **Minification** (default on, `--no-minify` disables, requires the new
+  `rjsmin`/`rcssmin` dependencies): CSS and JS assets are minified
+  (`*.min.*` files skipped), inline `<style>`/`<script>` blocks too, and
+  HTML gets a conservative pass — comments removed (conditional comments
+  stay), indentation collapsed to single newlines. pre/textarea content,
+  JSON-LD and byte-identical HTML assets are never touched; without
+  `--rewrite` nothing is minified. The report shows file counts and bytes
+  saved.
+
 ## 1.4.3 (2026-08-27)
 
 ### Added

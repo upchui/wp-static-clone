@@ -699,3 +699,33 @@ def test_private_straggler_warning(mod, tmp_path, monkeypatch):
     e._warn_foreign_site_hosts()
     assert any("late.internal.test" in w and "--internal-host" in w
                for w in e.warnings)
+
+
+# -- v1.5.0: minification ---------------------------------------------------
+
+def test_serialize_soup_minify(mod):
+    soup = BeautifulSoup(
+        "<html>\n  <head>\n"
+        "    <style>body {  color : red ; }</style>\n"
+        '    <script type="application/ld+json">{ "a" : 1 }</script>\n'
+        "    <script>var x = 1;  // note\nvar y = 2;</script>\n"
+        "  </head>\n  <body>\n    <p>hi</p>\n  </body>\n</html>",
+        "html.parser")
+    out = mod.serialize_soup(soup, minify=True).decode()
+    assert "body{color:red}" in out
+    assert '{ "a" : 1 }' in out                         # JSON-LD untouched
+    assert "// note" not in out and "var x=1;" in out
+    assert "\n    <p>" not in out
+    # default stays non-minifying: comments survive without minify=True
+    soup2 = BeautifulSoup("<div><!-- keep me --><p>x</p></div>", "html.parser")
+    assert "keep me" in mod.serialize_soup(soup2).decode()
+    soup3 = BeautifulSoup("<div><!-- keep me --><p>x</p></div>", "html.parser")
+    assert "keep me" not in mod.serialize_soup(soup3, minify=True).decode()
+
+
+def test_minify_missing_libs_warns(mod, tmp_path, monkeypatch):
+    monkeypatch.setattr(mod, "rjsmin", None)
+    e = mod.Exporter(mod.Config(base_url="https://example.at",
+                                out_dir=tmp_path / "o"))
+    assert not e._minify_on                             # graceful skip
+    assert mod.minify_js("var a = 1;") == "var a = 1;"  # passthrough
