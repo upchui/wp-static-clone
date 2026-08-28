@@ -1,5 +1,29 @@
 # Changelog
 
+## 2.0.0 (2026-08-28)
+
+### Changed
+- **Plugin architecture**: everything feature- or vendor-specific moved out
+  of the core into `plugins/*.py`, loaded automatically at startup --
+  `minify`, `slider_revolution` (SR7 hydration, `data-dbsrc`, runtime
+  resources), `image_optimize`, `cloudflare` (cfemail decode, Insights
+  beacon, `/cdn-cgi/`), `complianz` and `theme_fixes` (The7
+  `data-dt-location`, Ultimate-Addons id normalization). The core now only
+  provides discovery, crawl, URL rewriting, verification, deploy files and
+  the report, plus the hook points plugins attach to
+  (see `plugins/README.md`).
+- All CLI flags (`--no-minify`, `--no-sr7-hydrate`, `--no-optimize-images`)
+  keep working unchanged; in `--help` they now appear under
+  `plugin: <name>` groups. Exported output is identical to 1.5.3 for
+  identical input.
+- Cosmetic: `report.json` key order shifts slightly (plugin-contributed
+  keys like `sr7_hydrated` and `seo.minified` are appended); in
+  `report.txt` the SR7 section moved towards the end, and the position of
+  the images/minify/SR7 console summary lines shifted. Content unchanged.
+- Plugin loading fails loudly (missing `plugins/` directory, a plugin file
+  without a valid `PLUGIN`, or an import error abort the run); disable a
+  plugin by deleting its file or renaming it to `_<name>.py`.
+
 ## 1.5.3 (2026-08-27)
 
 ### Changed

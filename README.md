@@ -188,6 +188,23 @@ Full list including examples: `wp-static-export.py --help`.
 
 ---
 
+## Plugins
+
+The core (`wp-static-export.py`) contains only the generic machinery — sitemap discovery, crawl, URL rewriting, verification, deployment files, report. Everything feature- or vendor-specific lives as a plugin in the [`plugins/`](plugins/) folder next to the script and is loaded automatically at startup:
+
+| Plugin | Provides |
+|---|---|
+| `minify` | HTML/CSS/JS minification (`--no-minify`) |
+| `slider_revolution` | SR7 lazy-slide hydration, `data-dbsrc` URLs, runtime resource discovery (`--no-sr7-hydrate`) |
+| `image_optimize` | `loading=lazy` / `width`/`height` injection (`--no-optimize-images`) |
+| `cloudflare` | email de-obfuscation, Insights-beacon removal, `/cdn-cgi/` handling |
+| `complianz` | consent-banner lazy attributes and banner-CSS URL template |
+| `theme_fixes` | The7 `data-dt-location` links, Ultimate-Addons id noise in the mobile comparison |
+
+The plugin-owned CLI flags appear in `--help` under their own `plugin: <name>` groups but behave exactly as before. Loading fails **loudly**: a missing `plugins/` folder or a broken plugin file aborts the run; disable a single plugin by deleting its file or renaming it to `_<name>.py`. How to write your own plugin (hooks, thread-safety rules, a minimal example): [`plugins/README.md`](plugins/README.md).
+
+---
+
 ## Report
 
 Every run writes `report.txt` (human-readable) and `report.json` (machine-readable) with:
