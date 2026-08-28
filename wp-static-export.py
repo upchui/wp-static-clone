@@ -984,8 +984,6 @@ class Exporter:
         self.sitemap_discovery_ok = False  # a usable origin sitemap was found
         self.cruft_removed: dict[str, int] = {}
         self.stats_lock = threading.Lock()
-        self.img_stats = {"lazy": 0, "dimensions": 0, "skipped_plugin": 0,
-                          "unparsed": 0, "missing": 0}
         self.deploy_info: dict = {}
         # HTML files parse_and_save_html wrote (re-serialized by bs4) --
         # postprocess_html must only touch these, never byte-identical
@@ -2582,9 +2580,8 @@ class Exporter:
         crawl rounds than the page that references them."""
         if not self.cfg.rewrite:
             return
-        do_images = self.cfg.optimize_images
         do_staging = self.cfg.staging
-        if not (do_images or do_staging or self.download_map
+        if not (do_staging or self.download_map
                 or any(p.wants_postprocess() for p in self.plugins)):
             return
         # only files parse_and_save_html re-serialized -- HTML *assets* were
@@ -2600,8 +2597,6 @@ class Exporter:
             changed = False
             if do_staging:
                 changed |= self._inject_staging_meta(soup)
-            if do_images:
-                changed |= self._optimize_images(soup)
             for p in self.plugins:
                 changed |= p.postprocess_soup(soup)
             if self.download_map:
@@ -2648,51 +2643,6 @@ class Exporter:
                 if new and val != new:
                     tag[attr] = new           # cache-buster query dropped
                     changed = True
-        return changed
-
-    def _optimize_images(self, soup: BeautifulSoup) -> bool:
-        changed = False
-        first = True
-        for img in soup.find_all("img"):
-            if img.find_parent("noscript") is not None:
-                continue  # lazyload fallback markup; also must not consume
-                          # the eager first-image slot
-            is_first = first
-            first = False
-            classes = " ".join(img.get("class") or []).lower()
-            plugin_lazy = (img.has_attr("data-src")
-                           or img.has_attr("data-lazy-src")
-                           or "lazy" in classes)
-            if plugin_lazy:
-                self.img_stats["skipped_plugin"] += 1
-            elif (not img.has_attr("loading") and not is_first
-                    and (img.get("fetchpriority") or "").lower() != "high"):
-                # first image per page stays eager (LCP protection)
-                img["loading"] = "lazy"
-                if not img.has_attr("decoding"):
-                    img["decoding"] = "async"
-                self.img_stats["lazy"] += 1
-                changed = True
-            if img.has_attr("width") or img.has_attr("height") or plugin_lazy:
-                continue
-            src = (img.get("src") or "").strip()
-            if not src.startswith("/") or src.startswith("//"):
-                continue
-            path = unicodedata.normalize(
-                "NFC", unquote(src.split("?", 1)[0].split("#", 1)[0]))
-            if path_extension(path) not in ("png", "jpg", "jpeg", "gif", "webp"):
-                continue
-            target = self.public_dir / path.lstrip("/")
-            if not target.is_file():
-                self.img_stats["missing"] += 1
-                continue
-            size = read_image_size(target)
-            if size:
-                img["width"], img["height"] = str(size[0]), str(size[1])
-                self.img_stats["dimensions"] += 1
-                changed = True
-            else:
-                self.img_stats["unparsed"] += 1
         return changed
 
     # ----------------------------------------------------------------------
@@ -3393,7 +3343,6 @@ esac
                 "respect_robots": self.cfg.respect_robots,
                 "crawl_truncated_at_max_pages": self.truncated,
                 "wp_cruft_removed": self.cruft_removed,
-                "image_optimization": self.img_stats,
                 "minified": self.minify_stats,
                 "staging_noindex": self.cfg.staging,
                 "target_domain": self.cfg.target_domain,
@@ -3456,11 +3405,6 @@ esac
                 f"{k}={v}" for k, v in sorted(self.cruft_removed.items()))
                 or "none"),
             *txt_head,
-            (f"Images:          {self.img_stats['lazy']}x loading=lazy, "
-             f"{self.img_stats['dimensions']}x width/height injected, "
-             f"{self.img_stats['skipped_plugin']}x plugin-lazyload skipped"
-             if self.cfg.optimize_images and self.cfg.rewrite else
-             "Images:          optimization disabled"),
             *(["Staging:         noindex everywhere (robots.txt, "
                "X-Robots-Tag, meta robots)"] if self.cfg.staging else []),
             *([f"Target domain:   {self.cfg.target_domain} (canonical/og/"
@@ -3597,9 +3541,6 @@ esac
             print(f"[seo] stripped {sum(self.cruft_removed.values())} WP/CDN "
                   f"head elements "
                   f"({', '.join(sorted(self.cruft_removed))})")
-        if self.cfg.rewrite and self.cfg.optimize_images:
-            print(f"[seo] images: {self.img_stats['lazy']}x loading=lazy, "
-                  f"{self.img_stats['dimensions']}x width/height injected")
         if self.download_map:
             print(f"[seo] {len(self.download_map)} download endpoints "
                   f"materialized as files (links rewritten, 301s generated)")
@@ -3788,11 +3729,6 @@ Notes:
                          "pingback, shortlink, Cloudflare beacon) that only "
                          "points at dynamic origin infrastructure. "
                          "No effect with --no-rewrite")
-    ap.add_argument("--no-optimize-images", dest="optimize_images",
-                    action="store_false",
-                    help="skip injecting loading=lazy/decoding=async and "
-                         "width/height attributes into <img> tags. "
-                         "No effect with --no-rewrite")
     ap.add_argument("--staging", action="store_true",
                     help="deploy invisible to search engines: robots.txt "
                          "'Disallow: /', X-Robots-Tag noindex header in the "
@@ -3912,7 +3848,6 @@ Notes:
         port=args.port,
         generate_sitemap=args.generate_sitemap,
         strip_wp_cruft=args.strip_wp_cruft,
-        optimize_images=args.optimize_images,
         staging=args.staging,
         target_domain=target_domain,
         sitemap_include_linked=args.sitemap_include_linked,

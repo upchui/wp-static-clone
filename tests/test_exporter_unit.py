@@ -131,7 +131,8 @@ def test_optimize_images(exporter):
         '<noscript><img src="/wp-content/ns.png"></noscript>'
         '<img data-src="/wp-content/lazy.png" class="lazyload">'
         '<img src="/wp-content/a.png">', "html.parser")
-    changed = exporter._optimize_images(soup)
+    img_opt = exporter.plugin("image_optimize")
+    changed = img_opt.postprocess_soup(soup)
     assert changed
     imgs = soup.find_all("img")
     first, ns, lazy, plain = imgs
@@ -141,7 +142,7 @@ def test_optimize_images(exporter):
     assert plain["loading"] == "lazy"
     assert plain["decoding"] == "async"
     assert (plain["width"], plain["height"]) == ("320", "200")
-    assert exporter.img_stats["missing"] == 1           # first.png not on disk
+    assert img_opt.stats["missing"] == 1                # first.png not on disk
 
 
 def test_inject_staging_meta(exporter):
