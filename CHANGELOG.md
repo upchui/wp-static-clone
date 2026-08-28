@@ -1,5 +1,40 @@
 # Changelog
 
+## 2.1.0 (2026-08-28)
+
+### Changed
+- **Plugin extraction round 2**: everything feature/vendor-specific that
+  remained in the core moved to plugins -- new `plugins/lazyload.py`
+  (data-src/data-lazy-src/data-bg/srcset lazy attributes),
+  `plugins/downloads.py` (dynamic download endpoints incl. their 301
+  rules), `plugins/wordpress.py` (WP head cruft, WPForms AJAX skip,
+  WooCommerce cart/checkout skip) and `plugins/mobile_check.py` (the
+  whole mobile-vs-desktop comparison incl. `normalize_html`). The
+  image-size readers moved into `plugins/image_optimize.py`. The core
+  keeps only generic machinery: resource-hint stripping stayed core
+  (renamed `strip_resource_hints`; Local-Network-Access policy), as did
+  the wp-admin/wp-login/wp-json/xmlrpc crawl policy, `--staging` and the
+  internal-host detection.
+- New plugin API surface: registries `srcset_attrs`, `css_url_attrs`,
+  `lazy_img_attrs`, `page_skip_pattern_fragments`, `extra_output_dirs`;
+  hooks `skip_asset_candidate`, `save_non_html_response`, `page_fetched`,
+  `page_saved`, `redirect_rules` (first deploy-file hook).
+- CLI flags unchanged; `--no-mobile-check` / `--mobile-user-agent` now
+  appear under the `plugin: mobile_check` group in `--help`.
+- Cosmetic (content unchanged): `report.json` keys `downloads` and
+  `mobile` are appended by their plugins (position shifts);
+  in `report.txt` the downloads and the three mobile sections moved into
+  the plugin block near the end; the console mobile summary line moved up
+  into the plugin summary block; the two closing `[note]` lines no longer
+  name WPForms/SR7 ("form submissions, consent/analytics AJAX and site
+  search", "wp-admin/xmlrpc are never requested"); the
+  `verification.policy` string is now assembled from a generic base plus
+  the Slider Revolution clause ("; wp-json is requested only for the
+  read-only Slider Revolution endpoint when a slider has lazy slides
+  (--no-sr7-hydrate disables)").
+- `Config.mobile_user_agent` defaults to `""` now (meaning: the plugin's
+  iPhone UA); `--mobile-user-agent` behaves exactly as before.
+
 ## 2.0.0 (2026-08-28)
 
 ### Changed

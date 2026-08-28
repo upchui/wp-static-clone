@@ -196,10 +196,14 @@ The core (`wp-static-export.py`) contains only the generic machinery — sitemap
 |---|---|
 | `minify` | HTML/CSS/JS minification (`--no-minify`) |
 | `slider_revolution` | SR7 lazy-slide hydration, `data-dbsrc` URLs, runtime resource discovery (`--no-sr7-hydrate`) |
-| `image_optimize` | `loading=lazy` / `width`/`height` injection (`--no-optimize-images`) |
+| `image_optimize` | `loading=lazy` / `width`/`height` injection, header-based image-size readers (`--no-optimize-images`) |
+| `mobile_check` | the mobile-vs-desktop HTML comparison incl. `mobile-variants/` output (`--no-mobile-check`, `--mobile-user-agent`) |
+| `downloads` | dynamic download endpoints materialized as real files, link rewriting, 301 rules |
+| `wordpress` | WP head-cruft removal, WPForms AJAX skip, WooCommerce cart/checkout skip |
+| `lazyload` | lazy-load plugin attributes (`data-src`, `data-lazy-src`, `data-lazy-srcset`, `data-bg`) |
 | `cloudflare` | email de-obfuscation, Insights-beacon removal, `/cdn-cgi/` handling |
 | `complianz` | consent-banner lazy attributes and banner-CSS URL template |
-| `theme_fixes` | The7 `data-dt-location` links, Ultimate-Addons id noise in the mobile comparison |
+| `theme_fixes` | The7 `data-dt-location` links, builder placeholder images, Ultimate-Addons id noise in the mobile comparison |
 
 The plugin-owned CLI flags appear in `--help` under their own `plugin: <name>` groups but behave exactly as before. Loading fails **loudly**: a missing `plugins/` folder or a broken plugin file aborts the run; disable a single plugin by deleting its file or renaming it to `_<name>.py`. How to write your own plugin (hooks, thread-safety rules, a minimal example): [`plugins/README.md`](plugins/README.md).
 

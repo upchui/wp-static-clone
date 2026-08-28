@@ -165,7 +165,7 @@ if sys.version_info < (3, 10):
              f"(running {sys.version.split()[0]})")
 
 TOOL_NAME = "wp-static-export"
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 
 # --------------------------------------------------------------------------
 # Classification helpers
@@ -3033,12 +3033,10 @@ esac
                 # artifacts) always run; reference resolution needs rewrite
                 "policy_checks": True,
                 "reference_checks": self.cfg.rewrite,
+                # plugins append their own clauses via add_report
                 "policy": "external hosts are linked as-is and never fetched;"
                           " wp-admin/xmlrpc/admin-ajax and other dynamic"
-                          " endpoints are never requested; wp-json only for"
-                          " the read-only Slider Revolution endpoint when a"
-                          " slider has lazy slides (--no-sr7-hydrate"
-                          " disables); redirects"
+                          " endpoints are never requested; redirects"
                           " are only followed while they stay on the target"
                           " site",
                 "missing_local_files": self.verify_missing,
@@ -3223,13 +3221,12 @@ esac
             else:
                 print("[verify] export is self-contained: all references "
                       "resolve locally, no unexpected absolute URLs")
-            print("[note] Not functional statically: form submissions "
-                  "(WPForms & co.), consent/analytics AJAX and WordPress "
-                  "search (dynamic endpoints).")
+            print("[note] Not functional statically: form submissions, "
+                  "consent/analytics AJAX and site search "
+                  "(dynamic endpoints).")
             print("[note] External hosts (font/analytics/CDN domains) stay "
                   "linked and are never downloaded; "
-                  "wp-admin/xmlrpc are never requested (wp-json only for "
-                  "the read-only SR7 slider endpoint when needed).")
+                  "wp-admin/xmlrpc are never requested.")
         if failed or self.asset_errors or self.warnings:
             print(f"[done] {failed} page errors, {len(self.asset_errors)} "
                   f"asset errors, {len(self.warnings)} warnings -- see report.txt")

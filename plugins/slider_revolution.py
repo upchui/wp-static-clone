@@ -204,6 +204,10 @@ class SliderRevolution(Plugin):
 
     def add_report(self, report: dict, txt_head: list,
                    txt_sections: list) -> None:
+        report["verification"]["policy"] += (
+            "; wp-json is requested only for the read-only Slider Revolution"
+            " endpoint when a slider has lazy slides (--no-sr7-hydrate"
+            " disables)")
         report["sr7_hydrated"] = dict(sorted(self.hydrated.items()))
         txt_sections.append(report_section(
             "SR7 sliders: lazy slides hydrated into the page",
