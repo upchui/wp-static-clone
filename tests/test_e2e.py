@@ -148,6 +148,7 @@ def export(mod, tmp_path_factory):
                          "--no-resolve-internal"])
     finally:
         server.shutdown()
+        server.server_close()       # release the listening socket
     assert code == 0
     return {"out": out, "public": out / "public", "origin": origin,
             "report": json.loads((out / "report.json").read_text())}

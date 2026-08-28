@@ -108,7 +108,9 @@ crawl, per PAGE   page_fetched            after a successful HTML response,
                   text_asset_written("html", ...)
                   page_saved              after the page landed on disk
 crawl, per ASSET  save_non_html_response  claim e.g. download endpoints
-                                          (first claimant wins)
+                                          (first claimant wins; ALSO fires
+                                          on the page path for non-HTML
+                                          responses to page URLs)
                   filter_text_asset       LAST transform of CSS/JS text
                   text_asset_written("css"|"js", ...)
 post-crawl        wants_postprocess       any True -> extra pass over every
@@ -121,9 +123,13 @@ report            add_report              mutate report.json, append
                                           report.txt lines/sections
 ```
 
-Ordering guarantees live in the **fixed hook points**, not in priorities:
-no two plugins share a hook where their relative order matters. Within
-one hook, call order is load order (alphabetical file names).
+Ordering guarantees live in the **fixed hook points**, not in priorities.
+Within one hook, call order is load order (alphabetical file names) —
+and one shipped pair does depend on it: `downloads.postprocess_soup`
+rewrites `/download/…/` links onto the materialized files *before*
+`image_optimize.postprocess_soup` resolves `img src` paths against the
+disk. Keep that in mind before renaming plugin files (renaming is the
+supported way to reorder).
 
 ## Registry reference
 

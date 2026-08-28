@@ -1,5 +1,100 @@
 # Changelog
 
+## 2.2.0 (2026-08-28)
+
+Bugfix release: a systematic audit of the whole codebase (three parallel
+review passes over the plugin system, the crawl/URL core and the
+post-crawl phases) surfaced ~30 confirmed defects, almost all of them
+predating the 2.x plugin refactor. All are fixed.
+
+### Fixed -- deploy configs
+- **Infinite 301 loops**: origin redirects that STRIP the trailing slash
+  (`/a/` -> `/a`, no-trailing-slash permalink setups) produced rewrite
+  rules that fought the generated configs' own directory-slash
+  canonicalization; such rules are now skipped in both slash directions.
+- Redirect-rule sources are emitted percent-DECODED -- nginx/Apache match
+  the decoded URI, so rules for umlaut/space paths never fired before.
+- `sub_filter` host substitution now covers hosts auto-detected via
+  split DNS (and the portless connect-address spelling); host spellings
+  with characters that would break or inject into the nginx config are
+  skipped with a warning.
+- `--extra-sitemap` values spelled differently from the crawled variant
+  (www. vs bare) are no longer fetched and walked twice; origin-sitemap
+  301 rules are deduplicated.
+- When sitemap generation yields no entries, origin `Sitemap:` lines are
+  now removed from robots.txt (they pointed at files not in the export).
+
+### Fixed -- downloads plugin
+- Extensionless CSS/JS routes (`/assets/bundle` served as
+  `application/javascript`) are no longer claimed as "downloads": they
+  flow through localization/minification/URL discovery again. Previously
+  they shipped raw under a wrong name -- unusable under the generated
+  configs' `nosniff` header.
+- A download endpoint is only claimed (and mapped/301'ed) when its file
+  actually landed on disk; `assets_exported` no longer double-counts.
+
+### Fixed -- crawl / CLI
+- `--max-pages` now also caps sitemap-seeded URLs, and `truncated` (and
+  the `--fail-on errors` exit code) only trigger on real truncation.
+- The NFD 404-retry no longer accepts an unfollowed 3xx as page content,
+  and refreshes `Last-Modified` (previously `<lastmod>` came from the
+  404 response).
+- robots.txt fetch no longer saves the body of an unfollowed redirect.
+- Streamed asset responses are closed on all error paths.
+- CLI validation: `--timeout <= 0`, `--max-pages < 1`, empty `--header`
+  names and a base_url with a path component (subdirectory installs are
+  unsupported) now produce clean argparse errors instead of tracebacks
+  or silent misbehavior.
+- `--clean` removes plugin output trees (mobile-variants/) even when
+  public/ is already absent; `%00` in URLs and over-long file names are
+  handled as clean skips; the sitemap depth/count caps warn when hit.
+
+### Fixed -- rewriting / discovery
+- srcset parsing follows the HTML spec's tokenization: `data:` URIs
+  containing commas survive byte-identically (previously they were split
+  and corrupted), space-less srcsets parse correctly, and untouched
+  srcset attributes keep their exact bytes.
+- Human-readable attributes (`alt`, `title`, `aria-label`,
+  `placeholder`) are no longer "localized" -- URLs there are prose.
+- Relative `url()` refs in CSS reached via an internal redirect resolve
+  against the FINAL location, like a browser.
+- `canon_path` canonicalizes per path segment: an encoded `%2F` no
+  longer turns into a real path separator (which changed the fetched URL
+  and the on-disk path); single quotes are re-encoded as `%27` so the
+  generated `url('...')` stays parseable.
+- Base64 URL attributes accept the URL-safe alphabet, keep their
+  alphabet on re-encoding, and fall back to plain-URL localization when
+  the value is not base64 at all.
+- `<meta http-equiv="refresh">` targets are discovered as pages and
+  localized (browsers navigate them; previously they bounced the static
+  site back to the origin).
+- `.json`/`.webmanifest` assets are localized and their URLs discovered
+  (PWA manifests pointed at the origin before).
+- Verification: private-network URLs inside `<style>` blocks are
+  flagged; a bare directory without index.html no longer counts as an
+  existing page (only as a JS base path under wp-content & co.).
+
+### Fixed -- plugin system
+- Slider Revolution: the REST cache is locked across the fetch, so
+  concurrent crawl workers can no longer fire duplicate wp-json requests
+  for the same slider; hydration warnings are emitted once per slider
+  instead of once per page.
+- Conflicting plugin CLI options exit with a readable message naming the
+  plugin; a plugin file that fails to import no longer leaves a
+  half-initialized module in `sys.modules`; `load_plugins()` dropped its
+  never-effective directory parameter; `cfg.user_agent` is final before
+  plugin `finish_args` runs.
+
+### Known limitations (documented, unchanged)
+- Unquoted CSS `url(...)` containing `)` (invalid CSS) truncates at the
+  first `)`.
+- Unicode-escaped URLs (`https://...`) in bundler output are
+  neither localized nor flagged.
+- URLs in prose ending with punctuation can leave a trailing `.` in
+  rewritten inline-script text.
+- Relative references on the captured 404 page resolve against
+  /404.html instead of the probe URL.
+
 ## 2.1.1 (2026-08-28)
 
 ### Fixed

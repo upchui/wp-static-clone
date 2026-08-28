@@ -165,7 +165,7 @@ if sys.version_info < (3, 10):
              f"(running {sys.version.split()[0]})")
 
 TOOL_NAME = "wp-static-export"
-VERSION = "2.1.1"
+VERSION = "2.2.0"
 
 # --------------------------------------------------------------------------
 # Classification helpers
@@ -557,7 +557,8 @@ class Plugin:
         return [], []
 
     def skip_page_path(self, path: str) -> bool:
-        """True when this URL path must never be treated as a page."""
+        """[threaded] True when this URL path must never be treated as a
+        page (reached from crawl workers via normalize_page_url)."""
         return False
 
     def skip_asset_candidate(self, url: str, tag_name: str,
