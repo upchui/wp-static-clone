@@ -190,7 +190,7 @@ Full list including examples: `wp-static-export.py --help`.
 
 ## Plugins
 
-The core (`wp-static-export.py`) contains only the generic machinery — sitemap discovery, crawl, URL rewriting, verification, deployment files, report. Everything feature- or vendor-specific lives as a plugin in the [`plugins/`](plugins/) folder next to the script and is loaded automatically at startup:
+The core (`wp-static-export.py`) contains only the generic export pipeline — sitemap discovery, crawl, URL rewriting, verification, deployment files, report — plus a fixed set of **hook points** (called at defined stages of the pipeline) and **registries** (attribute names, URL patterns and the like that the core reads). Everything feature- or vendor-specific attaches to those and lives as a plugin in the [`plugins/`](plugins/) folder next to the script:
 
 | Plugin | Provides |
 |---|---|
@@ -205,7 +205,9 @@ The core (`wp-static-export.py`) contains only the generic machinery — sitemap
 | `complianz` | consent-banner lazy attributes and banner-CSS URL template |
 | `theme_fixes` | The7 `data-dt-location` links, builder placeholder images, Ultimate-Addons id noise in the mobile comparison |
 
-The plugin-owned CLI flags appear in `--help` under their own `plugin: <name>` groups but behave exactly as before. Loading fails **loudly**: a missing `plugins/` folder or a broken plugin file aborts the run; disable a single plugin by deleting its file or renaming it to `_<name>.py`. How to write your own plugin (hooks, thread-safety rules, a minimal example): [`plugins/README.md`](plugins/README.md).
+How it works, in one paragraph: every `plugins/*.py` is loaded automatically at startup (alphabetical file order = hook call order) and must expose `PLUGIN = <subclass of Plugin>`. Loading happens **before** the CLI is parsed, which is why plugin-owned flags (`--no-minify`, `--no-sr7-hydrate`, `--no-optimize-images`, `--no-mobile-check`, …) appear in `--help` under their own `plugin: <name>` groups — delete a plugin file and its flags disappear with it. Loading fails **loudly**: a missing `plugins/` folder or a broken plugin file aborts the run instead of silently producing a degraded export; disable a single plugin by renaming it to `_<name>.py` (or deleting it). Each export run gets fresh plugin instances with full access to the exporter — plugins are trusted local code, not a sandbox.
+
+The complete developer reference — loading lifecycle, all hooks and registries with the pipeline stages they fire at, thread-safety rules, pitfalls, testing patterns and a runnable worked example: [`plugins/README.md`](plugins/README.md).
 
 ---
 
