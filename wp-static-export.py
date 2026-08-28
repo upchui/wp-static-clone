@@ -194,7 +194,6 @@ PAGE_SKIP_FRAGMENTS = (
     r"/wp-admin(/|$)", r"/wp-login\.php", r"/wp-json(/|$)", r"/xmlrpc\.php",
     r"/wp-signup\.php", r"/wp-activate\.php", r"/wp-trackback\.php",
     r"/feed/?$", r"/comments/feed", r"/wp-cron\.php",
-    r"/cart/?$", r"/checkout/?$",
 )
 
 
@@ -532,7 +531,8 @@ class Plugin:
         mutations here are seen by both (e.g. slide hydration)."""
 
     def clean_soup(self, soup) -> None:
-        """[threaded] Right after core strip_wp_cruft() (same gates)."""
+        """[threaded] Right after core strip_resource_hints(), under the
+        same cfg.rewrite + cfg.strip_wp_cruft gate."""
 
     def rewrite_soup(self, soup) -> None:
         """[threaded] Right after core rewrite_soup_relative()."""
@@ -1090,12 +1090,11 @@ class Exporter:
             return None
         if self.is_excluded(path):
             return None
-        # never pages: form AJAX routes, extensionless plugin/theme
-        # directories referenced from JS configs, and plugin-registered
-        # runtime endpoints (e.g. Cloudflare's /cdn-cgi/)
-        if (path.startswith("/wpforms-ajax")
-                or (path.startswith(("/wp-content/", "/wp-includes/"))
-                    and not path_extension(path))):
+        # never pages: extensionless plugin/theme directories referenced
+        # from JS configs, and plugin-registered runtime endpoints (e.g.
+        # Cloudflare's /cdn-cgi/, WPForms AJAX routes)
+        if (path.startswith(("/wp-content/", "/wp-includes/"))
+                and not path_extension(path)):
             return None
         if any(p.skip_page_path(path) for p in self.plugins):
             return None
@@ -1713,12 +1712,9 @@ class Exporter:
             elif tag_name == "link" and rel & {"canonical", "alternate",
                                                "shortlink", "pingback"}:
                 return  # SEO/meta links, never fetched as assets
-            elif (tag_name == "link" and rel & {"wlwmanifest", "edituri"}
-                    and self.cfg.rewrite and self.cfg.strip_wp_cruft):
-                return  # tag gets stripped -- don't mirror its target either
             elif any(p.skip_asset_candidate(absolute, tag_name, rel)
                      for p in self.plugins):
-                return
+                return  # e.g. targets of tags a plugin strips anyway
             else:
                 if PAGE_SKIP_PATTERNS.search(urlsplit(absolute).path):
                     return  # dynamic endpoints (wp-json, xmlrpc, ...) --
@@ -1820,7 +1816,7 @@ class Exporter:
         if target:
             if self.cfg.rewrite:
                 if self.cfg.strip_wp_cruft:
-                    self.strip_wp_cruft(soup)
+                    self.strip_resource_hints(soup)
                     for p in self.plugins:
                         p.clean_soup(soup)
                 self.rewrite_soup_relative(soup)
@@ -1928,63 +1924,34 @@ class Exporter:
             return val
         return base64.b64encode(localized.encode("utf-8")).decode("ascii")
 
-    def strip_wp_cruft(self, soup: BeautifulSoup) -> None:
-        """Remove WordPress head elements that only point at dynamic origin
-        infrastructure a static mirror does not have (REST/oEmbed/RSD/feed
-        discovery, pingback, wlwmanifest, ?p= shortlinks) plus the
-        version-revealing generator meta. canonical / hreflang / og: /
-        twitter: / JSON-LD stay untouched."""
-        removed: dict[str, int] = {}
-
-        def drop(tag, kind: str) -> None:
-            tag.decompose()
-            removed[kind] = removed.get(kind, 0) + 1
-
-        for meta in soup.find_all(
-                "meta", attrs={"name": re.compile("^generator$", re.I)}):
-            drop(meta, "generator-meta")
+    def strip_resource_hints(self, soup: BeautifulSoup) -> None:
+        """Remove resource-hint <link>s: they trigger connection attempts
+        WITHOUT a visible network request -- pointing at an internal host
+        they make browsers show the Local Network Access permission prompt
+        (same policy as verify_export's private-URL checks). dns-prefetch
+        is a pure WP automatism: always dropped; preconnect only when it
+        targets our own (localized) or a private host. The WP-specific
+        head cruft lives in plugins/wordpress.py (clean_soup)."""
+        removed = 0
         for link in soup.find_all("link"):
             rel_attr = link.get("rel")
             rel = {r.lower() for r in (rel_attr if isinstance(rel_attr, list)
                                        else (rel_attr or "").split())}
-            hit = rel & {"pingback", "shortlink", "wlwmanifest", "edituri"}
-            if hit:
-                drop(link, sorted(hit)[0])
-                continue
-            # resource hints trigger connection attempts WITHOUT a visible
-            # network request -- pointing at an internal host they make
-            # browsers show the Local Network Access permission prompt.
-            # dns-prefetch is a pure WP automatism: always drop; preconnect
-            # only when it targets our own (localized) or a private host.
             if "dns-prefetch" in rel:
-                drop(link, "resource-hints")
+                link.decompose()
+                removed += 1
                 continue
             if "preconnect" in rel:
                 href_abs = link.get("href") or ""
                 if href_abs.startswith("//"):
                     href_abs = "https:" + href_abs
                 if self.is_internal(href_abs) or PRIVATE_NET_RE.match(href_abs):
-                    drop(link, "resource-hints")
-                    continue
-            if any("api.w.org" in r for r in rel):
-                drop(link, "rest-api-discovery")
-                continue
-            ltype = (link.get("type") or "").lower()
-            href = link.get("href") or ""
-            # feed/oEmbed/REST discovery only -- hreflang alternates carry
-            # no type attribute and stay untouched
-            if "alternate" in rel and (
-                    "oembed" in ltype or "rss+xml" in ltype or "atom+xml" in ltype):
-                drop(link, "oembed-discovery" if "oembed" in ltype
-                     else "feed-discovery")
-                continue
-            if ("alternate" in rel and ltype == "application/json"
-                    and "/wp-json/" in href):
-                drop(link, "rest-api-discovery")
+                    link.decompose()
+                    removed += 1
         if removed:
             with self.stats_lock:
-                for kind, n in removed.items():
-                    self.cruft_removed[kind] = self.cruft_removed.get(kind, 0) + n
+                self.cruft_removed["resource-hints"] = (
+                    self.cruft_removed.get("resource-hints", 0) + removed)
 
     def rewrite_soup_relative(self, soup: BeautifulSoup) -> None:
         """Rewrite same-site URLs to root-relative -- in every form page

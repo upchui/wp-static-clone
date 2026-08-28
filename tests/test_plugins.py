@@ -49,7 +49,7 @@ def test_shipped_plugins_registered(mod):
     # alphabetical file order = load order
     assert [cls.name for cls in mod.PLUGIN_REGISTRY] == [
         "cloudflare", "complianz", "downloads", "image_optimize", "lazyload",
-        "minify", "slider_revolution", "theme_fixes"]
+        "minify", "slider_revolution", "theme_fixes", "wordpress"]
     assert set(mod.PLUGIN_MODULES) == {cls.name
                                        for cls in mod.PLUGIN_REGISTRY}
 
@@ -67,6 +67,9 @@ def test_plugin_registries_aggregated(mod):
     assert "data-lazy-srcset" in mod.SRCSET_ATTRS       # lazyload
     assert "data-bg" in mod.CSS_URL_ATTRS               # lazyload
     assert "data-lazy-src" in mod.LAZY_IMG_ATTRS        # lazyload
+    assert mod.PAGE_SKIP_PATTERNS.search("/cart/")      # wordpress (Woo)
+    assert mod.PAGE_SKIP_PATTERNS.search("/checkout/")
+    assert mod.PAGE_SKIP_PATTERNS.search("/wp-admin/")  # core fragment
 
 
 def test_exporter_gets_fresh_plugin_instances(mod, tmp_path):

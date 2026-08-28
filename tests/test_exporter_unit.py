@@ -92,8 +92,10 @@ CRUFT_HTML = """<html><head>
 
 def test_strip_wp_cruft(exporter):
     soup = BeautifulSoup(CRUFT_HTML, "html.parser")
-    exporter.strip_wp_cruft(soup)
-    exporter.plugin("cloudflare").clean_soup(soup)   # runs under the same gate
+    # same sequence as parse_and_save_html under the strip_wp_cruft gate
+    exporter.strip_resource_hints(soup)
+    exporter.plugin("wordpress").clean_soup(soup)
+    exporter.plugin("cloudflare").clean_soup(soup)
     out = str(soup)
     for gone in ("generator", "api.w.org", "EditURI", "shortlink",
                  "pingback", "oembed", "rss+xml", "cloudflareinsights"):
@@ -101,6 +103,15 @@ def test_strip_wp_cruft(exporter):
     assert 'rel="canonical"' in out
     assert 'hreflang="de"' in out
     assert 'rel="stylesheet"' in out
+
+
+def test_wlwmanifest_asset_candidate_skipped(exporter):
+    wp = exporter.plugin("wordpress")
+    url = "https://example.at/wp-includes/wlwmanifest.xml"
+    assert wp.skip_asset_candidate(url, "link", {"wlwmanifest"})
+    assert not wp.skip_asset_candidate(url, "link", {"stylesheet"})
+    exporter.cfg.strip_wp_cruft = False       # cruft kept -> target mirrored
+    assert not wp.skip_asset_candidate(url, "link", {"wlwmanifest"})
 
 
 def test_rewrite_keeps_canonical_localizes_assets(exporter):
@@ -593,7 +604,7 @@ def test_resource_hints_stripped_unit(exporter):
         '<link rel="preconnect" href="https://fonts.gstatic.com/">'
         '<link rel="preconnect" href="http://10.11.16.10">'
         '<link rel="preconnect" href="https://example.at">', "html.parser")
-    exporter.strip_wp_cruft(soup)
+    exporter.strip_resource_hints(soup)
     out = str(soup)
     assert "dns-prefetch" not in out
     assert "10.11.16.10" not in out                     # private preconnect
