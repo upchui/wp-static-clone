@@ -12,7 +12,10 @@ import re
 from wp_static_export import Plugin
 
 HEX_ID_RE = re.compile(rb"\b[0-9a-f]{8,}\b", re.IGNORECASE)
-NUM_ID_RE = re.compile(rb"-\d{3,7}\b")
+# rand() suffixes can be as short as 2 digits (observed: class="uvc-48"
+# on one request vs "uvc-482" on the next -> false "different mobile
+# HTML"); over-normalizing is fine for the comparison this feeds
+NUM_ID_RE = re.compile(rb"-\d{2,7}\b")
 
 
 class ThemeFixes(Plugin):

@@ -1,5 +1,14 @@
 # Changelog
 
+## 2.1.1 (2026-08-28)
+
+### Fixed
+- The mobile comparison's id-noise normalization (theme_fixes) now also
+  covers 2-digit rand() suffixes (`-\d{2,7}` instead of `-\d{3,7}`).
+  Observed on a real site: Ultimate Addons emitted `class="uvc-48"` on
+  one request and a 3-digit suffix on the next, so a responsive page was
+  falsely reported as serving different mobile HTML.
+
 ## 2.1.0 (2026-08-28)
 
 ### Changed
