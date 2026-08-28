@@ -13,6 +13,7 @@
 import json
 import posixpath
 import re
+import threading
 from urllib.parse import urljoin, urlsplit
 
 import requests
@@ -43,9 +44,13 @@ class SliderRevolution(Plugin):
     def __init__(self, exporter):
         super().__init__(exporter)
         # REST full-objects per slider id, and per-module count of slides
-        # whose layers were embedded
+        # whose layers were embedded. _rest_lock is held across the fetch:
+        # without it, N crawl workers hitting the same slider id would each
+        # miss the cache and issue N identical wp-json requests
         self._rest_cache: dict[str, dict | None] = {}
+        self._rest_lock = threading.Lock()
         self.hydrated: dict[str, int] = {}
+        self._warned: set[str] = set()      # one warning per slider, not page
 
     def pre_discover_soup(self, soup, page_url: str) -> None:
         # must run BEFORE discovery + rewrite: both need to see the
@@ -53,29 +58,36 @@ class SliderRevolution(Plugin):
         if self.exp.cfg.sr7_hydrate:
             self._hydrate(soup)
 
+    def _warn_once(self, key: str, msg: str) -> None:
+        """The same slider appears on many pages -- warn once, not per page."""
+        with self.exp.stats_lock:
+            if key in self._warned:
+                return
+            self._warned.add(key)
+        self.exp.warnings.append(msg)
+
     def _full_object(self, slider_id: str) -> dict | None:
         """Full slider object from the SR7 REST endpoint (all slides with
         layers, no slideid parameter needed) -- fetched once per slider id.
         This is the ONLY wp-json request the exporter ever makes, and only
         when a slider actually has lazy slides (--no-sr7-hydrate disables)."""
         exp = self.exp
-        with exp.stats_lock:
+        with self._rest_lock:
             if slider_id in self._rest_cache:
                 return self._rest_cache[slider_id]
-        data: dict | None = None
-        url = (f"{exp.scheme}://{exp.host}/wp-json/sliderrevolution/"
-               f"sliders/{slider_id}?srengine=7")
-        try:
-            resp = exp.fetch(url)
-            if resp.ok and not exp.off_site_redirect(resp):
-                obj = resp.json()
-                if isinstance(obj, dict) and obj.get("success"):
-                    data = obj
-        except (requests.RequestException, ValueError):
-            pass
-        with exp.stats_lock:
+            data: dict | None = None
+            url = (f"{exp.scheme}://{exp.host}/wp-json/sliderrevolution/"
+                   f"sliders/{slider_id}?srengine=7")
+            try:
+                resp = exp.fetch(url)
+                if resp.ok and not exp.off_site_redirect(resp):
+                    obj = resp.json()
+                    if isinstance(obj, dict) and obj.get("success"):
+                        data = obj
+            except (requests.RequestException, ValueError):
+                pass
             self._rest_cache[slider_id] = data
-        return data
+            return data
 
     def _hydrate(self, soup) -> None:
         """Merge the lazy slides' layers into the inline SR7.JSON blob --
@@ -107,7 +119,8 @@ class SliderRevolution(Plugin):
                 try:
                     blob, end = decoder.raw_decode(text, m.end())
                 except ValueError:
-                    exp.warnings.append(
+                    self._warn_once(
+                        f"parse:{dom_id}",
                         f"SR7 {dom_id}: inline JSON not parseable, "
                         f"hydration skipped")
                     break
@@ -120,7 +133,8 @@ class SliderRevolution(Plugin):
                     break
                 full = self._full_object(slider_id)
                 if full is None:
-                    exp.warnings.append(
+                    self._warn_once(
+                        f"rest:{slider_id}",
                         f"SR7 slider {slider_id} ({dom_id}) has lazy slides "
                         f"but the REST endpoint gave no usable answer -- the "
                         f"slider will freeze in the static mirror")
@@ -151,7 +165,8 @@ class SliderRevolution(Plugin):
                 still = [1 for v in pending.values()
                          if len(v.get("layers") or []) == 0]
                 if still:
-                    exp.warnings.append(
+                    self._warn_once(
+                        f"partial:{slider_id}",
                         f"SR7 slider {slider_id} ({dom_id}): {len(still)} "
                         f"lazy slide(s) not hydratable (stream source?) -- "
                         f"the slider may freeze statically")

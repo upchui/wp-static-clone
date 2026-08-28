@@ -686,6 +686,10 @@ def test_hydrate_sr7_rest_failure_warns(mod, tmp_path):
     assert '"layers":[]' in str(soup)                     # blob unchanged
     assert sr7.hydrated == {}
     assert any("freeze" in w for w in e.warnings)
+    # the same slider on a SECOND page: no duplicate warning spam
+    sr7.pre_discover_soup(BeautifulSoup(SR7_HTML, "html.parser"),
+                          "https://example.at/p2/")
+    assert sum("freeze" in w for w in e.warnings) == 1
 
 
 def test_hydrate_sr7_noop_without_lazy_slides(mod, tmp_path):

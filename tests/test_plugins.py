@@ -39,6 +39,20 @@ def test_underscore_files_skipped_and_valid_loaded(mod, tmp_path):
     assert issubclass(loaded[0][1], mod.Plugin)
 
 
+def test_failed_plugin_not_left_in_sys_modules(mod, tmp_path):
+    import sys
+    f = tmp_path / "zz_poison.py"
+    f.write_text("raise RuntimeError('boom')\n")
+    with pytest.raises(RuntimeError):
+        mod._load_plugin_file(f)
+    assert "wps_plugin_zz_poison" not in sys.modules
+    f2 = tmp_path / "zz_noplugin.py"
+    f2.write_text("x = 1\n")
+    with pytest.raises(SystemExit):
+        mod._load_plugin_file(f2)
+    assert "wps_plugin_zz_noplugin" not in sys.modules
+
+
 def test_load_plugins_idempotent(mod):
     before = list(mod.PLUGIN_REGISTRY)
     mod.load_plugins()

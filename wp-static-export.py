@@ -639,11 +639,17 @@ def _load_plugin_file(path: Path) -> tuple:
     spec = importlib.util.spec_from_file_location(mod_name, path)
     module = importlib.util.module_from_spec(spec)
     sys.modules[mod_name] = module   # findable for tests / monkeypatching
-    spec.loader.exec_module(module)
-    cls = getattr(module, "PLUGIN", None)
-    if not (isinstance(cls, type) and issubclass(cls, Plugin) and cls.name):
-        sys.exit(f"{TOOL_NAME}: {path.name}: no PLUGIN = <Plugin subclass "
-                 f"with a name> found")
+    try:
+        spec.loader.exec_module(module)
+        cls = getattr(module, "PLUGIN", None)
+        if not (isinstance(cls, type) and issubclass(cls, Plugin)
+                and cls.name):
+            sys.exit(f"{TOOL_NAME}: {path.name}: no PLUGIN = <Plugin "
+                     f"subclass with a name> found")
+    except BaseException:
+        # like importlib: never leave a half-initialized module behind
+        sys.modules.pop(mod_name, None)
+        raise
     return module, cls
 
 
@@ -658,17 +664,19 @@ def _scan_plugins(plugins_dir: Path) -> list[tuple]:
             if not p.name.startswith("_")]
 
 
-def load_plugins(plugins_dir: Path | None = None) -> None:
-    """Discover and register all plugins, then aggregate their static
-    registries into the module-level constants. Idempotent -- runs once at
-    the bottom of this module."""
+def load_plugins() -> None:
+    """Discover and register the plugins from the plugins/ directory next
+    to this script, then aggregate their static registries into the
+    module-level constants. Runs exactly once, at the bottom of this
+    module -- later calls are no-ops (which is why there is no directory
+    parameter: it could never take effect)."""
     global URL_ATTRS, PAGE_URL_ATTRS, B64_URL_ATTRS, HTML_NOISE_EXTRA
     global VERIFY_SCRIPT_REF_DIRS, VERIFY_SKIP_REF_PREFIXES
     global SRCSET_ATTRS, CSS_URL_ATTRS, LAZY_IMG_ATTRS, EXTRA_OUTPUT_DIRS
     global PAGE_SKIP_PATTERNS
     if PLUGIN_REGISTRY:
         return
-    pdir = plugins_dir or Path(__file__).resolve().parent / "plugins"
+    pdir = Path(__file__).resolve().parent / "plugins"
     skip_fragments: tuple = ()
     for module, cls in _scan_plugins(pdir):
         if cls.name in PLUGIN_MODULES:
@@ -3566,7 +3574,13 @@ Notes:
                          "resolving to private addresses (from this machine) "
                          "as additional spellings of the site")
     for cls in PLUGIN_REGISTRY:
-        cls.add_cli_args(ap.add_argument_group(f"plugin: {cls.name}"))
+        try:
+            cls.add_cli_args(ap.add_argument_group(f"plugin: {cls.name}"))
+        except argparse.ArgumentError as exc:
+            # two plugins registering the same option string -- name the
+            # culprit instead of dumping a raw traceback (also on --help)
+            sys.exit(f"{TOOL_NAME}: plugin {cls.name!r} registers a "
+                     f"conflicting CLI option: {exc}")
     args = ap.parse_args(argv)
 
     for pattern in args.exclude:
@@ -3645,10 +3659,11 @@ Notes:
                         for h in args.internal_hosts if h.strip()],
         resolve_internal=args.resolve_internal,
     )
+    if args.user_agent:
+        # before the plugin pass -- finish_args must see the final value
+        cfg.user_agent = args.user_agent
     for cls in PLUGIN_REGISTRY:
         cls.finish_args(ap, args, cfg)
-    if args.user_agent:
-        cfg.user_agent = args.user_agent
     return cfg
 
 
