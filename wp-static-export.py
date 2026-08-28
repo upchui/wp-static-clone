@@ -217,8 +217,8 @@ CSS_URL_ATTRS: tuple = ()
 # (plugin-registered: lazy_img_attrs)
 LAZY_IMG_ATTRS: tuple = ()
 # extra top-level output directories next to public/ that --clean removes
-# and .dockerignore excludes (plugin-extendable: extra_output_dirs)
-EXTRA_OUTPUT_DIRS = ("mobile-variants",)
+# and .dockerignore excludes (plugin-registered: extra_output_dirs)
+EXTRA_OUTPUT_DIRS: tuple = ()
 # attributes that hold internal *page* links (theme-specific -- registered
 # by plugins, e.g. The7's clickable images)
 PAGE_URL_ATTRS: tuple = ()
@@ -240,38 +240,6 @@ CSS_URL_RE = re.compile(r"url\(\s*['\"]?([^'\")]+)['\"]?\s*\)", re.IGNORECASE)
 CSS_IMPORT_RE = re.compile(r"@import\s+['\"]([^'\"]+)['\"]", re.IGNORECASE)
 XML_STYLESHEET_RE = re.compile(r"<\?xml-stylesheet[^>]*href=[\"']([^\"']+)[\"']")
 SITEMAP_LINE_RE = re.compile(r"(?im)^\s*sitemap:\s*(\S+)")
-
-MOBILE_UA = ("Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) "
-             "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 "
-             "Mobile/15E148 Safari/604.1")
-
-# Normalize away per-request noise before comparing two HTML responses, so
-# WordPress dynamics don't cause false "different"s: CSRF nonces (both the
-# JS and the <input name="_wpnonce"> form), cache-buster query params
-# (?ver=..., ?v=...), plugin-registered noise patterns (HTML_NOISE_EXTRA,
-# e.g. Ultimate Addons' per-request uniqid()/rand() element ids), HTML
-# comments (generator/debug stamps) and whitespace. Over-normalizing is
-# fine here -- worst case a truly dynamic page is classified "same".
-NONCE_RE = re.compile(
-    rb"""(_wpnonce|nonce|csrf[\w-]*|token)(["']?\s*[:=]\s*["'])"""
-    rb"""[A-Za-z0-9+/=._-]{6,}(["'])""", re.IGNORECASE)
-WPNONCE_ATTR_RE = re.compile(
-    rb"""(name=["']_wpnonce["']\s+value=["'])[^"']+""", re.IGNORECASE)
-HTML_COMMENT_RE = re.compile(rb"<!--.*?-->", re.DOTALL)
-VER_QS_RE = re.compile(rb"[?&](?:ver|v|t|cache|nocache)=[^\s\"'&<>]+",
-                       re.IGNORECASE)
-WS_RE = re.compile(rb"\s+")
-
-
-def normalize_html(data: bytes) -> bytes:
-    data = HTML_COMMENT_RE.sub(b"", data)
-    data = NONCE_RE.sub(rb"\1\2\3", data)
-    data = WPNONCE_ATTR_RE.sub(rb"\1", data)
-    data = VER_QS_RE.sub(b"", data)
-    for rx, rep in HTML_NOISE_EXTRA:
-        data = rx.sub(rep, data)
-    return WS_RE.sub(b" ", data).strip()
-
 
 def norm_host(host: str) -> str:
     """Canonical comparison form of a hostname: lowercase, www. stripped,
@@ -723,8 +691,10 @@ class Config:
     extra_headers: dict = field(default_factory=dict)
     port: int = 8080
     extra_sitemaps: list = field(default_factory=list)
+    # plugin-owned (plugins/mobile_check.py); user_agent "" means the
+    # plugin's default (iPhone UA)
     mobile_check: bool = True
-    mobile_user_agent: str = MOBILE_UA
+    mobile_user_agent: str = ""
     generate_sitemap: bool = True
     strip_wp_cruft: bool = True
     # plugin-owned option (declared here so direct Config() construction
@@ -760,6 +730,7 @@ class PageRecord:
     content_type: str = ""
     source: str = "sitemap"          # sitemap | link | manual
     mobile: str = ""                 # same | different | dynamic | check-failed
+                                     # (plugin-owned: plugins/mobile_check.py)
     last_modified: str = ""          # raw Last-Modified response header
     save_url: str = ""               # canonical URL the content was saved under
                                      # (differs from url for redirect sources)
@@ -874,9 +845,6 @@ class Exporter:
         self.warnings: list[str] = []
         self.soft_404 = False
         self.asset_count = 0
-        self.mobile_diff: list[dict] = []
-        self.mobile_dynamic: list[str] = []
-        self.vary_ua_pages: list[str] = []
         self.amp_links: set[str] = set()
         self.verify_missing: list[dict] = []
         self.verify_unexpected: list[dict] = []
@@ -1561,8 +1529,6 @@ class Exporter:
                     self.write_bytes(target, resp.content)
             return [], []
 
-        if "user-agent" in (resp.headers.get("Vary") or "").lower():
-            self.vary_ua_pages.append(url)
         for p in self.plugins:
             p.page_fetched(url, resp, rec)
 
@@ -1590,8 +1556,6 @@ class Exporter:
             self._write_redirect_stub(url, save_url)
         new_pages, new_assets = self.parse_and_save_html(
             save_url, resp.content, rec)
-        if self.cfg.mobile_check:
-            self.check_mobile_variant(save_url, resp.content, rec)
         for p in self.plugins:
             p.page_saved(save_url, resp, rec)
         return new_pages, new_assets
@@ -1609,50 +1573,6 @@ class Exporter:
                 '<title>Redirect</title></head>'
                 f'<body><a href="{dest}">{dest}</a></body></html>')
         self.write_bytes(src_target, stub.encode("utf-8"))
-
-    def check_mobile_variant(self, url: str, desktop_raw: bytes,
-                             rec: PageRecord) -> None:
-        """Fetch the page with a mobile UA and compare against the desktop
-        response. A second desktop fetch distinguishes UA-based dynamic
-        serving from per-request randomness."""
-        try:
-            mresp = self.fetch(url, headers={"User-Agent": self.cfg.mobile_user_agent})
-        except requests.RequestException as exc:
-            rec.mobile = "check-failed"
-            self.warnings.append(f"mobile check failed for {url}: {exc}")
-            return
-        if not mresp.ok or "html" not in (mresp.headers.get("Content-Type") or ""):
-            rec.mobile = "check-failed"
-            return
-        if normalize_html(mresp.content) == normalize_html(desktop_raw):
-            rec.mobile = "same"
-            return
-        # control fetch: does a second *desktop* request differ as well?
-        try:
-            dresp = self.fetch(url)
-        except requests.RequestException:
-            rec.mobile = "check-failed"
-            return
-        if dresp.ok and normalize_html(dresp.content) != normalize_html(desktop_raw):
-            rec.mobile = "dynamic"
-            self.mobile_dynamic.append(url)
-            return
-        rec.mobile = "different"
-        target = self.local_path_for(url, is_page=True)
-        variant_rel = ""
-        if target:
-            rel = target.relative_to(self.public_dir.resolve())
-            variant = self.cfg.out_dir / "mobile-variants" / rel
-            with self.write_lock:
-                # two source URLs redirecting to the same save_url must not
-                # write (and report) the same variant file concurrently
-                if variant in self.written_paths:
-                    return
-                self.written_paths.add(variant)
-            variant.parent.mkdir(parents=True, exist_ok=True)
-            variant.write_bytes(mresp.content)
-            variant_rel = str(Path("mobile-variants") / rel)
-        self.mobile_diff.append({"url": url, "variant": variant_rel})
 
     def parse_and_save_html(self, page_url: str, raw: bytes,
                             rec: PageRecord | None,
@@ -3067,15 +2987,6 @@ esac
         redirects = list({(r["from"], r["to"]): r for r in self.redirects}
                          .values())
 
-        if self.mobile_diff:
-            self.warnings.append(
-                "Some pages serve DIFFERENT HTML to mobile user agents (UA-based "
-                "dynamic serving). public/ contains the desktop variant; the "
-                "mobile HTML was saved under mobile-variants/ for review. "
-                "Options: switch theme/plugin to responsive rendering (one HTML "
-                "for all devices), or serve both variants via an nginx "
-                "user-agent map plus a 'Vary: User-Agent' response header.")
-
         report = {
             "tool": f"{TOOL_NAME} {VERSION}",
             "base_url": self.cfg.base_url,
@@ -3113,13 +3024,6 @@ esac
                 "wp_cruft_removed": self.cruft_removed,
                 "staging_noindex": self.cfg.staging,
                 "target_domain": self.cfg.target_domain,
-            },
-            "mobile": {
-                "checked": self.cfg.mobile_check,
-                "pages_with_different_mobile_html": self.mobile_diff,
-                "pages_with_per_request_dynamic_content": self.mobile_dynamic,
-                "pages_sending_vary_user_agent": self.vary_ua_pages,
-                "amp_variants_exported": sorted(self.amp_links),
             },
             "external_hosts_referenced": sorted(self.external_hosts),
             "auto_internal_hosts": self.auto_internal_hosts,
@@ -3192,13 +3096,6 @@ esac
             section("SEO: pages without meta description", no_desc, lambda p: p.url),
             section("SEO: pages without viewport meta (mobile usability)",
                     no_viewport, lambda p: p.url),
-            section("Mobile: pages serving DIFFERENT HTML to a mobile UA",
-                    self.mobile_diff,
-                    lambda d: f"{d['url']} (variant: {d['variant']})"),
-            section("Mobile: per-request dynamic content (UA comparison "
-                    "inconclusive)", self.mobile_dynamic),
-            section("Mobile: 'Vary: User-Agent' response header seen",
-                    self.vary_ua_pages),
             section("AMP variants exported", sorted(self.amp_links)),
             section("Skipped URLs with query strings", sorted(self.skipped_query_urls)),
             section("Excluded by --exclude / robots.txt",
@@ -3318,18 +3215,6 @@ esac
             print("[seo] canonical/og/JSON-LD/sitemap keep the origin host; "
                   "the generated nginx.conf substitutes the served domain "
                   "at runtime (sub_filter)")
-        if self.cfg.mobile_check:
-            if self.mobile_diff:
-                print(f"[done] Mobile: {len(self.mobile_diff)} pages serve "
-                      f"DIFFERENT mobile HTML -- variants under "
-                      f"mobile-variants/, details in the report")
-            elif self.mobile_dynamic:
-                print(f"[done] Mobile: {len(self.mobile_dynamic)} pages with "
-                      f"dynamic content, UA comparison inconclusive -- "
-                      f"see the report")
-            else:
-                print("[done] Mobile: HTML for a mobile UA is identical "
-                      "(responsive) -- the export covers the mobile rendering")
         if self.cfg.rewrite:
             if self.verify_missing or self.verify_unexpected:
                 print(f"[verify] {len(self.verify_missing)} missing local "
@@ -3462,12 +3347,6 @@ Notes:
                          "redirecting to its https:// URL")
     ap.add_argument("--extra-sitemap", action="append", default=[],
                     help="additional sitemap URL (repeatable)")
-    ap.add_argument("--no-mobile-check", dest="mobile_check", action="store_false",
-                    help="skip the mobile-vs-desktop HTML comparison "
-                         "(saves one extra request per page)")
-    ap.add_argument("--mobile-user-agent", default=None,
-                    help="user agent used for the mobile comparison "
-                         "(default: iPhone Safari)")
     ap.add_argument("--no-generate-sitemap", dest="generate_sitemap",
                     action="store_false",
                     help="keep the origin sitemap files verbatim instead of "
@@ -3583,7 +3462,6 @@ Notes:
         host_header=host_header,
         extra_headers=extra_headers,
         extra_sitemaps=args.extra_sitemap,
-        mobile_check=args.mobile_check,
         port=args.port,
         generate_sitemap=args.generate_sitemap,
         strip_wp_cruft=args.strip_wp_cruft,
@@ -3602,8 +3480,6 @@ Notes:
         cls.finish_args(ap, args, cfg)
     if args.user_agent:
         cfg.user_agent = args.user_agent
-    if args.mobile_user_agent:
-        cfg.mobile_user_agent = args.mobile_user_agent
     return cfg
 
 

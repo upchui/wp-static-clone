@@ -148,6 +148,10 @@ def test_decode_cfemail(mod):
 # -- normalize_html (mobile-check comparison) -------------------------------
 
 def test_normalize_html_ignores_wp_noise(mod):
+    # the Ultimate-Addons id noise below also proves normalize_html reads
+    # the aggregated HTML_NOISE_EXTRA (contributed by theme_fixes, which
+    # loads AFTER mobile_check) lazily via the core module
+    mod = mod.PLUGIN_MODULES["mobile_check"]
     a = mod.normalize_html(
         b'<div id="ultimate-heading-13076a8ee702062f3">'
         b'<!-- Page generated in 0.42s -->'
@@ -168,6 +172,7 @@ def test_normalize_html_ignores_wp_noise(mod):
 
 
 def test_normalize_html_detects_real_difference(mod):
+    mod = mod.PLUGIN_MODULES["mobile_check"]
     a = mod.normalize_html(b"<h1>Desktop</h1>")
     b = mod.normalize_html(b"<h1>Mobile</h1>")
     assert a != b

@@ -767,3 +767,73 @@ def test_missing_minifiers_fail_cli(mod, monkeypatch, capsys):
     # --no-minify still works without the packages
     cfg = mod.parse_args(["https://example.at", "--no-minify"])
     assert cfg.minify is False
+
+
+# -- v2.1.0: mobile check plugin --------------------------------------------
+
+def _fake_resp(body=b"", ok=True, ctype="text/html"):
+    class R:
+        pass
+    r = R()
+    r.ok = ok
+    r.content = body
+    r.headers = {"Content-Type": ctype}
+    return r
+
+
+def test_mobile_check_matrix(mod, tmp_path):
+    e = mod.Exporter(mod.Config(base_url="https://example.at",
+                                out_dir=tmp_path / "o"))
+    e.public_dir.mkdir(parents=True)
+    mc = e.plugin("mobile_check")
+    queue = []
+    e.fetch = lambda url, headers=None, **kw: queue.pop(0)
+
+    # same: mobile response equals desktop
+    rec = mod.PageRecord(url="https://example.at/")
+    queue[:] = [_fake_resp(b"<h1>x</h1>")]
+    mc.page_saved("https://example.at/", _fake_resp(b"<h1>x</h1>"), rec)
+    assert rec.mobile == "same"
+
+    # dynamic: mobile differs AND the desktop control fetch differs too
+    rec = mod.PageRecord(url="https://example.at/a/")
+    queue[:] = [_fake_resp(b"<h1>m</h1>"), _fake_resp(b"<h1>d2</h1>")]
+    mc.page_saved("https://example.at/a/", _fake_resp(b"<h1>d</h1>"), rec)
+    assert rec.mobile == "dynamic"
+    assert mc.mobile_dynamic == ["https://example.at/a/"]
+
+    # different: mobile differs, desktop control identical -> variant saved
+    rec = mod.PageRecord(url="https://example.at/b/")
+    queue[:] = [_fake_resp(b"<h1>m</h1>"), _fake_resp(b"<h1>d</h1>")]
+    mc.page_saved("https://example.at/b/", _fake_resp(b"<h1>d</h1>"), rec)
+    assert rec.mobile == "different"
+    variant = e.cfg.out_dir / "mobile-variants" / "b" / "index.html"
+    assert variant.read_bytes() == b"<h1>m</h1>"
+    assert mc.mobile_diff == [{"url": "https://example.at/b/",
+                               "variant": "mobile-variants/b/index.html"}]
+
+    # check-failed: mobile response not ok
+    rec = mod.PageRecord(url="https://example.at/c/")
+    queue[:] = [_fake_resp(b"", ok=False)]
+    mc.page_saved("https://example.at/c/", _fake_resp(b"<h1>d</h1>"), rec)
+    assert rec.mobile == "check-failed"
+
+    # gate: --no-mobile-check -> no fetch at all (empty queue would raise)
+    e.cfg.mobile_check = False
+    rec = mod.PageRecord(url="https://example.at/d/")
+    queue[:] = []
+    mc.page_saved("https://example.at/d/", _fake_resp(b"<h1>d</h1>"), rec)
+    assert rec.mobile == ""
+
+
+def test_mobile_check_vary_header(mod, tmp_path):
+    e = mod.Exporter(mod.Config(base_url="https://example.at",
+                                out_dir=tmp_path / "o"))
+    mc = e.plugin("mobile_check")
+    r = _fake_resp()
+    r.headers = {"Vary": "Accept-Encoding, User-Agent"}
+    mc.page_fetched("https://example.at/", r, None)
+    r2 = _fake_resp()
+    r2.headers = {"Vary": "Accept-Encoding"}
+    mc.page_fetched("https://example.at/x/", r2, None)
+    assert mc.vary_ua_pages == ["https://example.at/"]
