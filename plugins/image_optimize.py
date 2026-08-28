@@ -9,6 +9,7 @@ later crawl rounds than the page that references them.
 import unicodedata
 from urllib.parse import unquote
 
+import wp_static_export as core
 from wp_static_export import Plugin, path_extension, read_image_size
 
 
@@ -54,8 +55,10 @@ class ImageOptimize(Plugin):
             is_first = first
             first = False
             classes = " ".join(img.get("class") or []).lower()
-            plugin_lazy = (img.has_attr("data-src")
-                           or img.has_attr("data-lazy-src")
+            # LAZY_IMG_ATTRS read via the module at call time: this plugin
+            # loads before the plugins that register those attrs, so a
+            # from-import would freeze the un-aggregated base tuple
+            plugin_lazy = (any(img.has_attr(a) for a in core.LAZY_IMG_ATTRS)
                            or "lazy" in classes)
             if plugin_lazy:
                 self.stats["skipped_plugin"] += 1

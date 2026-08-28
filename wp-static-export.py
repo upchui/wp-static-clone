@@ -187,19 +187,41 @@ MEDIA_EXTENSIONS = {
     "pdf", "zip", "gz", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "wasm",
 }
 
-PAGE_SKIP_PATTERNS = re.compile(
-    r"(/wp-admin(/|$)|/wp-login\.php|/wp-json(/|$)|/xmlrpc\.php"
-    r"|/wp-signup\.php|/wp-activate\.php|/wp-trackback\.php"
-    r"|/feed/?$|/comments/feed|/wp-cron\.php|/cart/?$|/checkout/?$)",
-    re.IGNORECASE,
+# dynamic-endpoint paths that must never be fetched as pages or assets.
+# The core fragments are the tool's identity (never talk to WP admin/API
+# endpoints); plugins contribute vendor fragments via
+# page_skip_pattern_fragments and load_plugins() recompiles the regex.
+PAGE_SKIP_FRAGMENTS = (
+    r"/wp-admin(/|$)", r"/wp-login\.php", r"/wp-json(/|$)", r"/xmlrpc\.php",
+    r"/wp-signup\.php", r"/wp-activate\.php", r"/wp-trackback\.php",
+    r"/feed/?$", r"/comments/feed", r"/wp-cron\.php",
+    r"/cart/?$", r"/checkout/?$",
 )
+
+
+def _compile_page_skip(fragments: tuple) -> re.Pattern:
+    return re.compile("(" + "|".join(fragments) + ")", re.IGNORECASE)
+
+
+PAGE_SKIP_PATTERNS = _compile_page_skip(PAGE_SKIP_FRAGMENTS)
 
 # attributes that may hold a single URL (plugins register vendor-specific
 # ones, e.g. Complianz lazy attributes)
 URL_ATTRS = ("src", "href", "poster", "data-src", "data-lazy-src", "data-bg",
              "data-placeholder-image")
 # attributes that hold srcset-style comma separated candidate lists
+# (plugin-extendable: srcset_attrs)
 SRCSET_ATTRS = ("srcset", "data-srcset", "data-lazy-srcset")
+# attributes whose value is a full CSS declaration containing url(...)
+# (plugin-extendable: css_url_attrs)
+CSS_URL_ATTRS = ("data-bg",)
+# attributes that mark an <img> as managed by a lazy-load plugin -- such
+# images must not get loading=lazy/width/height injected
+# (plugin-extendable: lazy_img_attrs)
+LAZY_IMG_ATTRS = ("data-src", "data-lazy-src")
+# extra top-level output directories next to public/ that --clean removes
+# and .dockerignore excludes (plugin-extendable: extra_output_dirs)
+EXTRA_OUTPUT_DIRS = ("mobile-variants",)
 # attributes that hold internal *page* links (theme-specific -- registered
 # by plugins, e.g. The7's clickable images)
 PAGE_URL_ATTRS: tuple = ()
@@ -610,6 +632,11 @@ class Plugin:
                                      # normalize_html() noise stripping
     verify_script_ref_dirs: tuple = ()    # extra VERIFY_SCRIPT_REF_DIRS
     verify_skip_ref_prefixes: tuple = ()  # extra VERIFY_SKIP_REF_PREFIXES
+    srcset_attrs: tuple = ()         # extra srcset-style attributes
+    css_url_attrs: tuple = ()        # extra CSS-declaration-in-attr attributes
+    lazy_img_attrs: tuple = ()       # extra lazy-load-plugin <img> attributes
+    page_skip_pattern_fragments: tuple = ()  # extra PAGE_SKIP regex fragments
+    extra_output_dirs: tuple = ()    # extra out-dir trees (--clean/.dockerignore)
 
     # -- CLI phase (classmethods: run before any Exporter exists) ----------
     @classmethod
@@ -652,6 +679,36 @@ class Plugin:
     def skip_page_path(self, path: str) -> bool:
         """True when this URL path must never be treated as a page."""
         return False
+
+    def skip_asset_candidate(self, url: str, tag_name: str,
+                             rel: set) -> bool:
+        """[threaded] True to drop this discovered asset candidate (url is
+        the canonicalized absolute URL, rel the lowercased rel-token set)
+        -- e.g. targets of tags another hook is going to strip anyway."""
+        return False
+
+    def save_non_html_response(self, url: str, resp) -> bool:
+        """[threaded] Claim a non-HTML response served on a page URL or an
+        extensionless asset URL (e.g. materialize a dynamic download
+        endpoint as a real file). True = claimed, the core skips its own
+        raw write; first claimant wins."""
+        return False
+
+    def page_fetched(self, url: str, resp, rec) -> None:
+        """[threaded] Successful same-site HTML page response, BEFORE the
+        redirect-stub/save decision (fires for pages that end up as query-
+        redirect stubs too) -- e.g. response-header inspection."""
+
+    def page_saved(self, save_url: str, resp, rec) -> None:
+        """[threaded] After parse_and_save_html() for a real (non-stub)
+        page; resp.content holds the HTML that was saved under save_url."""
+
+    def redirect_rules(self, seen_from: set) -> list:
+        """Extra (from_path, to_ref) 301 rules for the generated server
+        configs. seen_from holds every from_path already claimed -- skip
+        those and add your accepted ones; return only config-safe rules
+        (the plugin owns its character filtering and warnings)."""
+        return []
 
     def filter_text_asset(self, url: str, kind: str, text: str) -> str:
         """[threaded] Last transform of a rewritten text asset
@@ -727,9 +784,12 @@ def load_plugins(plugins_dir: Path | None = None) -> None:
     the bottom of this module."""
     global URL_ATTRS, PAGE_URL_ATTRS, B64_URL_ATTRS, HTML_NOISE_EXTRA
     global VERIFY_SCRIPT_REF_DIRS, VERIFY_SKIP_REF_PREFIXES
+    global SRCSET_ATTRS, CSS_URL_ATTRS, LAZY_IMG_ATTRS, EXTRA_OUTPUT_DIRS
+    global PAGE_SKIP_PATTERNS
     if PLUGIN_REGISTRY:
         return
     pdir = plugins_dir or Path(__file__).resolve().parent / "plugins"
+    skip_fragments: tuple = ()
     for module, cls in _scan_plugins(pdir):
         if cls.name in PLUGIN_MODULES:
             sys.exit(f"{TOOL_NAME}: duplicate plugin name {cls.name!r}")
@@ -741,6 +801,14 @@ def load_plugins(plugins_dir: Path | None = None) -> None:
         HTML_NOISE_EXTRA += tuple(cls.html_noise_patterns)
         VERIFY_SCRIPT_REF_DIRS += tuple(cls.verify_script_ref_dirs)
         VERIFY_SKIP_REF_PREFIXES += tuple(cls.verify_skip_ref_prefixes)
+        SRCSET_ATTRS += tuple(cls.srcset_attrs)
+        CSS_URL_ATTRS += tuple(cls.css_url_attrs)
+        LAZY_IMG_ATTRS += tuple(cls.lazy_img_attrs)
+        EXTRA_OUTPUT_DIRS += tuple(cls.extra_output_dirs)
+        skip_fragments += tuple(cls.page_skip_pattern_fragments)
+    if skip_fragments:
+        PAGE_SKIP_PATTERNS = _compile_page_skip(
+            PAGE_SKIP_FRAGMENTS + skip_fragments)
 
 
 class HostResolveAdapter(HTTPAdapter):
@@ -1614,18 +1682,23 @@ class Exporter:
             rec.error = f"redirected off-site to {resp.url}"
             return [], []
 
-        # non-HTML target: a PDF listed in the sitemap, or a dynamic
-        # download endpoint (/download/123/) that must become a real file
+        # non-HTML target: a PDF listed in the sitemap, or a response a
+        # plugin claims (e.g. a dynamic download endpoint that must become
+        # a real file)
         if "html" not in rec.content_type:
-            if self._save_download(self.to_base_host(resp.url), resp) is None:
-                target = self.local_path_for(self.to_base_host(resp.url),
-                                             is_page=False)
-                if target:
-                    self.write_bytes(target, resp.content)
+            url_b = self.to_base_host(resp.url)
+            if not any(p.save_non_html_response(url_b, resp)
+                       for p in self.plugins):
+                if self._save_download(url_b, resp) is None:
+                    target = self.local_path_for(url_b, is_page=False)
+                    if target:
+                        self.write_bytes(target, resp.content)
             return [], []
 
         if "user-agent" in (resp.headers.get("Vary") or "").lower():
             self.vary_ua_pages.append(url)
+        for p in self.plugins:
+            p.page_fetched(url, resp, rec)
 
         final = self.to_base_host(resp.url)
         if (resp.history
@@ -1653,6 +1726,8 @@ class Exporter:
             save_url, resp.content, rec)
         if self.cfg.mobile_check:
             self.check_mobile_variant(save_url, resp.content, rec)
+        for p in self.plugins:
+            p.page_saved(save_url, resp, rec)
         return new_pages, new_assets
 
     def _save_download(self, url: str, resp: requests.Response) -> str | None:
@@ -1798,6 +1873,9 @@ class Exporter:
             elif (tag_name == "link" and rel & {"wlwmanifest", "edituri"}
                     and self.cfg.rewrite and self.cfg.strip_wp_cruft):
                 return  # tag gets stripped -- don't mirror its target either
+            elif any(p.skip_asset_candidate(absolute, tag_name, rel)
+                     for p in self.plugins):
+                return
             else:
                 if PAGE_SKIP_PATTERNS.search(urlsplit(absolute).path):
                     return  # dynamic endpoints (wp-json, xmlrpc, ...) --
@@ -1818,8 +1896,9 @@ class Exporter:
                 val = tag.get(attr)
                 if not val:
                     continue
-                if attr == "data-bg" and "url(" in val:
-                    # some themes store a full CSS declaration in data-bg
+                if attr in CSS_URL_ATTRS and "url(" in val:
+                    # some themes store a full CSS declaration in the
+                    # attribute (e.g. data-bg)
                     for m in CSS_URL_RE.finditer(val):
                         handle_candidate(m.group(1), "style", set())
                 else:
@@ -2108,7 +2187,8 @@ class Exporter:
                         bits[0] = self.localize_url(bits[0])
                         parts.append(" ".join(bits))
                     tag[attr] = ", ".join(parts)
-                elif attr == "style" or (attr == "data-bg" and "url(" in val):
+                elif attr == "style" or (attr in CSS_URL_ATTRS
+                                         and "url(" in val):
                     tag[attr] = CSS_URL_RE.sub(
                         lambda m: f"url('{self.localize_url(m.group(1))}')", val)
                 elif attr in B64_URL_ATTRS:
@@ -2203,6 +2283,9 @@ class Exporter:
         if not ext and "html" not in ctype:
             # extensionless URL answering with a file: dynamic download
             # endpoint reached through an asset context
+            if any(p.save_non_html_response(self.to_base_host(resp.url), resp)
+                   for p in self.plugins):
+                return [], []
             if self._save_download(self.to_base_host(resp.url), resp) is not None:
                 return [], []
 
@@ -2688,7 +2771,8 @@ class Exporter:
                             cand = cand.strip().split(" ")[0]
                             if cand:
                                 check_ref(rel_file, cand)
-                    elif attr == "style" or (attr == "data-bg" and "url(" in val):
+                    elif attr == "style" or (attr in CSS_URL_ATTRS
+                                             and "url(" in val):
                         for m in CSS_URL_RE.finditer(val):
                             check_ref(rel_file, m.group(1))
                     elif attr in URL_ATTRS or attr in PAGE_URL_ATTRS:
@@ -2891,6 +2975,9 @@ class Exporter:
                         break
                     seen_from.add(fp)
                     redirect_rules.append((fp, file_path))
+        seen_from = {fp for fp, _ in redirect_rules}
+        for p in self.plugins:
+            redirect_rules.extend(p.redirect_rules(seen_from))
 
         inc_lines = ["# Redirects observed on the origin site, served as real"
                      " 301s (generated)."]
@@ -3095,9 +3182,10 @@ networks:
 """.replace("__SITE_SLUG__", site_slug).replace("__PORT__", str(self.cfg.port))
         (self.cfg.out_dir / "docker-compose.yml").write_text(compose, encoding="utf-8")
 
-        # keep report/mobile-variants out of the docker build context
+        # keep reports/plugin output trees out of the docker build context
         (self.cfg.out_dir / ".dockerignore").write_text(
-            "mobile-variants/\nreport.json\nreport.txt\n", encoding="utf-8")
+            "".join(f"{d}/\n" for d in EXTRA_OUTPUT_DIRS)
+            + "report.json\nreport.txt\n", encoding="utf-8")
 
         # server.sh: thin wrapper that drives docker compose.
         server_sh = r'''#!/usr/bin/env sh
@@ -3402,10 +3490,11 @@ esac
         if self.public_dir.exists():
             if self.cfg.clean:
                 shutil.rmtree(self.public_dir)
-                shutil.rmtree(self.cfg.out_dir / "mobile-variants",
-                              ignore_errors=True)
-                self.say("[init] --clean: removed existing public/ "
-                         "and mobile-variants/")
+                for extra in EXTRA_OUTPUT_DIRS:
+                    shutil.rmtree(self.cfg.out_dir / extra,
+                                  ignore_errors=True)
+                self.say("[init] --clean: removed existing public/"
+                         + "".join(f" and {d}/" for d in EXTRA_OUTPUT_DIRS))
             elif any(self.public_dir.iterdir()):
                 self.warnings.append(
                     "output dir public/ was not empty and --clean was not "
