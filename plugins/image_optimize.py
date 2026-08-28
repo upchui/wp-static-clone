@@ -7,10 +7,108 @@ Runs in the post-crawl pass because image files may only exist after
 later crawl rounds than the page that references them.
 """
 import unicodedata
+from pathlib import Path
 from urllib.parse import unquote
 
 import wp_static_export as core
-from wp_static_export import Plugin, path_extension, read_image_size
+from wp_static_export import Plugin, path_extension
+
+
+def _exif_orientation(tiff: bytes) -> int:
+    """Orientation tag (0x0112) from an EXIF TIFF block; 1 if absent."""
+    try:
+        if tiff[:2] == b"II":
+            end = "little"
+        elif tiff[:2] == b"MM":
+            end = "big"
+        else:
+            return 1
+        if int.from_bytes(tiff[2:4], end) != 42:
+            return 1
+        off = int.from_bytes(tiff[4:8], end)
+        count = int.from_bytes(tiff[off:off + 2], end)
+        for i in range(count):
+            entry = tiff[off + 2 + 12 * i: off + 14 + 12 * i]
+            if len(entry) < 12:
+                return 1
+            if int.from_bytes(entry[0:2], end) == 0x0112:
+                return int.from_bytes(entry[8:10], end) or 1
+    except (IndexError, ValueError):
+        pass
+    return 1
+
+
+def read_image_size(path: Path) -> tuple[int, int] | None:
+    """Pixel size straight from the file header -- PNG/GIF/JPEG/WebP,
+    no image library needed. None for other formats or malformed files.
+    JPEG dimensions are reported as DISPLAYED, i.e. swapped when the EXIF
+    orientation transposes the image (phone photos, orientation 5-8)."""
+    try:
+        with path.open("rb") as fh:
+            head = fh.read(32)
+            if head.startswith(b"\x89PNG\r\n\x1a\n") and head[12:16] == b"IHDR":
+                w = int.from_bytes(head[16:20], "big")
+                h = int.from_bytes(head[20:24], "big")
+                return (w, h) if w and h else None
+            if head[:6] in (b"GIF87a", b"GIF89a"):
+                w = int.from_bytes(head[6:8], "little")
+                h = int.from_bytes(head[8:10], "little")
+                return (w, h) if w and h else None
+            if head.startswith(b"RIFF") and head[8:12] == b"WEBP":
+                fmt = head[12:16]
+                if fmt == b"VP8X":
+                    return (int.from_bytes(head[24:27], "little") + 1,
+                            int.from_bytes(head[27:30], "little") + 1)
+                if fmt == b"VP8L" and len(head) >= 25 and head[20] == 0x2F:
+                    bits = int.from_bytes(head[21:25], "little")
+                    return (bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1
+                if fmt == b"VP8 " and head[23:26] == b"\x9d\x01\x2a":
+                    w = int.from_bytes(head[26:28], "little") & 0x3FFF
+                    h = int.from_bytes(head[28:30], "little") & 0x3FFF
+                    return (w, h) if w and h else None
+                return None
+            if head.startswith(b"\xff\xd8"):        # JPEG: scan for a SOF marker
+                fh.seek(2)
+                orientation = 1
+                while True:
+                    marker = fh.read(2)
+                    if len(marker) < 2 or marker[0] != 0xFF:
+                        return None
+                    code = marker[1]
+                    while code == 0xFF:             # fill bytes
+                        nxt = fh.read(1)
+                        if not nxt:
+                            return None
+                        code = nxt[0]
+                    if code in (0x01,) or 0xD0 <= code <= 0xD8:
+                        continue                    # standalone marker
+                    seg = fh.read(2)
+                    if len(seg) < 2:
+                        return None
+                    seglen = int.from_bytes(seg, "big")
+                    if seglen < 2:
+                        return None
+                    if code == 0xE1 and seglen >= 10:   # APP1: EXIF orientation
+                        body = fh.read(seglen - 2)
+                        if len(body) < seglen - 2:
+                            return None
+                        if body[:6] == b"Exif\x00\x00":
+                            orientation = _exif_orientation(body[6:])
+                        continue
+                    if code in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
+                                0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
+                        body = fh.read(5)
+                        if len(body) < 5:
+                            return None
+                        h = int.from_bytes(body[1:3], "big")
+                        w = int.from_bytes(body[3:5], "big")
+                        if not (w and h):
+                            return None
+                        return (h, w) if orientation in (5, 6, 7, 8) else (w, h)
+                    fh.seek(seglen - 2, 1)
+    except OSError:
+        return None
+    return None
 
 
 class ImageOptimize(Plugin):

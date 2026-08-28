@@ -55,6 +55,7 @@ def webp_vp8(w, h):
 # -- read_image_size --------------------------------------------------------
 
 def test_read_image_size(mod, tmp_path):
+    mod = mod.PLUGIN_MODULES["image_optimize"]
     cases = [("a.png", png_bytes(320, 200), (320, 200)),
              ("a.gif", gif_bytes(10, 20), (10, 20)),
              ("a.jpg", jpeg_bytes(200, 100), (200, 100)),
@@ -68,6 +69,7 @@ def test_read_image_size(mod, tmp_path):
 
 
 def test_read_image_size_exif_orientation_swaps(mod, tmp_path):
+    mod = mod.PLUGIN_MODULES["image_optimize"]
     p = tmp_path / "rot.jpg"
     p.write_bytes(jpeg_bytes(200, 100, orientation=6))
     assert mod.read_image_size(p) == (100, 200)
@@ -76,6 +78,7 @@ def test_read_image_size_exif_orientation_swaps(mod, tmp_path):
 
 
 def test_read_image_size_garbage(mod, tmp_path):
+    mod = mod.PLUGIN_MODULES["image_optimize"]
     p = tmp_path / "t.png"
     p.write_bytes(png_bytes(10, 10)[:12])          # truncated
     assert mod.read_image_size(p) is None
