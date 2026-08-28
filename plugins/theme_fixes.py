@@ -17,6 +17,7 @@ NUM_ID_RE = re.compile(rb"-\d{3,7}\b")
 
 class ThemeFixes(Plugin):
     name = "theme_fixes"
+    url_attrs = ("data-placeholder-image",)   # builder placeholder images
     page_url_attrs = ("data-dt-location",)
     html_noise_patterns = ((HEX_ID_RE, b"H"), (NUM_ID_RE, b"-N"))
 

@@ -206,19 +206,18 @@ def _compile_page_skip(fragments: tuple) -> re.Pattern:
 PAGE_SKIP_PATTERNS = _compile_page_skip(PAGE_SKIP_FRAGMENTS)
 
 # attributes that may hold a single URL (plugins register vendor-specific
-# ones, e.g. Complianz lazy attributes)
-URL_ATTRS = ("src", "href", "poster", "data-src", "data-lazy-src", "data-bg",
-             "data-placeholder-image")
+# ones, e.g. lazy-load and consent-plugin attributes)
+URL_ATTRS = ("src", "href", "poster")
 # attributes that hold srcset-style comma separated candidate lists
 # (plugin-extendable: srcset_attrs)
-SRCSET_ATTRS = ("srcset", "data-srcset", "data-lazy-srcset")
+SRCSET_ATTRS = ("srcset",)
 # attributes whose value is a full CSS declaration containing url(...)
-# (plugin-extendable: css_url_attrs)
-CSS_URL_ATTRS = ("data-bg",)
+# (plugin-registered: css_url_attrs, e.g. data-bg)
+CSS_URL_ATTRS: tuple = ()
 # attributes that mark an <img> as managed by a lazy-load plugin -- such
 # images must not get loading=lazy/width/height injected
-# (plugin-extendable: lazy_img_attrs)
-LAZY_IMG_ATTRS = ("data-src", "data-lazy-src")
+# (plugin-registered: lazy_img_attrs)
+LAZY_IMG_ATTRS: tuple = ()
 # extra top-level output directories next to public/ that --clean removes
 # and .dockerignore excludes (plugin-extendable: extra_output_dirs)
 EXTRA_OUTPUT_DIRS = ("mobile-variants",)

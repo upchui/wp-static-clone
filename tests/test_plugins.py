@@ -48,7 +48,7 @@ def test_load_plugins_idempotent(mod):
 def test_shipped_plugins_registered(mod):
     # alphabetical file order = load order
     assert [cls.name for cls in mod.PLUGIN_REGISTRY] == [
-        "cloudflare", "complianz", "image_optimize", "minify",
+        "cloudflare", "complianz", "image_optimize", "lazyload", "minify",
         "slider_revolution", "theme_fixes"]
     assert set(mod.PLUGIN_MODULES) == {cls.name
                                        for cls in mod.PLUGIN_REGISTRY}
@@ -62,6 +62,11 @@ def test_plugin_registries_aggregated(mod):
     assert mod.HTML_NOISE_EXTRA                         # theme_fixes id noise
     assert "cf-fonts" in mod.VERIFY_SCRIPT_REF_DIRS     # cloudflare
     assert "/cdn-cgi/l/email-protection" in mod.VERIFY_SKIP_REF_PREFIXES
+    assert "data-src" in mod.URL_ATTRS                  # lazyload
+    assert "data-placeholder-image" in mod.URL_ATTRS    # theme_fixes
+    assert "data-lazy-srcset" in mod.SRCSET_ATTRS       # lazyload
+    assert "data-bg" in mod.CSS_URL_ATTRS               # lazyload
+    assert "data-lazy-src" in mod.LAZY_IMG_ATTRS        # lazyload
 
 
 def test_exporter_gets_fresh_plugin_instances(mod, tmp_path):
