@@ -108,9 +108,12 @@ class Downloads(Plugin):
 
     def redirect_rules(self, seen_from: set) -> list:
         # externally shared/indexed download-endpoint URLs (with or
-        # without trailing slash, any ?cachebuster) 301 onto the file
+        # without trailing slash, any ?cachebuster) 301 onto the file;
+        # the FROM side is emitted percent-decoded (nginx/Apache match the
+        # decoded URI), the target stays encoded (becomes a Location)
         rules: list[tuple[str, str]] = []
         for endpoint, file_path in sorted(self.download_map.items()):
+            endpoint = unicodedata.normalize("NFC", unquote(endpoint))
             for fp in (endpoint, endpoint.rstrip("/")):
                 if not fp or fp in seen_from:
                     continue

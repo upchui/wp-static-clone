@@ -1280,8 +1280,16 @@ class Exporter:
                                           "/wp-sitemap.xml")):
                 # one working well-known entry point is enough; robots-declared
                 # and --extra-sitemap entries are always processed
-                remaining = [c for c in sitemap_candidates
-                             if c in self.cfg.extra_sitemaps and c not in seen_sitemaps]
+                # compare/walk extras in NORMALIZED form -- seen_sitemaps
+                # records normalized URLs, so a www./non-www spelling of an
+                # already-walked sitemap must not be fetched a second time
+                remaining = []
+                for c in sitemap_candidates:
+                    if c not in self.cfg.extra_sitemaps:
+                        continue
+                    cn = self.to_base_host(c) if self.is_internal(c) else c
+                    if cn not in seen_sitemaps and cn not in remaining:
+                        remaining.append(cn)
                 for extra in remaining:
                     page_urls.extend(self.walk_sitemap(extra, seen_sitemaps, depth=0))
                 break
@@ -2283,6 +2291,22 @@ class Exporter:
                 text = re.sub(r"\n{3,}", "\n\n", text).strip("\n")
                 text = (text + "\n\n" if text else "") + sitemap_line + "\n"
                 self.robots_action = "sitemap-line-rewritten"
+            elif self.cfg.generate_sitemap:
+                # generation was expected but produced no entries (e.g. every
+                # page noindex'ed): origin Sitemap: lines would point at
+                # files this export does not contain -- strip them
+                stripped = SITEMAP_LINE_RE.sub("", text)
+                if stripped != text:
+                    text = re.sub(r"\n{3,}", "\n\n", stripped).strip("\n") + "\n"
+                    self.robots_action = "sitemap-lines-removed"
+                    self.warnings.append(
+                        "sitemap generation produced no entries -- origin "
+                        "Sitemap: line(s) removed from robots.txt (their "
+                        "files are not part of this export)")
+                elif self.target_prefix:
+                    self.robots_action = "retargeted"
+                else:
+                    return
             elif self.target_prefix:
                 self.robots_action = "retargeted"
             else:
@@ -2577,22 +2601,25 @@ class Exporter:
     # ----------------------------------------------------------------------
 
     def _sub_filter_hosts(self) -> list[str]:
-        """Host spellings that can appear in the exported files -- the only
-        forms the __init__ regexes ever match, plus --target-domain ones."""
+        """Host spellings that can appear in the exported files -- every
+        form the localization regexes match (incl. hosts auto-detected via
+        split DNS), plus --target-domain ones."""
         hosts: list[str] = []
         try:                              # www. variant is nonsense for IPs
             ipaddress.ip_address(self.base_norm.rsplit(":", 1)[0])
-            candidates = (self.base_norm, self.connect_norm)
+            candidates = (self.base_norm, self.connect_norm,
+                          self.connect_norm.partition(":")[0])
         except ValueError:
             candidates = (f"www.{self.base_norm}", self.base_norm,
-                          self.connect_norm)
+                          self.connect_norm,
+                          self.connect_norm.partition(":")[0])
         for h in candidates:
             if not h or norm_host(h) not in self.internal_norms:
                 continue
             for spelling in sorted(host_spellings(h)):
                 if spelling not in hosts:
                     hosts.append(spelling)
-        for extra in self.cfg.internal_hosts:
+        for extra in (*self.cfg.internal_hosts, *self.auto_internal_hosts):
             for spelling in sorted(host_spellings(norm_host(extra))):
                 if spelling not in hosts:
                     hosts.append(spelling)
@@ -2618,12 +2645,18 @@ class Exporter:
             t = urlsplit(r["to"])
             if s.query:
                 continue  # query-string sources are not part of the export
-            fp = canon_path(s.path or "/")
+            # the FROM side must match nginx's $uri / Apache's r->uri, which
+            # are matched percent-DECODED -- emit the decoded spelling. The
+            # target becomes a Location header and stays encoded.
+            fp = unicodedata.normalize("NFC", unquote(s.path or "/"))
             tp = canon_path(t.path or "/") + (f"?{t.query}" if t.query else "")
-            if t.path in (s.path, s.path + "/"):
-                # self-redirect / generic trailing-slash rule -- ALSO when the
-                # target only adds a query (/a/ -> /a/?x=1): a rule for that
-                # would match its own target's $uri and 301-loop forever
+            if t.path in (s.path, s.path + "/") or s.path == t.path + "/":
+                # trailing-slash rules in EITHER direction: /a -> /a/ is what
+                # the deploy configs do themselves, and a /a/ -> /a rule
+                # would fight their directory-slash canonicalization into an
+                # infinite 301 loop. ALSO when the target only adds a query
+                # (/a/ -> /a/?x=1): a rule for that would match its own
+                # target's $uri and 301-loop forever
                 continue
             if fp in seen_from:
                 continue
@@ -2647,6 +2680,15 @@ class Exporter:
         (nginx unescapes '\\\\' in quoted strings to a literal backslash)."""
         lines = []
         for h in self._sub_filter_hosts():
+            if (re.search(r"""[\s'"$\\{};]""", h)
+                    or any(ord(c) < 32 for c in h)):
+                # hosts come from the CLI (--internal-host/--target-domain)
+                # -- a stray quote/semicolon would break or inject into the
+                # generated nginx config
+                self.warnings.append(
+                    f"sub_filter skipped (unsafe characters for the nginx "
+                    f"config): {h!r}")
+                continue
             for scheme in ("https", "http"):
                 lines.append(f"    sub_filter '{scheme}://{h}/' "
                              "'$canonical_scheme://$served_host/';")
@@ -2663,7 +2705,9 @@ class Exporter:
             # Search Console -- 301 them onto the generated /sitemap.xml
             seen_from = {fp for fp, _ in redirect_rules}
             for path in self.origin_sitemap_paths:
+                path = unicodedata.normalize("NFC", unquote(path))
                 if path not in ("/sitemap.xml", "") and path not in seen_from:
+                    seen_from.add(path)
                     redirect_rules.append((path, "/sitemap.xml"))
         seen_from = {fp for fp, _ in redirect_rules}
         for p in self.plugins:

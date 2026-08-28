@@ -16,7 +16,9 @@ FIXTURE_SRC = Path(__file__).parent / "fixture"
 REDIRECTS = {"/alt/": "/ueber-uns/", "/alt": "/ueber-uns/",
              "/alt2": "/ueber-uns/?ref=alt2", "/alt2/": "/ueber-uns/?ref=alt2",
              # query-only self-redirect (consent/region plugin pattern)
-             "/loop": "/loop/?x=1", "/loop/": "/loop/?x=1"}
+             "/loop": "/loop/?x=1", "/loop/": "/loop/?x=1",
+             # slash-STRIPPING canonicalization (no-trailing-slash permalinks)
+             "/dienst/": "/dienst"}
 
 
 def _make_handler(root: Path):
@@ -60,6 +62,18 @@ def _make_handler(root: Path):
                     "Content-Disposition",
                     'attachment; filename="Vollmacht-04.2021.pdf"; '
                     "filename*=UTF-8''Vollmacht-04.2021.pdf")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if path == "/dienst":
+                # content served at the slash-LESS URL (see REDIRECTS)
+                body = (b'<!doctype html><html><head><meta charset="utf-8">'
+                        b'<meta name="viewport" content="width=device-width">'
+                        b'<title>Dienst</title></head>'
+                        b'<body>Dienstseite ohne Slash</body></html>')
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
@@ -239,6 +253,16 @@ def test_redirects_keep_query(export):
     assert 'rewrite "^/alt2/$" "/ueber-uns/?ref=alt2?" permanent;' in inc
     ht = (export["public"] / ".htaccess").read_text()
     assert 'RedirectMatch 301 "^/alt2/$" "/ueber-uns/?ref=alt2"' in ht
+
+
+def test_slash_strip_redirect_no_loop_rule(export):
+    # /dienst/ 301s to /dienst on the origin; the export saves the page at
+    # /dienst/ and must NOT emit a /dienst/ -> /dienst rule (it would fight
+    # the deploy configs' own /a -> /a/ canonicalization into a 301 loop)
+    inc = (export["out"] / "redirects.inc").read_text()
+    assert "/dienst" not in inc
+    page = (export["public"] / "dienst" / "index.html").read_text()
+    assert "Dienstseite ohne Slash" in page
 
 
 def test_query_self_redirect_no_loop(export):

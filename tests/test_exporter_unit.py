@@ -474,6 +474,63 @@ def test_download_map_redirect_rules(mod, tmp_path):
         (e.public_dir / ".htaccess").read_text()
 
 
+def test_redirect_rules_no_slash_strip_loop(mod, tmp_path):
+    e = mod.Exporter(mod.Config(base_url="https://example.at",
+                                out_dir=tmp_path / "o"))
+    e.redirects.append({"from": "https://example.at/dienst/",
+                        "to": "https://example.at/dienst", "status": 301})
+    # a /a/ -> /a rule would fight the deploy configs' own /a -> /a/
+    # canonicalization into an infinite 301 loop
+    assert e._safe_redirect_rules() == []
+
+
+def test_redirect_rules_percent_decoded_source(mod, tmp_path):
+    e = mod.Exporter(mod.Config(base_url="https://example.at",
+                                out_dir=tmp_path / "o"))
+    e.redirects.append({"from": "https://example.at/%C3%BCber-uns/",
+                        "to": "https://example.at/team/", "status": 301})
+    # nginx/Apache match the DECODED $uri -- the rule source must be decoded
+    assert e._safe_redirect_rules() == [("/über-uns/", "/team/")]
+
+
+def test_sub_filter_auto_hosts_and_sanitization(mod, tmp_path):
+    e = mod.Exporter(mod.Config(base_url="https://example.at",
+                                out_dir=tmp_path / "o",
+                                internal_hosts=["bad'host.example"]))
+    e.internal_norms.add("wp.intern.example.at")
+    e.auto_internal_hosts.append("wp.intern.example.at")
+    assert "wp.intern.example.at" in e._sub_filter_hosts()
+    lines = e._sub_filter_lines()
+    assert "wp.intern.example.at" in lines      # split-DNS host substituted
+    assert "bad'host.example" not in lines      # quote would break nginx
+    assert any("sub_filter skipped" in w for w in e.warnings)
+
+
+def test_origin_sitemap_301_deduped(mod, tmp_path):
+    e = mod.Exporter(mod.Config(base_url="https://example.at",
+                                out_dir=tmp_path / "o"))
+    e.public_dir.mkdir(parents=True)
+    e.generated_sitemap = {"path": "/sitemap.xml", "url_count": 1}
+    e.origin_sitemap_paths = ["/sitemap_index.xml", "/sitemap_index.xml"]
+    e.write_deploy_files()
+    inc = (e.cfg.out_dir / "redirects.inc").read_text()
+    assert inc.count('"^/sitemap_index\\.xml$"') == 1
+
+
+def test_finalize_robots_empty_generation(mod, tmp_path):
+    e = mod.Exporter(mod.Config(base_url="https://example.at",
+                                out_dir=tmp_path / "o"))
+    e.public_dir.mkdir(parents=True)
+    (e.public_dir / "robots.txt").write_text(
+        "User-agent: *\nAllow: /\n\n"
+        "Sitemap: https://example.at/sitemap_index.xml\n")
+    e.finalize_robots()        # generate_sitemap on, but no sitemap generated
+    text = (e.public_dir / "robots.txt").read_text()
+    assert "Sitemap:" not in text               # file is not in the export
+    assert e.robots_action == "sitemap-lines-removed"
+    assert any("Sitemap: line(s) removed" in w for w in e.warnings)
+
+
 def test_save_download(mod, tmp_path):
     e = mod.Exporter(mod.Config(base_url="https://example.at",
                                 out_dir=tmp_path / "o"))
