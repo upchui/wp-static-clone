@@ -175,11 +175,13 @@ def test_resource_hints_stripped(export):
 
 def test_wp_cruft_stripped(export):
     html = (export["public"] / "index.html").read_text(encoding="utf-8")
-    for gone in ("generator", "shortlink", "EditURI", "oembed",
+    for gone in ("generator", "shortlink", "EditURI", "wlwmanifest", "oembed",
                  "api.w.org", "pingback", "cloudflareinsights", "rss+xml"):
         assert gone not in html, gone
     assert 'rel="canonical"' in html
     assert 'hreflang="de"' in html
+    # the stripped wlwmanifest's target must not have been crawled either
+    assert not (export["public"] / "wp-includes" / "wlwmanifest.xml").exists()
 
 
 def test_seo_urls_keep_origin(export):
@@ -194,6 +196,23 @@ def test_images_optimized(export):
     html = (export["public"] / "index.html").read_text(encoding="utf-8")
     assert 'loading="lazy"' in html
     assert 'width="320"' in html and 'height="200"' in html  # plain.png
+
+
+def test_lazyload_attrs_localized(export):
+    html = (export["public"] / "index.html").read_text(encoding="utf-8")
+    assert 'data-lazy-src="/wp-content/uploads/plain.png"' in html
+    assert ('data-lazy-srcset="/wp-content/uploads/plain.png 1x, '
+            '/wp-content/uploads/hero.png 2x"') in html
+    assert ("data-bg=\"background-image: "
+            "url('/wp-content/uploads/bg.png')\"") in html
+
+
+def test_vendor_page_skips(export):
+    # /cart/ (WooCommerce) and /wpforms-ajax (WPForms) are linked but must
+    # never be fetched as pages -- a broken skip surfaces in pages_failed
+    # (asserted empty in test_export_self_contained) and as export files
+    assert not (export["public"] / "cart").exists()
+    assert not (export["public"] / "wpforms-ajax").exists()
 
 
 def test_generated_sitemap(export):
