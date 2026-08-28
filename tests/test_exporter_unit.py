@@ -549,6 +549,49 @@ def test_save_download(mod, tmp_path):
     assert dl._save_download("https://example.at/x.pdf", FakeResp()) is None
 
 
+def test_download_claim_leaves_css_js_to_core(mod, tmp_path):
+    e = mod.Exporter(mod.Config(base_url="https://example.at",
+                                out_dir=tmp_path / "o"))
+    dl = e.plugin("downloads")
+
+    class JsResp:
+        headers = {"Content-Type": "application/javascript"}
+        content = b"var a = 1;"
+
+    class CssResp:
+        headers = {"Content-Type": "text/css; charset=utf-8"}
+        content = b"a{x:1}"
+
+    # extensionless CSS/JS must fall through to the core pipeline
+    # (localization/minification/URL discovery), never become "downloads"
+    assert not dl.save_non_html_response("https://example.at/assets/bundle",
+                                         JsResp())
+    assert not dl.save_non_html_response("https://example.at/cache/style",
+                                         CssResp())
+    assert dl.download_map == {}
+
+
+def test_download_not_claimed_when_nothing_written(mod, tmp_path):
+    e = mod.Exporter(mod.Config(base_url="https://example.at",
+                                out_dir=tmp_path / "o"))
+    e.public_dir.mkdir(parents=True)
+    # /download/9 already exists as a FILE -> the endpoint's directory
+    # cannot be created, write_bytes refuses with a path-conflict warning
+    (e.public_dir / "download").mkdir()
+    (e.public_dir / "download" / "9").write_bytes(b"occupied")
+    dl = e.plugin("downloads")
+
+    class FakeResp:
+        headers = {"Content-Disposition": 'attachment; filename="a.pdf"',
+                   "Content-Type": "application/pdf"}
+        content = b"%PDF-1.4"
+
+    assert dl._save_download("https://example.at/download/9/",
+                             FakeResp()) is None
+    assert dl.download_map == {}                # no dead links / 301s
+    assert e.asset_count == 0
+
+
 # -- v1.4.0: SR7 slide hydration --------------------------------------------
 
 SR7_HTML = """<sr7-module data-id="2" id="SR7_2_1"></sr7-module>

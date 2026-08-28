@@ -54,6 +54,12 @@ class Downloads(Plugin):
         self.download_map: dict[str, str] = {}
 
     def save_non_html_response(self, url: str, resp) -> bool:
+        ctype = (resp.headers.get("Content-Type") or "").lower()
+        if "text/css" in ctype or "javascript" in ctype:
+            # extensionless CSS/JS routes are NOT downloads -- the core
+            # localizes/minifies them and discovers the URLs they contain;
+            # claiming them here would ship them raw under a wrong name
+            return False
         return self._save_download(url, resp) is not None
 
     def _save_download(self, url: str, resp) -> str | None:
@@ -75,10 +81,16 @@ class Downloads(Plugin):
             f"{exp.scheme}://{exp.host}{file_path}", is_page=False)
         if target is None:
             return None
-        exp.write_bytes(target, resp.content)
+        written = exp.write_bytes(target, resp.content)
+        if written is None and not target.is_file():
+            # nothing landed on disk (path conflict) -- do NOT claim the
+            # response or register the mapping: links rewritten onto the
+            # file and 301 rules pointing at it would all be dead
+            return None
         with exp.stats_lock:
             self.download_map[base] = file_path
-            exp.asset_count += 1
+            if written is not None:
+                exp.asset_count += 1
         return file_path
 
     def wants_postprocess(self) -> bool:
