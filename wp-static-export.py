@@ -161,12 +161,6 @@ from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-try:                        # optional: without them minification is skipped
-    import rcssmin
-    import rjsmin
-except ImportError:         # pragma: no cover
-    rcssmin = rjsmin = None
-
 if sys.version_info < (3, 10):
     sys.exit(f"wp-static-export needs Python 3.10+ "
              f"(running {sys.version.split()[0]})")
@@ -564,74 +558,16 @@ SVG_ATTR_CASE = {a.lower(): a for a in (
     "yChannelSelector zoomAndPan").split()}
 
 
-# minification: content of these tags must never be touched by the HTML
-# whitespace pass (pre/textarea render whitespace; script/style content is
-# minified separately by rjsmin/rcssmin, which know where newlines matter)
-MINIFY_PROTECT_RE = re.compile(
-    r"(<(?:pre|textarea|script|style)\b.*?</(?:pre|textarea|script|style)\s*>)",
-    re.IGNORECASE | re.DOTALL)
-HTML_COMMENT_ALL_RE = re.compile(r"<!--.*?-->", re.DOTALL)
-INDENT_RE = re.compile(r"[ \t]*\n[ \t\n]*")
-
-
-def minify_css(text: str) -> str:
-    # keep_bang_comments=False: /*! license banners */ go too -- explicit,
-    # so a future library-default change can't bring them back
-    if not rcssmin:
-        return text
-    out = rcssmin.cssmin(text, keep_bang_comments=False)
-    # rcssmin deliberately preserves the ancient IE5/Mac hack pair
-    # ("/*\*/ rule /**/") -- obsolete for two decades, strip exactly
-    # those two tokens (nothing else matches this pattern)
-    return re.sub(r"/\*\\?\*/", "", out)
-
-
-def minify_js(text: str) -> str:
-    return rjsmin.jsmin(text, keep_bang_comments=False) if rjsmin else text
-
-
-def minify_html_bytes(data: bytes) -> bytes:
-    """Conservative HTML minification: drop ALL comments (including the
-    IE conditional-comment relics -- the downlevel-revealed pattern keeps
-    its enclosed markup, hidden IE-only blocks vanish entirely) and
-    collapse indentation to a single newline -- whitespace between inline
-    elements is render-relevant, so exactly one newline survives (renders
-    as one space, like before). pre/textarea/script/style content is left
-    byte-identical."""
-    text = data.decode("utf-8", "replace")
-    parts = MINIFY_PROTECT_RE.split(text)
-    for i in range(0, len(parts), 2):       # even indexes = unprotected
-        part = HTML_COMMENT_ALL_RE.sub("", parts[i])
-        parts[i] = INDENT_RE.sub("\n", part)
-    return "".join(parts).encode("utf-8")
-
-
-def serialize_soup(soup: BeautifulSoup, minify: bool = False) -> bytes:
+def serialize_soup(soup: BeautifulSoup) -> bytes:
     """str(soup) with case-sensitive SVG attribute names restored inside
-    <svg> subtrees (viewBox, preserveAspectRatio, ...); with minify=True
-    inline CSS/JS is minified (JSON/JSON-LD/templates untouched) and the
-    HTML whitespace collapsed."""
+    <svg> subtrees (viewBox, preserveAspectRatio, ...)."""
     for svg in soup.find_all("svg"):
         for tag in (svg, *svg.find_all(True)):
             for attr in list(tag.attrs):
                 proper = SVG_ATTR_CASE.get(attr)
                 if proper and proper != attr:
                     tag.attrs[proper] = tag.attrs.pop(attr)
-    if minify:
-        for style in soup.find_all("style"):
-            if style.string:
-                style.string = minify_css(style.string)
-        for script in soup.find_all("script"):
-            stype = (script.get("type") or "").lower()
-            if (script.get("src") or "json" in stype or "template" in stype
-                    or (stype and "javascript" not in stype)):
-                continue    # external / data blocks / non-JS types: untouched
-            if script.string:
-                script.string = minify_js(script.string)
-    out = str(soup).encode("utf-8")
-    if minify:
-        out = minify_html_bytes(out)
-    return out
+    return str(soup).encode("utf-8")
 
 
 # --------------------------------------------------------------------------
@@ -852,6 +788,8 @@ class Config:
     mobile_user_agent: str = MOBILE_UA
     generate_sitemap: bool = True
     strip_wp_cruft: bool = True
+    # plugin-owned option (declared here so direct Config() construction
+    # keeps working; consumed only by plugins/image_optimize.py)
     optimize_images: bool = True
     staging: bool = False
     target_domain: str | None = None
@@ -860,9 +798,11 @@ class Config:
     quiet: bool = False
     excludes: list = field(default_factory=list)
     respect_robots: bool = False
+    # plugin-owned (plugins/slider_revolution.py)
     sr7_hydrate: bool = True
     internal_hosts: list = field(default_factory=list)
     resolve_internal: bool = True
+    # plugin-owned (plugins/minify.py)
     minify: bool = True
 
 
@@ -979,7 +919,6 @@ class Exporter:
         self._dns_cache: dict[str, bool] = {}
         self.auto_internal_hosts: list[str] = []
         self.foreign_wp_hosts: set[str] = set()
-        self.minify_stats = {"html": 0, "css": 0, "js": 0, "bytes_saved": 0}
         self.generated_sitemap: dict | None = None
         self.sitemap_discovery_ok = False  # a usable origin sitemap was found
         self.cruft_removed: dict[str, int] = {}
@@ -1101,11 +1040,6 @@ class Exporter:
                 f"THIS WordPress site under another name; re-run with "
                 f"--internal-host {host} (ignore if it is a real CDN)")
 
-    @property
-    def _minify_on(self) -> bool:
-        return (self.cfg.rewrite and self.cfg.minify
-                and rjsmin is not None and rcssmin is not None)
-
     def plugin(self, name: str) -> Plugin:
         """The per-run instance of the named plugin."""
         for p in self.plugins:
@@ -1119,7 +1053,7 @@ class Exporter:
         post_serialize (byte-level, e.g. whitespace collapsing)."""
         for p in self.plugins:
             p.pre_serialize(soup)
-        out = serialize_soup(soup, self._minify_on)
+        out = serialize_soup(soup)
         for p in self.plugins:
             out = p.post_serialize(out)
         return out
@@ -1972,11 +1906,6 @@ class Exporter:
                     p.rewrite_soup(soup)
                 out = self.serialize(soup)
                 written = self.write_bytes(target, out)
-                if written is not None and self._minify_on:
-                    with self.stats_lock:
-                        self.minify_stats["html"] += 1
-                        self.minify_stats["bytes_saved"] += max(
-                            0, len(raw) - len(out))
                 if written is not None:
                     for p in self.plugins:
                         p.text_asset_written("html", len(raw), len(out))
@@ -2323,11 +2252,6 @@ class Exporter:
 
                 new_text = CSS_IMPORT_RE.sub(
                     rel_import, CSS_URL_RE.sub(rel, text))
-                # .min.* files run through as well: a safe near-no-op that
-                # still strips their /*! license banners */
-                minify = self._minify_on
-                if minify:
-                    new_text = minify_css(new_text)
                 for p in self.plugins:
                     new_text = p.filter_text_asset(url, "css", new_text)
                 if new_text != text:
@@ -2335,11 +2259,6 @@ class Exporter:
                     # so a declared legacy @charset must say so too
                     data = CSS_CHARSET_RE.sub('@charset "UTF-8"',
                                               new_text).encode("utf-8")
-                    if minify:
-                        with self.stats_lock:
-                            self.minify_stats["css"] += 1
-                            self.minify_stats["bytes_saved"] += max(
-                                0, len(resp.content) - len(data))
                     for p in self.plugins:
                         p.text_asset_written("css", len(resp.content),
                                              len(data))
@@ -2352,18 +2271,10 @@ class Exporter:
                 new_text = text
                 if self.host_probe_re.search(new_text):
                     new_text = self.localize_text(new_text)
-                minify = self._minify_on
-                if minify:
-                    new_text = minify_js(new_text)
                 for p in self.plugins:
                     new_text = p.filter_text_asset(url, "js", new_text)
                 if new_text != text:
                     data = new_text.encode("utf-8")
-                    if minify:
-                        with self.stats_lock:
-                            self.minify_stats["js"] += 1
-                            self.minify_stats["bytes_saved"] += max(
-                                0, len(resp.content) - len(data))
                     for p in self.plugins:
                         p.text_asset_written("js", len(resp.content),
                                              len(data))
@@ -3343,7 +3254,6 @@ esac
                 "respect_robots": self.cfg.respect_robots,
                 "crawl_truncated_at_max_pages": self.truncated,
                 "wp_cruft_removed": self.cruft_removed,
-                "minified": self.minify_stats,
                 "staging_noindex": self.cfg.staging,
                 "target_domain": self.cfg.target_domain,
             },
@@ -3483,11 +3393,6 @@ esac
             self.warnings.append(
                 "--no-rewrite: WP cruft stripping, image optimization, "
                 "minification and redirect stub pages are disabled")
-        if (self.cfg.minify and self.cfg.rewrite
-                and (rjsmin is None or rcssmin is None)):
-            self.warnings.append(
-                "minification skipped: rjsmin/rcssmin not installed "
-                "(pip install rjsmin rcssmin)")
         for p in self.plugins:
             p.run_start()
         if self.cfg.staging and self.cfg.target_domain:
@@ -3547,11 +3452,6 @@ esac
         for p in self.plugins:
             for line in p.summary_lines():
                 print(line)
-        if self._minify_on and any(self.minify_stats.values()):
-            print(f"[seo] minified: {self.minify_stats['html']} HTML, "
-                  f"{self.minify_stats['css']} CSS, "
-                  f"{self.minify_stats['js']} JS files "
-                  f"({self.minify_stats['bytes_saved'] // 1024} KB saved)")
         if self.auto_internal_hosts:
             print(f"[done] auto-detected internal hosts (private DNS): "
                   f"{', '.join(self.auto_internal_hosts)}")
@@ -3772,12 +3672,6 @@ Notes:
                          "WordPress siteurl points at -- URLs on these hosts "
                          "get localized like the main domain instead of "
                          "surviving as (possibly private) absolute links")
-    ap.add_argument("--no-minify", dest="minify", action="store_false",
-                    help="skip minifying exported HTML, CSS and JS "
-                         "(conservative: ALL comments removed incl. IE "
-                         "conditionals and license banners, indentation "
-                         "collapsed; JSON-LD and pre/textarea untouched). "
-                         "No effect with --no-rewrite")
     ap.add_argument("--no-resolve-internal", dest="resolve_internal",
                     action="store_false",
                     help="skip the split-DNS detection that treats hosts "
@@ -3786,13 +3680,6 @@ Notes:
     for cls in PLUGIN_REGISTRY:
         cls.add_cli_args(ap.add_argument_group(f"plugin: {cls.name}"))
     args = ap.parse_args(argv)
-
-    if args.minify and args.rewrite and (rjsmin is None or rcssmin is None):
-        # a stale venv would otherwise silently produce an unminified
-        # export -- fail loudly with the fix instead
-        ap.error("minification (default on) needs the rjsmin and rcssmin "
-                 "packages -- run: pip install -r requirements.txt "
-                 "(or pass --no-minify)")
 
     for pattern in args.exclude:
         try:
@@ -3858,7 +3745,6 @@ Notes:
         internal_hosts=[re.sub(r"^https?://", "", h.strip()).rstrip("/")
                         for h in args.internal_hosts if h.strip()],
         resolve_internal=args.resolve_internal,
-        minify=args.minify,
     )
     for cls in PLUGIN_REGISTRY:
         cls.finish_args(ap, args, cfg)

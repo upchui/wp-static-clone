@@ -196,6 +196,7 @@ def test_robots_rule_re(mod):
 # -- minification -----------------------------------------------------------
 
 def test_minify_html_bytes(mod):
+    mod = mod.PLUGIN_MODULES["minify"]
     src = (b"<html>\n  <head>\n    <title>x</title>\n"
            b"    <!-- normal comment -->\n"
            b"    <!--[if IE]><link href=ie.css><![endif]-->\n"
@@ -215,17 +216,20 @@ def test_minify_html_bytes(mod):
 
 
 def test_minify_css_js(mod):
+    mod = mod.PLUGIN_MODULES["minify"]
     assert mod.minify_css("body {  color : red ; }") == "body{color:red}"
     out = mod.minify_js("var a = 1;\n// comment\nvar b = 2;")
     assert "comment" not in out and "var a=1;" in out
 
 
 def test_minify_strips_bang_comments(mod):
+    mod = mod.PLUGIN_MODULES["minify"]
     assert mod.minify_css("/*! bang */body{color:red}") == "body{color:red}"
     assert "bang" not in mod.minify_js("/*! bang */var a=1;")
 
 
 def test_minify_removes_conditionals_and_hacks(mod):
+    mod = mod.PLUGIN_MODULES["minify"]
     # downlevel-revealed conditional: enclosed markup must survive
     out = mod.minify_html_bytes(
         b'<!--[if !(IE 8)]><!--><html class="no-js"><!--<![endif]-->'

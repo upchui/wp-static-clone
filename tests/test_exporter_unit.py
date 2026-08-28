@@ -709,7 +709,9 @@ def test_private_straggler_warning(mod, tmp_path, monkeypatch):
 
 # -- v1.5.0: minification ---------------------------------------------------
 
-def test_serialize_soup_minify(mod):
+def test_serialize_minify(mod, tmp_path):
+    e = mod.Exporter(mod.Config(base_url="https://example.at",
+                                out_dir=tmp_path / "o"))    # minify default on
     soup = BeautifulSoup(
         "<html>\n  <head>\n"
         "    <style>body {  color : red ; }</style>\n"
@@ -717,31 +719,34 @@ def test_serialize_soup_minify(mod):
         "    <script>var x = 1;  // note\nvar y = 2;</script>\n"
         "  </head>\n  <body>\n    <p>hi</p>\n  </body>\n</html>",
         "html.parser")
-    out = mod.serialize_soup(soup, minify=True).decode()
+    out = e.serialize(soup).decode()
     assert "body{color:red}" in out
     assert '{ "a" : 1 }' in out                         # JSON-LD untouched
     assert "// note" not in out and "var x=1;" in out
     assert "\n    <p>" not in out
-    # default stays non-minifying: comments survive without minify=True
+    # plain serialize_soup stays non-minifying: comments survive
     soup2 = BeautifulSoup("<div><!-- keep me --><p>x</p></div>", "html.parser")
     assert "keep me" in mod.serialize_soup(soup2).decode()
     soup3 = BeautifulSoup("<div><!-- keep me --><p>x</p></div>", "html.parser")
-    assert "keep me" not in mod.serialize_soup(soup3, minify=True).decode()
+    assert "keep me" not in e.serialize(soup3).decode()
 
 
 def test_minify_missing_libs_warns(mod, tmp_path, monkeypatch):
-    monkeypatch.setattr(mod, "rjsmin", None)
+    pmod = mod.PLUGIN_MODULES["minify"]
+    monkeypatch.setattr(pmod, "rjsmin", None)
     e = mod.Exporter(mod.Config(base_url="https://example.at",
                                 out_dir=tmp_path / "o"))
-    assert not e._minify_on                             # graceful skip
-    assert mod.minify_js("var a = 1;") == "var a = 1;"  # passthrough
+    assert not e.plugin("minify").enabled               # graceful skip
+    assert pmod.minify_js("var a = 1;") == "var a = 1;"  # passthrough
+    e.plugin("minify").run_start()
+    assert any("minification skipped" in w for w in e.warnings)
 
 
 # -- v1.5.3: hard error on missing minifier packages ------------------------
 
 def test_missing_minifiers_fail_cli(mod, monkeypatch, capsys):
     import pytest as _pytest
-    monkeypatch.setattr(mod, "rjsmin", None)
+    monkeypatch.setattr(mod.PLUGIN_MODULES["minify"], "rjsmin", None)
     with _pytest.raises(SystemExit):
         mod.parse_args(["https://example.at"])
     assert "rjsmin" in capsys.readouterr().err
