@@ -82,7 +82,11 @@ class Downloads(Plugin):
         if target is None:
             return None
         written = exp.write_bytes(target, resp.content)
-        if written is None and not target.is_file():
+        try:
+            on_disk = target.is_file()
+        except OSError:            # un-stat-able (e.g. over-long name)
+            on_disk = False
+        if written is None and not on_disk:
             # nothing landed on disk (path conflict) -- do NOT claim the
             # response or register the mapping: links rewritten onto the
             # file and 301 rules pointing at it would all be dead

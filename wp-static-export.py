@@ -372,6 +372,16 @@ def path_extension(url_path: str) -> str:
     return ""
 
 
+def _isdir(p: Path) -> bool:
+    """Path.is_dir() that treats an un-stat-able path as 'not a directory'
+    instead of raising -- Path.is_dir() propagates ENAMETOOLONG for
+    over-long names on Python 3.10-3.13 (3.14 swallows it)."""
+    try:
+        return p.is_dir()
+    except OSError:
+        return False
+
+
 def canon_path(path: str) -> str:
     """Canonical URL path: percent-decoded, Unicode-NFC, re-quoted.
 
@@ -1168,7 +1178,7 @@ class Exporter:
         with self.write_lock:
             if target in self.written_paths:
                 return None
-            if target.is_dir():
+            if _isdir(target):
                 target = target / "index.html"
                 if target in self.written_paths:
                     return None
@@ -1190,7 +1200,7 @@ class Exporter:
         with self.write_lock:
             if target in self.written_paths:
                 return False
-            if target.is_dir():
+            if _isdir(target):
                 target = target / "index.html"
                 if target in self.written_paths:
                     return False
