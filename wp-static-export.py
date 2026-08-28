@@ -138,7 +138,6 @@ import base64
 import importlib.util
 import ipaddress
 import json
-import mimetypes
 import posixpath
 import random
 import re
@@ -338,36 +337,6 @@ def resolves_private(host: str) -> bool:
     # co. answer tracker domains with 0.0.0.0/127.x) -- NOT internal sites
     return all(ip.is_private and not ip.is_loopback and not ip.is_unspecified
                for ip in ips)
-
-
-CD_FILENAME_STAR_RE = re.compile(r"filename\*\s*=\s*[\w-]+''([^;]+)",
-                                 re.IGNORECASE)
-CD_FILENAME_RE = re.compile(r'filename\s*=\s*"?([^";]+)"?', re.IGNORECASE)
-
-
-def attachment_filename(disposition: str, content_type: str,
-                        url_path: str) -> str:
-    """File name for a dynamically served download (WP plugins answer
-    /download/123/ with Content-Disposition: attachment): RFC 5987
-    filename* preferred, then plain filename=, else the last URL path
-    segment plus an extension guessed from the content type. The result is
-    a bare, traversal-safe file name."""
-    name = ""
-    m = CD_FILENAME_STAR_RE.search(disposition or "")
-    if m:
-        name = unquote(m.group(1).strip())
-    else:
-        m = CD_FILENAME_RE.search(disposition or "")
-        if m:
-            name = m.group(1).strip()
-    name = posixpath.basename(name.replace("\\", "/")).lstrip(". ")
-    name = unicodedata.normalize("NFC", name)
-    if not name:
-        seg = posixpath.basename(url_path.rstrip("/")) or "download"
-        ext = mimetypes.guess_extension(
-            (content_type or "").split(";")[0].strip()) or ""
-        name = seg + ext
-    return name
 
 
 def robots_rule_re(pattern: str) -> re.Pattern:
@@ -882,9 +851,6 @@ class Exporter:
         self.robots_rules: list[tuple[int, bool, re.Pattern]] = []
         self.robots_crawl_delay = 0.0
         self.excluded_urls: set[str] = set()
-        # dynamic download endpoints materialized as real files:
-        # "/download/123/" -> "/download/123/Vollmacht.pdf"
-        self.download_map: dict[str, str] = {}
         # split-DNS detection of additional same-site hosts
         self._dns_cache: dict[str, bool] = {}
         self.auto_internal_hosts: list[str] = []
@@ -1591,10 +1557,9 @@ class Exporter:
             url_b = self.to_base_host(resp.url)
             if not any(p.save_non_html_response(url_b, resp)
                        for p in self.plugins):
-                if self._save_download(url_b, resp) is None:
-                    target = self.local_path_for(url_b, is_page=False)
-                    if target:
-                        self.write_bytes(target, resp.content)
+                target = self.local_path_for(url_b, is_page=False)
+                if target:
+                    self.write_bytes(target, resp.content)
             return [], []
 
         if "user-agent" in (resp.headers.get("Vary") or "").lower():
@@ -1631,30 +1596,6 @@ class Exporter:
         for p in self.plugins:
             p.page_saved(save_url, resp, rec)
         return new_pages, new_assets
-
-    def _save_download(self, url: str, resp: requests.Response) -> str | None:
-        """Materialize a dynamic download endpoint (an extensionless URL
-        like /download/123/ answering with a file) as a REAL file next to
-        its URL path, so the link can be rewritten to something a static
-        server can deliver. Returns the root-relative file path, or None
-        when the URL already has a file extension (works as-is)."""
-        path = canon_path(urlsplit(url).path or "/")
-        if path_extension(path):
-            return None
-        name = attachment_filename(
-            resp.headers.get("Content-Disposition", ""),
-            resp.headers.get("Content-Type", ""), path)
-        base = path if path.endswith("/") else path + "/"
-        file_path = canon_path(base + name)
-        target = self.local_path_for(
-            f"{self.scheme}://{self.host}{file_path}", is_page=False)
-        if target is None:
-            return None
-        self.write_bytes(target, resp.content)
-        with self.stats_lock:
-            self.download_map[base] = file_path
-            self.asset_count += 1
-        return file_path
 
     def _write_redirect_stub(self, src_url: str, dest_abs: str) -> None:
         """noindex'ed meta-refresh page at the redirect source path."""
@@ -2183,12 +2124,10 @@ class Exporter:
             return [], []
 
         if not ext and "html" not in ctype:
-            # extensionless URL answering with a file: dynamic download
-            # endpoint reached through an asset context
+            # extensionless URL answering with a file, e.g. a dynamic
+            # download endpoint reached through an asset context
             if any(p.save_non_html_response(self.to_base_host(resp.url), resp)
                    for p in self.plugins):
-                return [], []
-            if self._save_download(self.to_base_host(resp.url), resp) is not None:
                 return [], []
 
         if "html" in ctype and not ext:
@@ -2477,7 +2416,7 @@ class Exporter:
         if not self.cfg.rewrite:
             return
         do_staging = self.cfg.staging
-        if not (do_staging or self.download_map
+        if not (do_staging
                 or any(p.wants_postprocess() for p in self.plugins)):
             return
         # only files parse_and_save_html re-serialized -- HTML *assets* were
@@ -2495,8 +2434,6 @@ class Exporter:
                 changed |= self._inject_staging_meta(soup)
             for p in self.plugins:
                 changed |= p.postprocess_soup(soup)
-            if self.download_map:
-                changed |= self._rewrite_download_links(soup)
             if changed:
                 try:
                     html_file.write_bytes(self.serialize(soup))
@@ -2520,26 +2457,6 @@ class Exporter:
         tag["content"] = "noindex"
         head.insert(0, tag)
         return True
-
-    def _rewrite_download_links(self, soup: BeautifulSoup) -> bool:
-        """Point links at the materialized download files -- the dynamic
-        /download/123/?cachebuster endpoints don't exist statically. Runs
-        in the post-crawl pass because the map is only complete then."""
-        changed = False
-        for tag in soup.find_all(True):
-            for attr in ("href", "src"):
-                val = tag.get(attr)
-                if not isinstance(val, str) or not val.startswith("/") \
-                        or val.startswith("//"):
-                    continue
-                path = canon_path(
-                    val.split("#", 1)[0].split("?", 1)[0] or "/")
-                key = path if path.endswith("/") else path + "/"
-                new = self.download_map.get(key)
-                if new and val != new:
-                    tag[attr] = new           # cache-buster query dropped
-                    changed = True
-        return changed
 
     # ----------------------------------------------------------------------
     # Phase 3b: post-export verification
@@ -2861,22 +2778,6 @@ class Exporter:
             for path in self.origin_sitemap_paths:
                 if path not in ("/sitemap.xml", "") and path not in seen_from:
                     redirect_rules.append((path, "/sitemap.xml"))
-        if self.download_map:
-            # externally shared/indexed download-endpoint URLs (with or
-            # without trailing slash, any ?cachebuster) 301 onto the file
-            seen_from = {fp for fp, _ in redirect_rules}
-            for endpoint, file_path in sorted(self.download_map.items()):
-                for fp in (endpoint, endpoint.rstrip("/")):
-                    if not fp or fp in seen_from:
-                        continue
-                    if (re.search(r"""[\s'"$\\{}]""", fp + file_path)
-                            or any(ord(c) < 32 for c in fp + file_path)):
-                        self.warnings.append(
-                            f"download redirect skipped (unsafe characters "
-                            f"for server configs): {fp} -> {file_path}")
-                        break
-                    seen_from.add(fp)
-                    redirect_rules.append((fp, file_path))
         seen_from = {fp for fp, _ in redirect_rules}
         for p in self.plugins:
             redirect_rules.extend(p.redirect_rules(seen_from))
@@ -3228,7 +3129,6 @@ esac
                 "action": self.robots_action,
             },
             "deploy": self.deploy_info,
-            "downloads": dict(sorted(self.download_map.items())),
             "redirects": redirects,
             "pages_found_only_via_links_not_in_sitemap": [p.url for p in link_only],
             "seo": {
@@ -3313,9 +3213,6 @@ esac
             section("Failed pages", failed_pages, lambda p: f"{p.url} ({p.error})"),
             section("Asset errors", self.asset_errors,
                     lambda a: f"{a['url']} ({a['error']})"),
-            section("Download endpoints materialized as files",
-                    sorted(self.download_map.items()),
-                    lambda d: f"{d[0]} -> {d[1]}"),
             section("Redirects observed", redirects,
                     lambda r: f"{r['from']} -> {r['to']} ({r['status']})"),
             section("Pages found via links but missing from sitemap", link_only,
@@ -3437,9 +3334,6 @@ esac
             print(f"[seo] stripped {sum(self.cruft_removed.values())} WP/CDN "
                   f"head elements "
                   f"({', '.join(sorted(self.cruft_removed))})")
-        if self.download_map:
-            print(f"[seo] {len(self.download_map)} download endpoints "
-                  f"materialized as files (links rewritten, 301s generated)")
         for p in self.plugins:
             for line in p.summary_lines():
                 print(line)

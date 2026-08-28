@@ -418,7 +418,7 @@ def test_write_stream(exporter):
 # -- v1.3.1: dynamic download endpoints -------------------------------------
 
 def test_attachment_filename(mod):
-    fn = mod.attachment_filename
+    fn = mod.PLUGIN_MODULES["downloads"].attachment_filename
     assert fn('attachment; filename="Vollmacht-04.2021.pdf"',
               "application/pdf", "/download/9/") == "Vollmacht-04.2021.pdf"
     # RFC 5987 wins, percent-decoded
@@ -434,13 +434,14 @@ def test_attachment_filename(mod):
 
 
 def test_rewrite_download_links(exporter):
-    exporter.download_map = {"/download/9/": "/download/9/Vollmacht.pdf"}
+    dl = exporter.plugin("downloads")
+    dl.download_map = {"/download/9/": "/download/9/Vollmacht.pdf"}
     soup = BeautifulSoup(
         '<a href="/download/9/?tmstv=123">a</a>'
         '<a href="/download/9">b</a>'
         '<a href="/download/10/">c</a>'
         '<a href="https://extern.tld/download/9/">d</a>', "html.parser")
-    assert exporter._rewrite_download_links(soup)
+    assert dl.postprocess_soup(soup)
     links = [a["href"] for a in soup.find_all("a")]
     assert links == ["/download/9/Vollmacht.pdf", "/download/9/Vollmacht.pdf",
                      "/download/10/", "https://extern.tld/download/9/"]
@@ -450,7 +451,8 @@ def test_download_map_redirect_rules(mod, tmp_path):
     e = mod.Exporter(mod.Config(base_url="https://example.at",
                                 out_dir=tmp_path / "o"))
     e.public_dir.mkdir(parents=True)
-    e.download_map = {"/download/9/": "/download/9/Vollmacht.pdf"}
+    e.plugin("downloads").download_map = {
+        "/download/9/": "/download/9/Vollmacht.pdf"}
     e.write_deploy_files()
     inc = (e.cfg.out_dir / "redirects.inc").read_text()
     assert 'rewrite "^/download/9/$" "/download/9/Vollmacht.pdf" permanent;' in inc
@@ -471,11 +473,12 @@ def test_save_download(mod, tmp_path):
                    "Content-Type": "application/pdf"}
         content = b"%PDF-1.4"
 
-    path = e._save_download("https://example.at/download/9/", FakeResp())
+    dl = e.plugin("downloads")
+    path = dl._save_download("https://example.at/download/9/", FakeResp())
     assert path == "/download/9/a b.pdf" or path == "/download/9/a%20b.pdf"
     assert (e.public_dir / "download" / "9" / "a b.pdf").read_bytes() == b"%PDF-1.4"
     # URL with extension: untouched
-    assert e._save_download("https://example.at/x.pdf", FakeResp()) is None
+    assert dl._save_download("https://example.at/x.pdf", FakeResp()) is None
 
 
 # -- v1.4.0: SR7 slide hydration --------------------------------------------

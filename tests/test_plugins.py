@@ -48,8 +48,8 @@ def test_load_plugins_idempotent(mod):
 def test_shipped_plugins_registered(mod):
     # alphabetical file order = load order
     assert [cls.name for cls in mod.PLUGIN_REGISTRY] == [
-        "cloudflare", "complianz", "image_optimize", "lazyload", "minify",
-        "slider_revolution", "theme_fixes"]
+        "cloudflare", "complianz", "downloads", "image_optimize", "lazyload",
+        "minify", "slider_revolution", "theme_fixes"]
     assert set(mod.PLUGIN_MODULES) == {cls.name
                                        for cls in mod.PLUGIN_REGISTRY}
 
