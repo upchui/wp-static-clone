@@ -474,6 +474,40 @@ def test_download_map_redirect_rules(mod, tmp_path):
         (e.public_dir / ".htaccess").read_text()
 
 
+def test_max_pages_caps_sitemap_seeds(mod, tmp_path, monkeypatch):
+    e = mod.Exporter(mod.Config(base_url="https://example.at",
+                                out_dir=tmp_path / "o", max_pages=2))
+    processed = []
+    monkeypatch.setattr(e, "process_page",
+                        lambda url, src: (processed.append(url), ([], []))[1])
+    e.crawl([f"https://example.at/p{i}/" for i in range(5)])
+    assert len(processed) == 2                  # cap applies to seeds too
+    assert e.truncated                          # and truncation is REAL
+
+
+def test_cli_validation_errors(mod, capsys):
+    import pytest as _pytest
+    for argv in (["https://example.at", "--timeout", "-1"],
+                 ["https://example.at", "--max-pages", "0"],
+                 ["https://example.at", "--header", ": x"],
+                 ["https://example.at/blog"]):
+        with _pytest.raises(SystemExit):
+            mod.parse_args(argv)
+        assert capsys.readouterr().err          # argparse error, no traceback
+
+
+def test_local_path_for_nul_byte(exporter):
+    assert exporter.local_path_for("https://example.at/img%00.png",
+                                   is_page=False) is None
+
+
+def test_write_bytes_oserror_becomes_warning(exporter):
+    exporter.public_dir.mkdir(parents=True, exist_ok=True)
+    target = exporter.public_dir / ("x" * 300 + ".png")   # ENAMETOOLONG
+    assert exporter.write_bytes(target, b"d") is None
+    assert any("path conflict" in w for w in exporter.warnings)
+
+
 def test_redirect_rules_no_slash_strip_loop(mod, tmp_path):
     e = mod.Exporter(mod.Config(base_url="https://example.at",
                                 out_dir=tmp_path / "o"))

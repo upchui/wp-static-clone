@@ -835,6 +835,7 @@ class Exporter:
         # postprocess_html must only touch these, never byte-identical
         # HTML assets
         self.rewritten_html_paths: set[Path] = set()
+        self._sitemap_cap_warned = False
         # global politeness gate: --delay is the minimum spacing between
         # ANY two requests, not a per-worker sleep
         self._rate_lock = threading.Lock()
@@ -1096,8 +1097,9 @@ class Exporter:
         norm = posixpath.normpath(path).lstrip("/")
         if norm.startswith(".."):
             return None
-        target = (self.public_dir / norm).resolve()
         try:
+            # resolve() itself raises ValueError on e.g. embedded NUL (%00)
+            target = (self.public_dir / norm).resolve()
             target.relative_to(self.public_dir.resolve())
         except ValueError:
             return None
@@ -1123,7 +1125,9 @@ class Exporter:
             try:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes(data)
-            except (FileExistsError, NotADirectoryError, IsADirectoryError) as exc:
+            except OSError as exc:
+                # path conflicts, over-long names (ENAMETOOLONG), permission
+                # or space errors -- warn and skip, like write_stream()
                 self.warnings.append(
                     f"path conflict, not written: {target} ({exc.__class__.__name__})")
                 return None
@@ -1223,7 +1227,7 @@ class Exporter:
         robots_url = f"{self.scheme}://{self.host}/robots.txt"
         try:
             resp = self.fetch(robots_url)
-            if resp.ok and resp.content:
+            if resp.ok and resp.content and not self.off_site_redirect(resp):
                 self.robots_txt_found = True
                 target = self.local_path_for(robots_url, is_page=False)
                 if target:
@@ -1303,7 +1307,15 @@ class Exporter:
         return page_urls
 
     def walk_sitemap(self, url: str, seen: set[str], depth: int) -> list[str]:
-        if url in seen or depth > 5 or len(seen) > 200:
+        if url in seen:
+            return []
+        if depth > 5 or len(seen) > 200:
+            if not self._sitemap_cap_warned:
+                self._sitemap_cap_warned = True
+                self.warnings.append(
+                    f"sitemap graph cap reached (depth > 5 or > 200 sitemap "
+                    f"files) -- further sitemaps are skipped starting at "
+                    f"{url}; page discovery may be incomplete")
             return []
         seen.add(url)
         try:
@@ -1393,6 +1405,8 @@ class Exporter:
     def crawl(self, seed_pages: list[str]) -> None:
         pending_pages: list[tuple[str, str]] = []
         for u in seed_pages:
+            if len(self.page_urls_seen) >= self.cfg.max_pages:
+                break                   # --max-pages also caps sitemap seeds
             n = self.normalize_page_url(u)
             if n and n not in self.page_urls_seen:
                 self.page_urls_seen.add(n)
@@ -1512,12 +1526,14 @@ class Exporter:
                     retry = self.fetch(urlunsplit((s.scheme, s.netloc, nfd_path, "", "")))
                 except requests.RequestException:
                     retry = None
-                if retry is not None and retry.ok:
+                if (retry is not None and retry.ok
+                        and not self.off_site_redirect(retry)):
                     resp = retry
                     rec.status = resp.status_code
                     rec.final_url = resp.url
                     rec.content_type = (
                         resp.headers.get("Content-Type") or "").split(";")[0]
+                    rec.last_modified = resp.headers.get("Last-Modified", "")
         if not resp.ok:
             rec.error = f"HTTP {resp.status_code}"
             return [], []
@@ -1966,6 +1982,8 @@ class Exporter:
             return [], []
         off_site = self.off_site_redirect(resp)
         if off_site:
+            if stream:
+                resp.close()    # unread streamed body would pin a connection
             if url not in self.speculative_urls:
                 self.asset_errors.append(
                     {"url": url,
@@ -1976,11 +1994,15 @@ class Exporter:
                     self.external_hosts.add(host)
             return [], []
         if not resp.ok:
+            if stream:
+                resp.close()
             if url not in self.speculative_urls:
                 self.asset_errors.append(
                     {"url": url, "error": f"HTTP {resp.status_code}"})
             return [], []
         if not self.is_internal(resp.url):
+            if stream:
+                resp.close()
             self.asset_errors.append({"url": url,
                                       "error": f"redirected off-site to {resp.url}"})
             return [], []
@@ -2099,8 +2121,7 @@ class Exporter:
                                              len(data))
 
         target = self.local_path_for(url, is_page=False)
-        if target:
-            self.write_bytes(target, data)
+        if target and self.write_bytes(target, data) is not None:
             with self.stats_lock:
                 self.asset_count += 1
         return discovered_pages, discovered
@@ -3192,18 +3213,18 @@ esac
             self.warnings.append(
                 "--staging blocks all indexing -- --target-domain only "
                 "affects the markup of this (unindexable) preview")
-        if self.public_dir.exists():
-            if self.cfg.clean:
-                shutil.rmtree(self.public_dir)
-                for extra in EXTRA_OUTPUT_DIRS:
-                    shutil.rmtree(self.cfg.out_dir / extra,
-                                  ignore_errors=True)
-                self.say("[init] --clean: removed existing public/"
-                         + "".join(f" and {d}/" for d in EXTRA_OUTPUT_DIRS))
-            elif any(self.public_dir.iterdir()):
-                self.warnings.append(
-                    "output dir public/ was not empty and --clean was not "
-                    "set; stale files from previous runs may remain.")
+        if self.cfg.clean:
+            # extras (e.g. mobile-variants/) must go even when public/ is
+            # already absent -- stale trees would be reported as current
+            shutil.rmtree(self.public_dir, ignore_errors=True)
+            for extra in EXTRA_OUTPUT_DIRS:
+                shutil.rmtree(self.cfg.out_dir / extra, ignore_errors=True)
+            self.say("[init] --clean: removed existing public/"
+                     + "".join(f" and {d}/" for d in EXTRA_OUTPUT_DIRS))
+        elif self.public_dir.exists() and any(self.public_dir.iterdir()):
+            self.warnings.append(
+                "output dir public/ was not empty and --clean was not "
+                "set; stale files from previous runs may remain.")
         self.public_dir.mkdir(parents=True, exist_ok=True)
 
         seeds = self.discover()
@@ -3459,10 +3480,20 @@ Notes:
         except re.error as exc:
             ap.error(f"--exclude: invalid regex {pattern!r} ({exc})")
 
+    if args.timeout <= 0:
+        ap.error(f"--timeout must be positive, got {args.timeout:g}")
+    if args.max_pages < 1:
+        ap.error(f"--max-pages must be at least 1, got {args.max_pages}")
+
     base = args.base_url.strip()
     if not base.startswith(("http://", "https://")):
         base = "https://" + base
     base = base.rstrip("/")
+    if urlsplit(base).path:
+        # only scheme+host are ever used -- a path would be silently
+        # ignored and the ROOT site exported instead
+        ap.error(f"base_url must be the site root (subdirectory installs "
+                 f"are not supported): {args.base_url!r}")
 
     host_header = (args.host_header or "").strip()
     host_header = re.sub(r"^https?://", "", host_header).rstrip("/") or None
@@ -3480,6 +3511,8 @@ Notes:
         if ":" not in raw:
             ap.error(f"--header must be 'Name: Value', got: {raw!r}")
         name, value = raw.split(":", 1)
+        if not name.strip():
+            ap.error(f"--header needs a non-empty header name, got: {raw!r}")
         extra_headers[name.strip()] = value.strip()
 
     if args.make_relative:
