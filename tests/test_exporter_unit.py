@@ -93,6 +93,7 @@ CRUFT_HTML = """<html><head>
 def test_strip_wp_cruft(exporter):
     soup = BeautifulSoup(CRUFT_HTML, "html.parser")
     exporter.strip_wp_cruft(soup)
+    exporter.plugin("cloudflare").clean_soup(soup)   # runs under the same gate
     out = str(soup)
     for gone in ("generator", "api.w.org", "EditURI", "shortlink",
                  "pingback", "oembed", "rss+xml", "cloudflareinsights"):

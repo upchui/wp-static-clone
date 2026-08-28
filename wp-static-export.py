@@ -218,9 +218,9 @@ B64_URL_ATTRS = ("data-dbsrc",)
 HTML_NOISE_EXTRA: tuple = ()
 # top-level dirs whose "/dir/..." string refs inside inline scripts
 # verify_export() resolves against the export
-VERIFY_SCRIPT_REF_DIRS = ("wp-content", "wp-includes", "cf-fonts", "cdn-cgi")
+VERIFY_SCRIPT_REF_DIRS = ("wp-content", "wp-includes")
 # local refs verify_export() never checks (resolved at runtime instead)
-VERIFY_SKIP_REF_PREFIXES = ("/cdn-cgi/l/email-protection",)
+VERIFY_SKIP_REF_PREFIXES: tuple = ()
 
 CSS_URL_RE = re.compile(r"url\(\s*['\"]?([^'\")]+)['\"]?\s*\)", re.IGNORECASE)
 CSS_IMPORT_RE = re.compile(r"@import\s+['\"]([^'\"]+)['\"]", re.IGNORECASE)
@@ -409,20 +409,6 @@ def canon_ref(ref: str) -> str:
     if cut != -1:
         return canon_path(ref[:cut] or "/") + ref[cut:]
     return canon_path(ref or "/")
-
-
-def decode_cfemail(enc: str) -> str | None:
-    """Decode a Cloudflare email-obfuscation hex string (XOR with first byte)."""
-    try:
-        data = bytes.fromhex(enc)
-    except ValueError:
-        return None
-    if len(data) < 2:
-        return None
-    try:
-        return bytes(b ^ data[0] for b in data[1:]).decode("utf-8")
-    except UnicodeDecodeError:
-        return None
 
 
 def try_b64_url(val: str) -> str | None:
@@ -1239,9 +1225,10 @@ class Exporter:
             return None
         if self.is_excluded(path):
             return None
-        # never pages: Cloudflare runtime endpoints, form AJAX routes, and
-        # extensionless plugin/theme directories referenced from JS configs
-        if (path.startswith(("/cdn-cgi/", "/wpforms-ajax"))
+        # never pages: form AJAX routes, extensionless plugin/theme
+        # directories referenced from JS configs, and plugin-registered
+        # runtime endpoints (e.g. Cloudflare's /cdn-cgi/)
+        if (path.startswith("/wpforms-ajax")
                 or (path.startswith(("/wp-content/", "/wp-includes/"))
                     and not path_extension(path))):
             return None
@@ -2292,11 +2279,6 @@ class Exporter:
             if ("alternate" in rel and ltype == "application/json"
                     and "/wp-json/" in href):
                 drop(link, "rest-api-discovery")
-        # Cloudflare-injected RUM beacon: reports to Cloudflare for the
-        # ORIGIN zone -- off Cloudflare it only produces console/CORS errors
-        for script in soup.find_all("script", src=True):
-            if "cloudflareinsights.com" in script["src"]:
-                drop(script, "cloudflare-beacon")
         if removed:
             with self.stats_lock:
                 for kind, n in removed.items():
@@ -2355,27 +2337,6 @@ class Exporter:
                     tag[attr] = self.localize_url(val)
                 elif self.host_probe_re.search(val):
                     tag[attr] = self.localize_text(val)
-        # Cloudflare email obfuscation: pre-decode addresses so email links
-        # work on the static site even without the runtime decode script
-        # (whose /cdn-cgi/l/email-protection backend does not exist here)
-        for tag in soup.find_all(attrs={"data-cfemail": True}):
-            email = decode_cfemail(tag["data-cfemail"])
-            if not email:
-                continue
-            tag.string = email
-            del tag["data-cfemail"]
-            classes = [c for c in (tag.get("class") or []) if c != "__cf_email__"]
-            if classes:
-                tag["class"] = classes
-            elif tag.get("class") is not None:
-                del tag["class"]
-            if tag.name == "a" and "email-protection" in (tag.get("href") or ""):
-                tag["href"] = "mailto:" + email
-        for a in soup.find_all("a", href=True):
-            if "/cdn-cgi/l/email-protection#" in a["href"]:
-                email = decode_cfemail(a["href"].split("#", 1)[1])
-                if email:
-                    a["href"] = "mailto:" + email
         for style in soup.find_all("style"):
             if style.string and self.host_probe_re.search(style.string):
                 style.string = self.localize_text(style.string)

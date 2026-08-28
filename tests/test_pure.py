@@ -133,12 +133,13 @@ def test_try_b64_url(mod):
 
 
 def test_decode_cfemail(mod):
+    decode_cfemail = mod.PLUGIN_MODULES["cloudflare"].decode_cfemail
     key = 0x42
     email = "a@b.at"
     enc = f"{key:02x}" + "".join(f"{ord(c) ^ key:02x}" for c in email)
-    assert mod.decode_cfemail(enc) == email
-    assert mod.decode_cfemail("zz") is None
-    assert mod.decode_cfemail("00") is None
+    assert decode_cfemail(enc) == email
+    assert decode_cfemail("zz") is None
+    assert decode_cfemail("00") is None
 
 
 # -- normalize_html (mobile-check comparison) -------------------------------
