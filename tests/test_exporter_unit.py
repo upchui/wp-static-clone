@@ -971,3 +971,101 @@ def test_mobile_check_vary_header(mod, tmp_path):
     r2.headers = {"Vary": "Accept-Encoding"}
     mc.page_fetched("https://example.at/x/", r2, None)
     assert mc.vary_ua_pages == ["https://example.at/"]
+
+
+# -- v2.2.0: rewrite/discovery accuracy --------------------------------------
+
+def test_srcset_rewrite_keeps_data_uris(exporter):
+    data_uri = ("data:image/gif;base64,"
+                "R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==")
+    soup = BeautifulSoup(
+        f'<img srcset="{data_uri}" '
+        f'data-srcset="https://example.at/a.png 1x">', "html.parser")
+    exporter.rewrite_soup_relative(soup)
+    img = soup.find("img")
+    assert img["srcset"] == data_uri                # byte-identical
+    assert img["data-srcset"] == "/a.png 1x"
+
+
+def test_text_attrs_not_localized(exporter):
+    soup = BeautifulSoup(
+        '<img src="https://example.at/a.png" '
+        'alt="Screenshot von https://example.at/shop" '
+        'title="Mehr auf https://example.at/agb">', "html.parser")
+    exporter.rewrite_soup_relative(soup)
+    img = soup.find("img")
+    assert img["src"] == "/a.png"
+    assert img["alt"] == "Screenshot von https://example.at/shop"
+    assert img["title"] == "Mehr auf https://example.at/agb"
+
+
+def test_meta_refresh_localized(exporter):
+    soup = BeautifulSoup(
+        '<meta http-equiv="refresh" content="0;url=https://example.at/neu/">'
+        '<meta property="og:url" content="https://example.at/">',
+        "html.parser")
+    exporter.rewrite_soup_relative(soup)
+    metas = soup.find_all("meta")
+    assert metas[0]["content"] == "0;url=/neu/"
+    assert metas[1]["content"] == "https://example.at/"  # SEO stays absolute
+
+
+def test_b64_attr_with_plain_url(exporter):
+    soup = BeautifulSoup(
+        '<img data-dbsrc="https://example.at/wp-content/x.jpg">',
+        "html.parser")
+    exporter.rewrite_soup_relative(soup)
+    assert soup.find("img")["data-dbsrc"] == "/wp-content/x.jpg"
+
+
+def test_localize_b64_preserves_urlsafe_alphabet(exporter):
+    import base64
+    url = "https://example.at/wp-content/uploads/tür.jpg"
+    us = base64.urlsafe_b64encode(url.encode()).decode()
+    out = exporter.localize_b64(us)
+    assert base64.urlsafe_b64decode(out).decode().startswith("/wp-content/")
+
+
+class _AssetResp:
+    is_redirect = is_permanent_redirect = False
+    ok = True
+    status_code = 200
+    history = []
+
+    def __init__(self, url, content, ctype):
+        self.url = url
+        self.content = content
+        self.headers = {"Content-Type": ctype}
+
+
+def _asset_exporter(mod, tmp_path, resp):
+    e = mod.Exporter(mod.Config(base_url="https://example.at",
+                                out_dir=tmp_path / "o", minify=False))
+    e.public_dir.mkdir(parents=True)
+    e.fetch = lambda url, **kw: resp
+    return e
+
+
+def test_css_relative_refs_resolve_against_final_url(mod, tmp_path):
+    # /style.css redirects to /assets/style.css on the origin -- relative
+    # url() refs must resolve against the FINAL location, like the browser
+    resp = _AssetResp("https://example.at/assets/style.css",
+                      b"body{background:url(fonts/x.woff)}", "text/css")
+    e = _asset_exporter(mod, tmp_path, resp)
+    pages, assets = e.process_asset("https://example.at/style.css")
+    assert "https://example.at/assets/fonts/x.woff" in assets
+    css = (e.public_dir / "style.css").read_text()
+    assert "url('/assets/fonts/x.woff')" in css
+
+
+def test_webmanifest_localized(mod, tmp_path):
+    resp = _AssetResp(
+        "https://example.at/site.webmanifest",
+        b'{"start_url":"https://example.at/","icons":'
+        b'[{"src":"https://example.at/wp-content/icon.png"}]}',
+        "application/manifest+json")
+    e = _asset_exporter(mod, tmp_path, resp)
+    e.process_asset("https://example.at/site.webmanifest")
+    out = (e.public_dir / "site.webmanifest").read_text()
+    assert '"start_url":"/"' in out
+    assert '"src":"/wp-content/icon.png"' in out

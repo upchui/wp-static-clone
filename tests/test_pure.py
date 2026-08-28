@@ -251,3 +251,32 @@ def test_minify_removes_conditionals_and_hacks(mod):
     # comment-lookalike STRING LITERALS in JS stay (functional code)
     js = mod.minify_js('s.replace("/*easeName*/",x);')
     assert '"/*easeName*/"' in js
+
+
+# -- v2.2.0: srcset parser / canon_path segment handling / urlsafe b64 -------
+
+def test_iter_srcset(mod):
+    data_uri = ("data:image/gif;base64,"
+                "R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==")
+    assert list(mod.iter_srcset(data_uri)) == [(data_uri, "")]
+    assert list(mod.iter_srcset("/a.png 1x, /b.png 2x")) == [
+        ("/a.png", "1x"), ("/b.png", "2x")]
+    assert list(mod.iter_srcset("a.png 1x,b.png 2x")) == [
+        ("a.png", "1x"), ("b.png", "2x")]                # space-less form
+    assert list(mod.iter_srcset(f"{data_uri}, /b.png 2x")) == [
+        (data_uri, ""), ("/b.png", "2x")]
+
+
+def test_canon_path_preserves_encoded_slash_and_quote(mod):
+    assert mod.canon_path("/a%2Fb/") == "/a%2Fb/"    # NOT a path separator
+    assert mod.canon_path("/o%27brien.jpg") == "/o%27brien.jpg"
+    assert mod.canon_path("/über-uns/") == mod.canon_path("/%C3%BCber-uns/")
+
+
+def test_try_b64_url_urlsafe_alphabet(mod):
+    import base64
+    raw = "/wp-content/uploads/tür.jpg"
+    std = base64.b64encode(raw.encode()).decode()
+    urlsafe = base64.urlsafe_b64encode(raw.encode()).decode()
+    assert mod.try_b64_url(std) == raw
+    assert mod.try_b64_url(urlsafe) == raw

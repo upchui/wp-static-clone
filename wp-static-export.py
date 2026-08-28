@@ -238,6 +238,38 @@ VERIFY_SKIP_REF_PREFIXES: tuple = ()
 
 CSS_URL_RE = re.compile(r"url\(\s*['\"]?([^'\")]+)['\"]?\s*\)", re.IGNORECASE)
 CSS_IMPORT_RE = re.compile(r"@import\s+['\"]([^'\"]+)['\"]", re.IGNORECASE)
+META_REFRESH_RE = re.compile(r"url\s*=\s*(.+)", re.IGNORECASE)
+
+# attributes holding human-readable text -- a full URL inside them is
+# CONTENT (alt text, tooltips), never fetched by browsers: exempt from
+# localization and from the verify absolute-reference check
+TEXT_ATTRS = ("alt", "title", "aria-label", "placeholder")
+
+
+def iter_srcset(val: str):
+    """Parse a srcset-style attribute into (url, descriptor) pairs using
+    the HTML spec's whitespace-first tokenization: URLs are whitespace-
+    delimited (so data: URIs containing commas survive intact), a URL's
+    TRAILING comma acts as the candidate separator, and descriptors run to
+    the next comma. A naive split(",") would cut data: URIs in half."""
+    pos, n = 0, len(val)
+    while pos < n:
+        while pos < n and (val[pos].isspace() or val[pos] == ","):
+            pos += 1
+        if pos >= n:
+            break
+        start = pos
+        while pos < n and not val[pos].isspace():
+            pos += 1
+        url = val[start:pos]
+        if url.endswith(","):
+            yield url.rstrip(","), ""
+            continue
+        dstart = pos
+        while pos < n and val[pos] != ",":
+            pos += 1
+        yield url, val[dstart:pos].strip()
+        pos += 1
 XML_STYLESHEET_RE = re.compile(r"<\?xml-stylesheet[^>]*href=[\"']([^\"']+)[\"']")
 SITEMAP_LINE_RE = re.compile(r"(?im)^\s*sitemap:\s*(\S+)")
 
@@ -345,11 +377,17 @@ def canon_path(path: str) -> str:
 
     Collapses spelling variants of the same path (%C3%A4 vs literal ä vs
     NFD a+%CC%88) into one form so crawl keys, rewritten links and on-disk
-    paths all agree. RFC 3986 path characters plus {} and * stay literal:
-    plugins substitute {placeholder} templates and match /path/* globs at
-    runtime, which percent-encoding would break."""
-    return quote(unicodedata.normalize("NFC", unquote(path)),
-                 safe="/:@!$&'()*+,;={}")
+    paths all agree. Canonicalization runs per SEGMENT so an encoded %2F
+    never turns into a real path separator (that would change which URL is
+    fetched and where the file lands). RFC 3986 path characters plus {}
+    and * stay literal: plugins substitute {placeholder} templates and
+    match /path/* globs at runtime, which percent-encoding would break.
+    Single quotes are re-encoded (%27) so generated CSS url('...') stays
+    parseable."""
+    return "/".join(
+        quote(unicodedata.normalize("NFC", unquote(seg)),
+              safe=":@!$&()*+,;={}")
+        for seg in path.split("/"))
 
 
 def canon_ref(ref: str) -> str:
@@ -364,11 +402,14 @@ def canon_ref(ref: str) -> str:
 
 
 def try_b64_url(val: str) -> str | None:
-    """Decode a base64 attribute value if (and only if) it holds a URL."""
-    if not val or not re.fullmatch(r"[A-Za-z0-9+/]{8,}={0,2}", val):
+    """Decode a base64 attribute value if (and only if) it holds a URL.
+    Accepts the standard AND the URL-safe alphabet."""
+    if not val or not re.fullmatch(r"[A-Za-z0-9+/_-]{8,}={0,2}", val):
         return None
     try:
-        decoded = base64.b64decode(val, validate=True).decode("utf-8")
+        decoded = base64.b64decode(
+            val.replace("-", "+").replace("_", "/"),
+            validate=True).decode("utf-8")
     except (ValueError, UnicodeDecodeError):
         return None
     if decoded.startswith(("//", "http://", "https://", "/")):
@@ -1689,8 +1730,7 @@ class Exporter:
             for attr in SRCSET_ATTRS:
                 val = tag.get(attr)
                 if val:
-                    for cand in val.split(","):
-                        cand = cand.strip().split(" ")[0]
+                    for cand, _ in iter_srcset(val):
                         if cand:
                             handle_candidate(cand, "img", rel)
             for attr in PAGE_URL_ATTRS:
@@ -1698,9 +1738,17 @@ class Exporter:
                 if val:
                     handle_candidate(val, "a", rel)
             for attr in B64_URL_ATTRS:
-                decoded = try_b64_url(tag.get(attr))
+                bval = tag.get(attr)
+                if not bval:
+                    continue
+                decoded = try_b64_url(bval)
                 if decoded:
                     handle_candidate(decoded, "img", rel)
+                else:
+                    # some installs put a PLAIN URL into the b64 attribute
+                    pages, assets = self.scan_text_for_urls(bval)
+                    new_pages.extend(pages)
+                    new_assets.extend(assets)
             style_attr = tag.get("style")
             if style_attr:
                 for m in CSS_URL_RE.finditer(style_attr):
@@ -1715,13 +1763,18 @@ class Exporter:
                     new_pages.extend(pages)
                     new_assets.extend(assets)
 
-        # og:image / twitter:image -> download, tag stays untouched
+        # og:image / twitter:image -> download, tag stays untouched;
+        # meta-refresh targets are internal PAGE links
         for meta in soup.find_all("meta"):
             key = (meta.get("property") or meta.get("name") or "").lower()
             if key in ("og:image", "og:image:url", "twitter:image"):
                 val = meta.get("content")
                 if val:
                     handle_candidate(val, "meta-img", set())
+            if (meta.get("http-equiv") or "").lower() == "refresh":
+                m = META_REFRESH_RE.search(meta.get("content") or "")
+                if m:
+                    handle_candidate(m.group(1).strip("'\" "), "a", set())
 
         # inline <style> blocks
         for style in soup.find_all("style"):
@@ -1866,7 +1919,11 @@ class Exporter:
         localized = self.localize_url(decoded)
         if localized == decoded:
             return val
-        return base64.b64encode(localized.encode("utf-8")).decode("ascii")
+        # keep the original alphabet -- the runtime that decodes the
+        # attribute expects the same variant it emitted
+        enc = (base64.urlsafe_b64encode if ("-" in val or "_" in val)
+               else base64.b64encode)
+        return enc(localized.encode("utf-8")).decode("ascii")
 
     def strip_resource_hints(self, soup: BeautifulSoup) -> None:
         """Remove resource-hint <link>s: they trigger connection attempts
@@ -1908,6 +1965,16 @@ class Exporter:
         the new domain instead of staying on the origin."""
         for tag in soup.find_all(True):
             if tag.name == "meta":
+                if (tag.get("http-equiv") or "").lower() == "refresh":
+                    # meta-refresh targets ARE navigated by browsers --
+                    # localize them like links (og:*/twitter:* stay absolute)
+                    content = tag.get("content") or ""
+                    m = META_REFRESH_RE.search(content)
+                    if m:
+                        tag["content"] = (
+                            content[:m.start(1)]
+                            + self.localize_url(m.group(1).strip("'\" ")))
+                    continue
                 if self.target_prefix:
                     content = tag.get("content")
                     if (isinstance(content, str)
@@ -1933,23 +2000,27 @@ class Exporter:
                     continue
                 if attr in SRCSET_ATTRS:
                     parts = []
-                    for cand in val.split(","):
-                        cand = cand.strip()
-                        if not cand:
-                            continue
-                        bits = cand.split(" ", 1)
-                        bits[0] = self.localize_url(bits[0])
-                        parts.append(" ".join(bits))
-                    tag[attr] = ", ".join(parts)
+                    changed = False
+                    for cand, desc in iter_srcset(val):
+                        new = self.localize_url(cand)
+                        changed |= new != cand
+                        parts.append(f"{new} {desc}".strip())
+                    if changed:     # untouched srcsets keep their exact bytes
+                        tag[attr] = ", ".join(parts)
                 elif attr == "style" or (attr in CSS_URL_ATTRS
                                          and "url(" in val):
                     tag[attr] = CSS_URL_RE.sub(
                         lambda m: f"url('{self.localize_url(m.group(1))}')", val)
                 elif attr in B64_URL_ATTRS:
-                    tag[attr] = self.localize_b64(val)
+                    new = self.localize_b64(val)
+                    if new == val and self.host_probe_re.search(val):
+                        # a PLAIN URL sitting in the b64 attribute
+                        new = self.localize_text(val)
+                    tag[attr] = new
                 elif attr in URL_ATTRS or attr in PAGE_URL_ATTRS:
                     tag[attr] = self.localize_url(val)
-                elif self.host_probe_re.search(val):
+                elif attr not in TEXT_ATTRS and self.host_probe_re.search(val):
+                    # NOT for alt/title & co. -- URLs there are prose
                     tag[attr] = self.localize_text(val)
         for style in soup.find_all("style"):
             if style.string and self.host_probe_re.search(style.string):
@@ -2065,11 +2136,16 @@ class Exporter:
 
         if ext == "css" or "text/css" in ctype:
             text = decode_text_asset(resp)
+            # relative url() refs resolve against where the file was SERVED
+            # from (after internal redirects), not where it was requested --
+            # the browser on the origin resolved them the same way
+            css_base = (self.to_base_host(resp.url)
+                        if self.is_internal(resp.url) else url)
             for m in list(CSS_URL_RE.finditer(text)) + list(CSS_IMPORT_RE.finditer(text)):
                 ref = m.group(1).strip()
                 if ref.startswith(("data:", "#")):
                     continue
-                absolute = urljoin(url, ref)
+                absolute = urljoin(css_base, ref)
                 absolute, _ = self._defrag(absolute)
                 if self.is_internal(absolute):
                     discovered.append(self.to_base_host(absolute))
@@ -2080,13 +2156,13 @@ class Exporter:
                     u = m.group(1).strip()
                     if u.startswith(("data:", "#")):
                         return m.group(0)
-                    absolute = urljoin(url, u)
+                    absolute = urljoin(css_base, u)
                     if self.is_internal(absolute):
                         return f"url('{self.localize_url(absolute)}')"
                     return m.group(0)
 
                 def rel_import(m: re.Match) -> str:
-                    absolute = urljoin(url, m.group(1).strip())
+                    absolute = urljoin(css_base, m.group(1).strip())
                     if self.is_internal(absolute):
                         return f"@import '{self.localize_url(absolute)}'"
                     return m.group(0)
@@ -2119,6 +2195,18 @@ class Exporter:
                     for p in self.plugins:
                         p.text_asset_written("js", len(resp.content),
                                              len(data))
+        elif ext in ("json", "webmanifest") or "json" in ctype:
+            # PWA manifests / JSON data: their start_url / icon / api URLs
+            # behave like the ones in JS -- discover and localize them
+            # (no minification, no plugin text filters)
+            text = decode_text_asset(resp)
+            page_refs, asset_refs = self.scan_text_for_urls(text)
+            discovered_pages.extend(page_refs)
+            discovered.extend(asset_refs)
+            if self.cfg.rewrite and self.host_probe_re.search(text):
+                new_text = self.localize_text(text)
+                if new_text != text:
+                    data = new_text.encode("utf-8")
 
         target = self.local_path_for(url, is_page=False)
         if target and self.write_bytes(target, data) is not None:
@@ -2460,8 +2548,14 @@ class Exporter:
                 # served as 403 by the generated nginx config, not a page
                 return (target / "index.html").is_file()
             if not path_extension(path):
-                # extensionless page, or a directory base path
-                return (target / "index.html").is_file() or target.is_dir()
+                if (target / "index.html").is_file():
+                    return True
+                # a bare directory only counts as "exists" for JS base
+                # paths under the registered script-ref dirs -- anywhere
+                # else a directory without index.html is served 403/404
+                return (path.startswith(tuple(f"/{d}/"
+                                              for d in VERIFY_SCRIPT_REF_DIRS))
+                        and target.is_dir())
             return False
 
         def check_ref(rel_file: str, ref: str) -> None:
@@ -2514,12 +2608,12 @@ class Exporter:
                 for attr, val in tag.attrs.items():
                     if not isinstance(val, str) or not val:
                         continue
-                    if not allowed_abs and self.host_probe_re.search(val):
+                    if (attr not in TEXT_ATTRS and not allowed_abs
+                            and self.host_probe_re.search(val)):
                         note_unexpected(rel_file, f"<{tag.name} {attr}=...>")
                     note_private(rel_file, val, f"<{tag.name} {attr}=...>")
                     if attr in SRCSET_ATTRS:
-                        for cand in val.split(","):
-                            cand = cand.strip().split(" ")[0]
+                        for cand, _ in iter_srcset(val):
                             if cand:
                                 check_ref(rel_file, cand)
                     elif attr == "style" or (attr in CSS_URL_ATTRS
@@ -2533,6 +2627,7 @@ class Exporter:
                     continue
                 if self.host_probe_re.search(style.string):
                     note_unexpected(rel_file, "<style> block")
+                note_private(rel_file, style.string, "<style> block")
                 for m in CSS_URL_RE.finditer(style.string):
                     check_ref(rel_file, m.group(1))
             for script in soup.find_all("script"):
