@@ -200,14 +200,15 @@ PAGE_SKIP_PATTERNS = re.compile(
     re.IGNORECASE,
 )
 
-# attributes that may hold a single URL
+# attributes that may hold a single URL (plugins register vendor-specific
+# ones, e.g. Complianz lazy attributes)
 URL_ATTRS = ("src", "href", "poster", "data-src", "data-lazy-src", "data-bg",
-             "data-placeholder-image", "data-cmplz-src", "data-src-cmplz")
+             "data-placeholder-image")
 # attributes that hold srcset-style comma separated candidate lists
 SRCSET_ATTRS = ("srcset", "data-srcset", "data-lazy-srcset")
-# attributes that hold internal *page* links (theme-specific, e.g. The7's
-# clickable images)
-PAGE_URL_ATTRS = ("data-dt-location",)
+# attributes that hold internal *page* links (theme-specific -- registered
+# by plugins, e.g. The7's clickable images)
+PAGE_URL_ATTRS: tuple = ()
 # attributes that hold base64-encoded URLs (e.g. Slider Revolution lazy src)
 B64_URL_ATTRS = ("data-dbsrc",)
 
@@ -233,10 +234,10 @@ MOBILE_UA = ("Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) "
 # Normalize away per-request noise before comparing two HTML responses, so
 # WordPress dynamics don't cause false "different"s: CSRF nonces (both the
 # JS and the <input name="_wpnonce"> form), cache-buster query params
-# (?ver=..., ?v=...), uniqid()-style hex ids (Ultimate Addons emits
-# id="ultimate-heading-<hextime>" fresh on every request), HTML comments
-# (generator/debug stamps) and whitespace. Over-normalizing is fine here --
-# worst case a truly dynamic page is classified "same".
+# (?ver=..., ?v=...), plugin-registered noise patterns (HTML_NOISE_EXTRA,
+# e.g. Ultimate Addons' per-request uniqid()/rand() element ids), HTML
+# comments (generator/debug stamps) and whitespace. Over-normalizing is
+# fine here -- worst case a truly dynamic page is classified "same".
 NONCE_RE = re.compile(
     rb"""(_wpnonce|nonce|csrf[\w-]*|token)(["']?\s*[:=]\s*["'])"""
     rb"""[A-Za-z0-9+/=._-]{6,}(["'])""", re.IGNORECASE)
@@ -245,10 +246,6 @@ WPNONCE_ATTR_RE = re.compile(
 HTML_COMMENT_RE = re.compile(rb"<!--.*?-->", re.DOTALL)
 VER_QS_RE = re.compile(rb"[?&](?:ver|v|t|cache|nocache)=[^\s\"'&<>]+",
                        re.IGNORECASE)
-HEX_ID_RE = re.compile(rb"\b[0-9a-f]{8,}\b", re.IGNORECASE)
-# Ultimate Addons & co. also emit short DECIMAL rand() suffixes fresh per
-# request (id="Info-box-wrap-9913" plus matching selectors)
-NUM_ID_RE = re.compile(rb"-\d{3,7}\b")
 WS_RE = re.compile(rb"\s+")
 
 
@@ -257,8 +254,6 @@ def normalize_html(data: bytes) -> bytes:
     data = NONCE_RE.sub(rb"\1\2\3", data)
     data = WPNONCE_ATTR_RE.sub(rb"\1", data)
     data = VER_QS_RE.sub(b"", data)
-    data = HEX_ID_RE.sub(b"H", data)
-    data = NUM_ID_RE.sub(b"-N", data)
     for rx, rep in HTML_NOISE_EXTRA:
         data = rx.sub(rep, data)
     return WS_RE.sub(b" ", data).strip()
@@ -2138,14 +2133,6 @@ class Exporter:
         work = text.replace("\\/", "/")
         for p in self.plugins:
             work = p.expand_scan_text(work)
-        # Complianz builds its banner CSS URL from a template at runtime;
-        # resolve the placeholders from the config values in the same text
-        if "{banner_id}" in work:
-            m_id = re.search(r'"user_banner_id"\s*:\s*"?(\d+)', work)
-            m_type = re.search(r'"consenttype"\s*:\s*"?(\w+)', work)
-            if m_id and m_type:
-                work = (work.replace("{banner_id}", m_id.group(1))
-                            .replace("{type}", m_type.group(1)))
         # Slider Revolution 7 constructs its runtime resource URLs from
         # SR7.E.plugin_url plus module/lib/css name lists (sr7.js:
         # plugin_url+"public/js/"+name+".js" etc.). The CSS ones are loaded
