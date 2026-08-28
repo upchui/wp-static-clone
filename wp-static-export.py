@@ -135,6 +135,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import importlib.util
 import ipaddress
 import json
 import mimetypes
@@ -210,6 +211,16 @@ PAGE_URL_ATTRS = ("data-dt-location",)
 # attributes that hold base64-encoded URLs (e.g. Slider Revolution lazy src)
 B64_URL_ATTRS = ("data-dbsrc",)
 
+# plugin-extendable registries (aggregated by load_plugins() at import time):
+# extra (bytes-regex, replacement) noise patterns normalize_html() applies
+# before its whitespace collapse
+HTML_NOISE_EXTRA: tuple = ()
+# top-level dirs whose "/dir/..." string refs inside inline scripts
+# verify_export() resolves against the export
+VERIFY_SCRIPT_REF_DIRS = ("wp-content", "wp-includes", "cf-fonts", "cdn-cgi")
+# local refs verify_export() never checks (resolved at runtime instead)
+VERIFY_SKIP_REF_PREFIXES = ("/cdn-cgi/l/email-protection",)
+
 CSS_URL_RE = re.compile(r"url\(\s*['\"]?([^'\")]+)['\"]?\s*\)", re.IGNORECASE)
 CSS_IMPORT_RE = re.compile(r"@import\s+['\"]([^'\"]+)['\"]", re.IGNORECASE)
 XML_STYLESHEET_RE = re.compile(r"<\?xml-stylesheet[^>]*href=[\"']([^\"']+)[\"']")
@@ -248,6 +259,8 @@ def normalize_html(data: bytes) -> bytes:
     data = VER_QS_RE.sub(b"", data)
     data = HEX_ID_RE.sub(b"H", data)
     data = NUM_ID_RE.sub(b"-N", data)
+    for rx, rep in HTML_NOISE_EXTRA:
+        data = rx.sub(rep, data)
     return WS_RE.sub(b" ", data).strip()
 
 
@@ -639,6 +652,179 @@ def serialize_soup(soup: BeautifulSoup, minify: bool = False) -> bytes:
     return out
 
 
+# --------------------------------------------------------------------------
+# Plugin API -- feature-specific behavior (minification, slider handling,
+# vendor/theme fixes, ...) lives in plugins/*.py next to this script; the
+# core only provides the crawl/rewrite/verify/report machinery plus the
+# hook points below.
+# --------------------------------------------------------------------------
+
+def report_section(title: str, items: list, fmt=lambda x: str(x)) -> str:
+    """One formatted report.txt section -- shared by write_report() and
+    plugin add_report() contributions."""
+    if not items:
+        return f"{title}: none\n"
+    body = "\n".join(f"  - {fmt(i)}" for i in items)
+    return f"{title} ({len(items)}):\n{body}\n"
+
+
+class Plugin:
+    """Base class for the feature plugins in plugins/*.py.
+
+    One `PLUGIN = <Plugin subclass>` per file; the core discovers and loads
+    every plugins/*.py at import time (load_plugins()), so plugin CLI flags
+    exist before parse_args() ever runs. Disable a plugin by deleting its
+    file or prefixing the file name with '_'.
+
+    Class-level registries are aggregated ONCE at load time into the
+    module-level constants (URL_ATTRS & co.). Instance hooks run per
+    export run; hooks marked [threaded] are called from crawl worker
+    threads -- guard shared mutable state with self.exp.stats_lock,
+    exactly like the core does."""
+
+    name = ""                        # unique id, e.g. "minify" -- required
+
+    # -- static registries (aggregated at load time) -----------------------
+    url_attrs: tuple = ()            # extra single-URL attributes
+    page_url_attrs: tuple = ()       # extra internal-page-link attributes
+    b64_url_attrs: tuple = ()        # extra base64-encoded-URL attributes
+    html_noise_patterns: tuple = ()  # (bytes-regex, replacement) pairs for
+                                     # normalize_html() noise stripping
+    verify_script_ref_dirs: tuple = ()    # extra VERIFY_SCRIPT_REF_DIRS
+    verify_skip_ref_prefixes: tuple = ()  # extra VERIFY_SKIP_REF_PREFIXES
+
+    # -- CLI phase (classmethods: run before any Exporter exists) ----------
+    @classmethod
+    def add_cli_args(cls, group) -> None:
+        """Register argparse options (called with this plugin's own
+        argument group)."""
+
+    @classmethod
+    def finish_args(cls, ap, args, cfg) -> None:
+        """Validate parsed args (fail via ap.error) and copy them onto
+        the Config."""
+
+    # -- per-run instance hooks --------------------------------------------
+    def __init__(self, exporter):
+        self.exp = exporter
+
+    def run_start(self) -> None:
+        """Top of Exporter.run(): environment validation / warnings."""
+
+    def pre_discover_soup(self, soup, page_url: str) -> None:
+        """[threaded] Rewrite mode, BEFORE URL discovery and rewriting --
+        mutations here are seen by both (e.g. slide hydration)."""
+
+    def clean_soup(self, soup) -> None:
+        """[threaded] Right after core strip_wp_cruft() (same gates)."""
+
+    def rewrite_soup(self, soup) -> None:
+        """[threaded] Right after core rewrite_soup_relative()."""
+
+    def expand_scan_text(self, work: str) -> str:
+        """[threaded] Pre-transform of JS/JSON text before the URL sweep
+        (e.g. resolving runtime URL-template placeholders)."""
+        return work
+
+    def scan_text_urls(self, work: str) -> tuple[list, list]:
+        """[threaded] (page_urls, asset_urls) derived from runtime
+        URL-construction patterns in JS/JSON text."""
+        return [], []
+
+    def skip_page_path(self, path: str) -> bool:
+        """True when this URL path must never be treated as a page."""
+        return False
+
+    def filter_text_asset(self, url: str, kind: str, text: str) -> str:
+        """[threaded] Last transform of a rewritten text asset
+        (kind: 'css' | 'js') before it is encoded and written."""
+        return text
+
+    def text_asset_written(self, kind: str, orig_len: int,
+                           new_len: int) -> None:
+        """[threaded] A transformed text asset was written
+        (kind: 'html' | 'css' | 'js') -- stats notification."""
+
+    def pre_serialize(self, soup) -> None:
+        """[threaded] Inside Exporter.serialize(), before str(soup)."""
+
+    def post_serialize(self, data: bytes) -> bytes:
+        """[threaded] Last step on the serialized HTML bytes."""
+        return data
+
+    def wants_postprocess(self) -> bool:
+        """True when postprocess_soup() has work to do -- gates the extra
+        read-modify-write pass over every exported HTML page."""
+        return False
+
+    def postprocess_soup(self, soup) -> bool:
+        """Post-crawl transform of an exported page; True = changed."""
+        return False
+
+    def summary_lines(self) -> list[str]:
+        """Console lines for the final run() summary."""
+        return []
+
+    def add_report(self, report: dict, txt_head: list,
+                   txt_sections: list) -> None:
+        """Contribute to report.json (mutate report) and report.txt
+        (append 'Label:  value' head lines / report_section() blocks)."""
+
+
+PLUGIN_REGISTRY: list[type[Plugin]] = []
+PLUGIN_MODULES: dict = {}            # plugin name -> loaded module
+
+
+def _load_plugin_file(path: Path) -> tuple:
+    """Load one plugin file; returns (module, PLUGIN class). A plugin that
+    raises during import propagates -- a half-loaded feature set must never
+    silently produce a degraded export (same fail-loudly policy as the
+    missing-minifier check)."""
+    mod_name = f"wps_plugin_{path.stem}"
+    spec = importlib.util.spec_from_file_location(mod_name, path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[mod_name] = module   # findable for tests / monkeypatching
+    spec.loader.exec_module(module)
+    cls = getattr(module, "PLUGIN", None)
+    if not (isinstance(cls, type) and issubclass(cls, Plugin) and cls.name):
+        sys.exit(f"{TOOL_NAME}: {path.name}: no PLUGIN = <Plugin subclass "
+                 f"with a name> found")
+    return module, cls
+
+
+def _scan_plugins(plugins_dir: Path) -> list[tuple]:
+    """Load every plugins/*.py (sorted; '_'-prefixed files are skipped)."""
+    if not plugins_dir.is_dir():
+        sys.exit(f"{TOOL_NAME}: plugins directory not found: {plugins_dir}\n"
+                 f"The tool ships with a plugins/ folder next to the script "
+                 f"(minification, slider handling, vendor fixes live there) "
+                 f"-- restore it, or create an empty one to run bare.")
+    return [_load_plugin_file(p) for p in sorted(plugins_dir.glob("*.py"))
+            if not p.name.startswith("_")]
+
+
+def load_plugins(plugins_dir: Path | None = None) -> None:
+    """Discover and register all plugins, then aggregate their static
+    registries into the module-level constants. Idempotent -- runs once at
+    the bottom of this module."""
+    global URL_ATTRS, PAGE_URL_ATTRS, B64_URL_ATTRS, HTML_NOISE_EXTRA
+    global VERIFY_SCRIPT_REF_DIRS, VERIFY_SKIP_REF_PREFIXES
+    if PLUGIN_REGISTRY:
+        return
+    pdir = plugins_dir or Path(__file__).resolve().parent / "plugins"
+    for module, cls in _scan_plugins(pdir):
+        if cls.name in PLUGIN_MODULES:
+            sys.exit(f"{TOOL_NAME}: duplicate plugin name {cls.name!r}")
+        PLUGIN_REGISTRY.append(cls)
+        PLUGIN_MODULES[cls.name] = module
+        URL_ATTRS += tuple(cls.url_attrs)
+        PAGE_URL_ATTRS += tuple(cls.page_url_attrs)
+        B64_URL_ATTRS += tuple(cls.b64_url_attrs)
+        HTML_NOISE_EXTRA += tuple(cls.html_noise_patterns)
+        VERIFY_SCRIPT_REF_DIRS += tuple(cls.verify_script_ref_dirs)
+        VERIFY_SKIP_REF_PREFIXES += tuple(cls.verify_skip_ref_prefixes)
+
+
 class HostResolveAdapter(HTTPAdapter):
     """HTTPAdapter that pins TLS SNI / certificate verification to a fixed
     hostname while the URL targets an IP address -- the requests-level
@@ -848,6 +1034,10 @@ class Exporter:
         # skipped if not -- a 404 here is not an export error
         self.speculative_urls: set[str] = set()
 
+        # fresh plugin instances per run -- plugin state (stats, caches)
+        # must never leak between Exporter instances
+        self.plugins: list[Plugin] = [cls(self) for cls in PLUGIN_REGISTRY]
+
     def _build_host_regexes(self) -> None:
         """(Re)build the host-matching regexes for URL localization from
         the CURRENT internal_norms; called again when hosts are absorbed
@@ -939,6 +1129,24 @@ class Exporter:
     def _minify_on(self) -> bool:
         return (self.cfg.rewrite and self.cfg.minify
                 and rjsmin is not None and rcssmin is not None)
+
+    def plugin(self, name: str) -> Plugin:
+        """The per-run instance of the named plugin."""
+        for p in self.plugins:
+            if p.name == name:
+                return p
+        raise KeyError(f"plugin {name!r} not loaded")
+
+    def serialize(self, soup: BeautifulSoup) -> bytes:
+        """Serialize a page soup through the plugin hooks: pre_serialize
+        (tree-level, e.g. inline CSS/JS minification), str(), then
+        post_serialize (byte-level, e.g. whitespace collapsing)."""
+        for p in self.plugins:
+            p.pre_serialize(soup)
+        out = serialize_soup(soup, self._minify_on)
+        for p in self.plugins:
+            out = p.post_serialize(out)
+        return out
 
     def say(self, msg: str) -> None:
         """Progress chatter -- silenced by --quiet (warnings and the final
@@ -1041,6 +1249,8 @@ class Exporter:
         if (path.startswith(("/cdn-cgi/", "/wpforms-ajax"))
                 or (path.startswith(("/wp-content/", "/wp-includes/"))
                     and not path_extension(path))):
+            return None
+        if any(p.skip_page_path(path) for p in self.plugins):
             return None
         # extensionless page URLs get a trailing slash (WordPress canonical form)
         if not path.endswith("/") and not path_extension(path):
@@ -1729,10 +1939,13 @@ class Exporter:
                             rec: PageRecord | None,
                             save_as: Path | None = None) -> tuple[list[str], list[str]]:
         soup = BeautifulSoup(raw, "html.parser")
-        if self.cfg.rewrite and self.cfg.sr7_hydrate:
-            # must run BEFORE discovery + rewrite: both need to see the
-            # hydrated SR7 blob (later-slide images!)
-            self._hydrate_sr7(soup)
+        if self.cfg.rewrite:
+            if self.cfg.sr7_hydrate:
+                # must run BEFORE discovery + rewrite: both need to see the
+                # hydrated SR7 blob (later-slide images!)
+                self._hydrate_sr7(soup)
+            for p in self.plugins:
+                p.pre_discover_soup(soup, page_url)
         new_pages: list[str] = []
         new_assets: list[str] = []
 
@@ -1888,8 +2101,12 @@ class Exporter:
             if self.cfg.rewrite:
                 if self.cfg.strip_wp_cruft:
                     self.strip_wp_cruft(soup)
+                    for p in self.plugins:
+                        p.clean_soup(soup)
                 self.rewrite_soup_relative(soup)
-                out = serialize_soup(soup, self._minify_on)
+                for p in self.plugins:
+                    p.rewrite_soup(soup)
+                out = self.serialize(soup)
                 written = self.write_bytes(target, out)
                 if written is not None and self._minify_on:
                     with self.stats_lock:
@@ -1897,6 +2114,8 @@ class Exporter:
                         self.minify_stats["bytes_saved"] += max(
                             0, len(raw) - len(out))
                 if written is not None:
+                    for p in self.plugins:
+                        p.text_asset_written("html", len(raw), len(out))
                     with self.stats_lock:
                         # postprocess_html may only touch files WE
                         # actually re-serialized and wrote
@@ -1917,6 +2136,8 @@ class Exporter:
         if not text or not self.host_probe_re.search(text):
             return pages, assets
         work = text.replace("\\/", "/")
+        for p in self.plugins:
+            work = p.expand_scan_text(work)
         # Complianz builds its banner CSS URL from a template at runtime;
         # resolve the placeholders from the config values in the same text
         if "{banner_id}" in work:
@@ -1956,6 +2177,10 @@ class Exporter:
                             f"{posixpath.join(base, cand)}")
                 self.speculative_urls.add(absolute)
                 assets.append(absolute)
+        for p in self.plugins:
+            pg, ast = p.scan_text_urls(work)
+            pages.extend(pg)
+            assets.extend(ast)
         for m in self.text_url_re.finditer(work):
             ref = (m.group(1) or "/").rstrip(".,;:")
             if "{" in ref or "}" in ref or "*" in ref:
@@ -2304,6 +2529,8 @@ class Exporter:
                 minify = self._minify_on
                 if minify:
                     new_text = minify_css(new_text)
+                for p in self.plugins:
+                    new_text = p.filter_text_asset(url, "css", new_text)
                 if new_text != text:
                     # transcode only what we changed; the file is now UTF-8,
                     # so a declared legacy @charset must say so too
@@ -2314,6 +2541,9 @@ class Exporter:
                             self.minify_stats["css"] += 1
                             self.minify_stats["bytes_saved"] += max(
                                 0, len(resp.content) - len(data))
+                    for p in self.plugins:
+                        p.text_asset_written("css", len(resp.content),
+                                             len(data))
         elif ext in ("js", "mjs") or "javascript" in ctype:
             text = decode_text_asset(resp)
             page_refs, asset_refs = self.scan_text_for_urls(text)
@@ -2326,6 +2556,8 @@ class Exporter:
                 minify = self._minify_on
                 if minify:
                     new_text = minify_js(new_text)
+                for p in self.plugins:
+                    new_text = p.filter_text_asset(url, "js", new_text)
                 if new_text != text:
                     data = new_text.encode("utf-8")
                     if minify:
@@ -2333,6 +2565,9 @@ class Exporter:
                             self.minify_stats["js"] += 1
                             self.minify_stats["bytes_saved"] += max(
                                 0, len(resp.content) - len(data))
+                    for p in self.plugins:
+                        p.text_asset_written("js", len(resp.content),
+                                             len(data))
 
         target = self.local_path_for(url, is_page=False)
         if target:
@@ -2548,7 +2783,8 @@ class Exporter:
             return
         do_images = self.cfg.optimize_images
         do_staging = self.cfg.staging
-        if not (do_images or do_staging or self.download_map):
+        if not (do_images or do_staging or self.download_map
+                or any(p.wants_postprocess() for p in self.plugins)):
             return
         # only files parse_and_save_html re-serialized -- HTML *assets* were
         # stored byte-identical and must stay that way
@@ -2565,11 +2801,13 @@ class Exporter:
                 changed |= self._inject_staging_meta(soup)
             if do_images:
                 changed |= self._optimize_images(soup)
+            for p in self.plugins:
+                changed |= p.postprocess_soup(soup)
             if self.download_map:
                 changed |= self._rewrite_download_links(soup)
             if changed:
                 try:
-                    html_file.write_bytes(serialize_soup(soup, self._minify_on))
+                    html_file.write_bytes(self.serialize(soup))
                 except OSError as exc:
                     self.warnings.append(f"postprocess: cannot write "
                                          f"{html_file.name}: {exc}")
@@ -2737,8 +2975,10 @@ class Exporter:
             if ("{" in ref or "*" in ref
                     or PAGE_SKIP_PATTERNS.search(ref.split("?")[0])):
                 return  # runtime template / glob pattern / dynamic endpoint
-            if ref.startswith("/cdn-cgi/l/email-protection"):
-                return  # decoded to mailto: at runtime, never fetched
+            if VERIFY_SKIP_REF_PREFIXES and ref.startswith(
+                    VERIFY_SKIP_REF_PREFIXES):
+                return  # resolved at runtime (e.g. decoded to mailto:),
+                        # never fetched by browsers
             if exists_local(ref):
                 return
             key = (rel_file, ref)
@@ -2749,6 +2989,13 @@ class Exporter:
                 "file": rel_file, "ref": ref,
                 "origin_error": unicodedata.normalize(
                     "NFC", unquote(ref.split("?")[0])) in origin_404})
+
+        # "/dir/..." string refs inside inline scripts (JS configs join file
+        # names onto these); the dir list is plugin-extendable
+        script_ref_re = re.compile(
+            r"""["'](/(?:"""
+            + "|".join(re.escape(d) for d in VERIFY_SCRIPT_REF_DIRS)
+            + r""")/[^"'\s\\]+?)["'\\]""")
 
         for html_file in sorted(self.public_dir.rglob("*.html")):
             rel_file = html_file.relative_to(self.public_dir).as_posix()
@@ -2808,9 +3055,7 @@ class Exporter:
                 if self.host_probe_re.search(script.string):
                     note_unexpected(rel_file, "<script> block")
                 text = script.string.replace("\\/", "/")
-                for ref in re.findall(
-                        r"""["'](/(?:wp-content|wp-includes|cf-fonts|cdn-cgi)"""
-                        r"""/[^"'\s\\]+?)["'\\]""", text):
+                for ref in script_ref_re.findall(text):
                     check_ref(rel_file, ref)
 
         for css_file in sorted(self.public_dir.rglob("*.css")):
@@ -3381,14 +3626,16 @@ esac
             },
             "warnings": self.warnings,
         }
+        # plugin contributions: report.json keys, report.txt head lines and
+        # full report.txt sections -- BEFORE the dump below
+        txt_head: list[str] = []
+        txt_sections: list[str] = []
+        for p in self.plugins:
+            p.add_report(report, txt_head, txt_sections)
         (self.cfg.out_dir / "report.json").write_text(
             json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
 
-        def section(title: str, items: list, fmt=lambda x: str(x)) -> str:
-            if not items:
-                return f"{title}: none\n"
-            body = "\n".join(f"  - {fmt(i)}" for i in items)
-            return f"{title} ({len(items)}):\n{body}\n"
+        section = report_section
 
         txt = [
             f"{TOOL_NAME} {VERSION} -- export report",
@@ -3408,6 +3655,7 @@ esac
             "WP cruft removed: " + (", ".join(
                 f"{k}={v}" for k, v in sorted(self.cruft_removed.items()))
                 or "none"),
+            *txt_head,
             (f"Images:          {self.img_stats['lazy']}x loading=lazy, "
              f"{self.img_stats['dimensions']}x width/height injected, "
              f"{self.img_stats['skipped_plugin']}x plugin-lazyload skipped"
@@ -3465,6 +3713,7 @@ esac
             section("Verification: unexpected absolute self-references",
                     self.verify_unexpected,
                     lambda v: f"{v['file']} -> {v['ref']}"),
+            *txt_sections,
             section("Warnings", self.warnings),
         ]
         (self.cfg.out_dir / "report.txt").write_text("\n".join(txt), encoding="utf-8")
@@ -3498,6 +3747,8 @@ esac
             self.warnings.append(
                 "minification skipped: rjsmin/rcssmin not installed "
                 "(pip install rjsmin rcssmin)")
+        for p in self.plugins:
+            p.run_start()
         if self.cfg.staging and self.cfg.target_domain:
             self.warnings.append(
                 "--staging blocks all indexing -- --target-domain only "
@@ -3555,6 +3806,9 @@ esac
         if self.download_map:
             print(f"[seo] {len(self.download_map)} download endpoints "
                   f"materialized as files (links rewritten, 301s generated)")
+        for p in self.plugins:
+            for line in p.summary_lines():
+                print(line)
         if self._minify_on and any(self.minify_stats.values()):
             print(f"[seo] minified: {self.minify_stats['html']} HTML, "
                   f"{self.minify_stats['css']} CSS, "
@@ -3807,6 +4061,8 @@ Notes:
                          "slide 1 statically (they fetch later slides from "
                          "wp-json at runtime); hydration performs the only "
                          "wp-json request the exporter ever makes")
+    for cls in PLUGIN_REGISTRY:
+        cls.add_cli_args(ap.add_argument_group(f"plugin: {cls.name}"))
     args = ap.parse_args(argv)
 
     if args.minify and args.rewrite and (rjsmin is None or rcssmin is None):
@@ -3884,6 +4140,8 @@ Notes:
         resolve_internal=args.resolve_internal,
         minify=args.minify,
     )
+    for cls in PLUGIN_REGISTRY:
+        cls.finish_args(ap, args, cfg)
     if args.user_agent:
         cfg.user_agent = args.user_agent
     if args.mobile_user_agent:
@@ -3898,6 +4156,17 @@ def main(argv: list[str]) -> int:
     except KeyboardInterrupt:
         print("\nAborted.", file=sys.stderr)
         return 130
+
+
+# --------------------------------------------------------------------------
+# Plugin bootstrap -- MUST stay the last top-level statements before the
+# __main__ guard: plugin files do `from wp_static_export import Plugin`
+# while this module is still executing, so every definition above has to
+# exist already. The sys.modules alias makes that import work in script
+# mode too (where __name__ == "__main__"); under pytest the conftest
+# registers the module before executing it.
+sys.modules.setdefault("wp_static_export", sys.modules[__name__])
+load_plugins()
 
 
 if __name__ == "__main__":
