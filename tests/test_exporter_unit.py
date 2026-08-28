@@ -513,33 +513,37 @@ def test_hydrate_sr7_merges_lazy_slides(mod, tmp_path):
             "7": {"bg": {"image": {"src": "https://example.at/s2.png"}}}}},
     }}
     e, calls = _sr7_exporter(mod, tmp_path, resp)
+    sr7 = e.plugin("slider_revolution")
     soup = BeautifulSoup(SR7_HTML, "html.parser")
-    e._hydrate_sr7(soup)
+    sr7.pre_discover_soup(soup, "https://example.at/")
     out = str(soup)
     assert '"slide":{"id":3},"layers":{"7":' in out       # lazy slide filled
     assert '"layers":{"5":{"x":1}}' in out                # slide 1 untouched
     assert '"global":true},"layers":[]' in out            # global untouched
-    assert e.sr7_hydrated == {"SR7_2_1": 1}
+    assert sr7.hydrated == {"SR7_2_1": 1}
     assert calls == ["https://example.at/wp-json/sliderrevolution/"
                      "sliders/2?srengine=7"]
     # second page with the same slider: served from the cache
-    e._hydrate_sr7(BeautifulSoup(SR7_HTML, "html.parser"))
+    sr7.pre_discover_soup(BeautifulSoup(SR7_HTML, "html.parser"),
+                          "https://example.at/")
     assert len(calls) == 1
 
 
 def test_hydrate_sr7_rest_failure_warns(mod, tmp_path):
     e, calls = _sr7_exporter(mod, tmp_path, None)         # 404
+    sr7 = e.plugin("slider_revolution")
     soup = BeautifulSoup(SR7_HTML, "html.parser")
-    e._hydrate_sr7(soup)
+    sr7.pre_discover_soup(soup, "https://example.at/")
     assert '"layers":[]' in str(soup)                     # blob unchanged
-    assert e.sr7_hydrated == {}
+    assert sr7.hydrated == {}
     assert any("freeze" in w for w in e.warnings)
 
 
 def test_hydrate_sr7_noop_without_lazy_slides(mod, tmp_path):
     e, calls = _sr7_exporter(mod, tmp_path, {"success": True, "slides": {}})
     html = SR7_HTML.replace('"3":{"slide":{"id":3},"layers":[]},', "")
-    e._hydrate_sr7(BeautifulSoup(html, "html.parser"))
+    e.plugin("slider_revolution").pre_discover_soup(
+        BeautifulSoup(html, "html.parser"), "https://example.at/")
     assert calls == []                                    # no wp-json request
 
 
