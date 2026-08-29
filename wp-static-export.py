@@ -35,9 +35,11 @@ What it does
 SEO behaviour
 -------------
 * A fresh /sitemap.xml is generated from the URL set the ORIGIN SITEMAP
-  declared and the export contains (noindex'ed pages, redirect sources and
-  canonical mismatches excluded, link-only discoveries like attachment
-  pages stay out unless --sitemap-include-linked, <lastmod> from the
+  declared and the export contains (noindex'ed pages, redirect sources,
+  canonical mismatches and machine-generated artifact pages -- WordPress
+  attachment/cache pages, which a Yoast attachment sitemap happily lists
+  -- excluded; link-only discoveries stay out unless
+  --sitemap-include-linked, <lastmod> from the
   Last-Modified header), and the robots.txt Sitemap: line is pointed at
   it. --no-generate-sitemap instead keeps the origin sitemap files
   unchanged (except their XSL stylesheet reference, which is localized),
@@ -2319,36 +2321,64 @@ class Exporter:
                   or xfp.strip().lower() == "https" else "http")
         return f"{scheme}://{self.host}"
 
+    def index_exclusion(self, p: PageRecord) -> str:
+        """Why a crawled page must NOT be listed in the generated sitemap
+        nor be offered by the site search -- "" when it belongs in both.
+
+        The single source of truth for "is this a real, indexable page":
+        the generated sitemap and plugins/search.py both consult it, so
+        the two answers can never drift apart."""
+        if p.error or "html" not in p.content_type:
+            return "not-a-page"
+        if p.is_stub:
+            return "redirect-stub"      # only a redirect stub lives here
+        if p.artifact:
+            # machine-generated non-content page. Checked BEFORE the
+            # link-only rule: a WordPress attachment sitemap lists these
+            # itself, so "the origin sitemap knows it" proves nothing.
+            return p.artifact
+        if (p.source != "sitemap" and self.sitemap_discovery_ok
+                and not self.cfg.sitemap_include_linked):
+            # the origin sitemap did not list it -- don't ask Google to
+            # index what the site itself does not advertise
+            return "link-only"
+        if p.noindex:
+            return "noindex"
+        if (p.canonical and self.is_internal(p.canonical)
+                and self.canonical_target(p) != (p.save_url or p.url)):
+            return "canonical-mismatch"  # it declares another URL canonical
+        return ""
+
     def write_generated_sitemap(self) -> None:
         """Write /sitemap.xml describing the exported URL set. The origin
         sitemaps may list dropped query URLs, noindexed or redirected pages
         -- this one is truthful about what the mirror actually serves."""
         entries: dict[str, str] = {}            # save_url -> lastmod ISO date
         excluded_noindex = excluded_canonical = 0
-        excluded_redirects = excluded_linked = 0
+        excluded_redirects = excluded_linked = excluded_artifacts = 0
         for p in self.pages:
-            if p.error or "html" not in p.content_type:
+            reason = self.index_exclusion(p)
+            if reason == "not-a-page":
                 continue
-            if p.is_stub:
-                excluded_redirects += 1     # only a redirect stub lives here
+            if reason == "redirect-stub":
+                excluded_redirects += 1
                 continue
-            if (p.source != "sitemap" and self.sitemap_discovery_ok
-                    and not self.cfg.sitemap_include_linked):
-                # the origin sitemap deliberately excluded these (attachment
-                # pages, cache dirs, ...) -- don't ask Google to index them
+            if reason == "link-only":
                 excluded_linked += 1
+                continue
+            if reason and reason not in ("noindex", "canonical-mismatch"):
+                excluded_artifacts += 1     # attachment / cache page
                 continue
             sm_url = p.save_url or p.url
             if sm_url != p.url:
                 excluded_redirects += 1         # source path not listed; the
                                                 # redirect target still is
-            if p.noindex:
+            if reason == "noindex":
                 excluded_noindex += 1
                 continue
-            if (p.canonical and self.is_internal(p.canonical)
-                    and self.canonical_target(p) != sm_url):
-                excluded_canonical += 1         # page declares another URL as
-                continue                        # canonical -- list that one
+            if reason == "canonical-mismatch":
+                excluded_canonical += 1
+                continue
             lastmod = ""
             if p.last_modified:
                 try:
@@ -2389,11 +2419,13 @@ class Exporter:
             "excluded_noindex": excluded_noindex,
             "excluded_canonical_mismatch": excluded_canonical,
             "excluded_link_discovered": excluded_linked,
+            "excluded_artifacts": excluded_artifacts,
             "redirected_source_urls_not_listed": excluded_redirects,
         }
         extras = [f"{n} {label} excluded"
                   for n, label in ((excluded_noindex, "noindex"),
-                                   (excluded_linked, "link-only"))
+                                   (excluded_linked, "link-only"),
+                                   (excluded_artifacts, "artifact"))
                   if n]
         self.say(f"[seo] sitemap.xml generated: {len(entries)} URLs"
                  + (f" ({', '.join(extras)})" if extras else ""))
@@ -3247,7 +3279,9 @@ esac
             f"Assets exported: {self.asset_count}",
             (f"Sitemap:         generated /sitemap.xml "
              f"({self.generated_sitemap['url_count']} URLs, "
-             f"{self.generated_sitemap['excluded_noindex']} noindex excluded)"
+             f"{self.generated_sitemap['excluded_noindex']} noindex, "
+             f"{self.generated_sitemap['excluded_artifacts']} artifact "
+             f"excluded)"
              if self.generated_sitemap else
              f"Sitemap files:   {len(self.sitemap_files)} (origin, verbatim)"),
             f"robots.txt:      {self.robots_action}"
@@ -3560,8 +3594,8 @@ Notes:
     ap.add_argument("--sitemap-include-linked", action="store_true",
                     help="also list link-discovered pages in the generated "
                          "sitemap.xml (default: only pages the origin "
-                         "sitemap declared -- attachment pages and cache "
-                         "artifacts found via links stay out)")
+                         "sitemap declared). Attachment and cache pages are "
+                         "filtered separately -- see --list-attachment-pages")
     ap.add_argument("--fail-on", choices=("none", "errors", "verify"),
                     default="none",
                     help="exit-code policy for CI: 'errors' fails (exit 1) "

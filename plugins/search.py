@@ -886,24 +886,17 @@ class Search(Plugin):
         return None
 
     def _selected_pages(self) -> list:
-        """(save_url, PageRecord) of every page that belongs in the index --
-        the SAME filter write_generated_sitemap() applies, so the search
-        never offers a URL the mirror does not serve."""
-        exp, cfg = self.exp, self.exp.cfg
+        """(save_url, PageRecord) of every page that belongs in the index.
+
+        Exporter.index_exclusion() is the SAME classifier the generated
+        sitemap uses, so the search can never offer a URL the sitemap
+        considers unfit (nor miss one it lists)."""
+        exp = self.exp
         seen: dict = {}
         for p in exp.pages:
-            if p.error or "html" not in p.content_type or p.is_stub:
+            if exp.index_exclusion(p):
                 continue
-            if (p.source != "sitemap" and exp.sitemap_discovery_ok
-                    and not cfg.sitemap_include_linked):
-                continue
-            if p.noindex:
-                continue
-            url = p.save_url or p.url
-            if (p.canonical and exp.is_internal(p.canonical)
-                    and exp.canonical_target(p) != url):
-                continue
-            seen.setdefault(url, p)
+            seen.setdefault(p.save_url or p.url, p)
         return sorted(seen.items())
 
     # -- phase 3: wire every exported page -----------------------------------

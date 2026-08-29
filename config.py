@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 TOOL_NAME = "wp-static-export"
-VERSION = "2.7.0"
+VERSION = "2.8.0"
 
 
 @dataclass
@@ -68,3 +68,10 @@ class PageRecord:
     save_url: str = ""               # canonical URL the content was saved under
                                      # (differs from url for redirect sources)
     is_stub: bool = False            # only a redirect stub was written here
+    artifact: str = ""               # machine-generated non-content page (a
+                                     # WordPress attachment/cache page): it
+                                     # stays on disk, but is never listed in
+                                     # sitemap.xml nor offered by the site
+                                     # search. Reason token, e.g.
+                                     # "wp-attachment" / "phpthumb-cache"
+                                     # (plugin-owned: plugins/wordpress.py)

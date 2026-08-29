@@ -356,6 +356,10 @@ def _prepare(mod, exporter, plug, with_404=True):
         _page(mod, "https://example.at/alt/", title="Alt",
               save_url="https://example.at/fassaden/", is_stub=True),
         _page(mod, "https://example.at/err/", title="Err", error="HTTP 500"),
+        # WordPress attachment page: in the origin's attachment sitemap,
+        # so source="sitemap" -- only the artifact flag keeps it out
+        _page(mod, "https://example.at/partner/logo/", title="logo",
+              artifact="wp-attachment"),
     ]
     plug.pre_discover_soup(BeautifulSoup(PAGE, "html.parser"),
                            "https://example.at/fassaden/")
@@ -390,6 +394,7 @@ def test_run_end_writes_index_with_sitemap_filter(mod, exporter, plug):
     assert "/anhang/" not in paths          # link-only
     assert "/alt/" not in paths             # redirect stub
     assert "/err/" not in paths             # failed
+    assert "/partner/logo/" not in paths    # WP attachment artifact
     doc = data["docs"][0]
     assert doc[1] == "Fassaden"             # site suffix stripped
     assert doc[2] == "Wärmeschutzfassaden und mehr"

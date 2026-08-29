@@ -1,5 +1,38 @@
 # Changelog
 
+## 2.8.0 (2026-08-30)
+
+### Fixed
+- **WordPress artifact pages no longer pollute `sitemap.xml` and the
+  site search.** WordPress gives every uploaded file its own attachment
+  page, and image plugins add cache directories (phpThumb & co.). The
+  previous rule -- "keep what the origin sitemap declared" -- let all of
+  them through, because Yoast's *attachment sitemap* declares them: on
+  the reference site 30 of 42 sitemap entries and 30 of 42 search
+  documents were logos, cache dirs and image pages (`sitemap.xml` is now
+  15 URLs, the search index 15 documents, all of them real content).
+  They are still exported -- a theme's lightbox may link to them -- but
+  are advertised nowhere. `--list-attachment-pages` restores the old
+  behavior for sites where the attachment page *is* the content.
+  - Detection is WordPress' own `body_class()` output (whole class
+    tokens `attachment` / `attachment-template-default` /
+    `single-attachment` / `attachmentid-N` on `<body>`), so it is
+    theme-independent; measured on the reference site it flags 30 of 30
+    artifacts and 0 of 17 content pages. Cache directories are also
+    caught by URL (`phpthumb_cache…`) for themes that do not emit the
+    body classes.
+
+### Changed
+- New `Exporter.index_exclusion(page)` is now the single source of truth
+  for "does this page belong in the generated sitemap and the site
+  search". `write_generated_sitemap` and `plugins/search.py` both use
+  it, so the two answers can no longer drift apart -- the duplicated
+  filter is exactly why this bug hit both outputs at once. The sitemap
+  report gains an `excluded_artifacts` counter; every existing counter
+  key is unchanged.
+- New plugin-owned `PageRecord.artifact` field (written by
+  `plugins/wordpress.py`).
+
 ## 2.7.0 (2026-08-29)
 
 The static search-results page now looks like the live one.

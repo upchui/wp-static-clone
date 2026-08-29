@@ -299,6 +299,22 @@ def test_static_search_exported(export):
     assert stats["forms_rewritten"] >= 1
 
 
+def test_artifact_pages_excluded_but_exported(export):
+    """A WordPress attachment page the ORIGIN's own sitemap declares:
+    exported (a lightbox may link to it), but never advertised."""
+    pub = export["public"]
+    assert (pub / "partner" / "logo" / "index.html").is_file()
+    xml = (pub / "sitemap.xml").read_text(encoding="utf-8")
+    assert "/partner/logo/" not in xml
+    assert export["report"]["sitemap"]["excluded_artifacts"] == 1
+    index = json.loads((pub / "search-index.json").read_text("utf-8"))
+    assert "/partner/logo/" not in [d[0] for d in index["docs"]]
+    stats = export["report"]["seo"]["artifact_pages"]
+    assert stats["attachment_pages"] == 1 and stats["listed"] is False
+    # keeping it on disk is what keeps verification green
+    assert export["report"]["verification"]["missing_local_files"] == []
+
+
 def test_static_search_uses_the_live_design(export):
     """The results page must be the THEME's search page, not our own
     markup: harvested container, harvested card template, harvested

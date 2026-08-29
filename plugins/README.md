@@ -180,7 +180,7 @@ Hooks returning a value are filters; the rest are notifications.
 | `post_serialize(data) -> bytes` [T] | last step on the serialized HTML bytes | minify (whitespace/comments) |
 | `text_asset_written(kind, orig_len, new_len)` [T] | a transformed text asset was written (`"html"`/`"css"`/`"js"`) — stats notification | minify |
 | `page_fetched(url, resp, rec)` [T] | successful same-site HTML response, BEFORE the redirect-stub/save decision | mobile_check (Vary header) |
-| `page_saved(save_url, resp, rec)` [T] | after a real (non-stub) page was parsed and saved | mobile_check (UA comparison) |
+| `page_saved(save_url, resp, rec)` [T] | after a real (non-stub) page was parsed and saved | mobile_check (UA comparison), wordpress (artifact-page flag) |
 | `save_non_html_response(url, resp) -> bool` [T] | claim a non-HTML response on a page/extensionless URL; `True` = claimed, first claimant wins | downloads |
 | `filter_text_asset(url, kind, text) -> str` [T] | LAST transform of a rewritten CSS/JS asset before it is written | minify |
 | `wants_postprocess() -> bool` | gates the post-crawl read-modify-write pass over every exported page | image_optimize, downloads |
@@ -195,6 +195,14 @@ Hooks returning a value are filters; the rest are notifications.
 Plugins are **trusted local code**: they get the full `Exporter`. The
 pieces plugins actually use:
 
+* `exp.pages` — the `PageRecord` list. A few of its fields are
+  **plugin-owned**: declared in [`config.py`](../config.py) with a
+  `(plugin-owned: plugins/<name>.py)` comment so direct construction and
+  the report keep working, but written by exactly one plugin —
+  `mobile` (mobile_check) and `artifact` (wordpress). The core reads
+  them: `artifact` makes `exp.index_exclusion(p)` drop the page from
+  `sitemap.xml` **and** the site search, which is the one classifier
+  both outputs consult, so they can never disagree.
 * `exp.cfg` — the run's `Config`. The core fields live in
   [`config.py`](../config.py) next to the script (importable as
   `wps_config`); options a plugin owns are declared IN THE PLUGIN via

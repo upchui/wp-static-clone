@@ -203,6 +203,53 @@ def test_generated_sitemap_filters(mod, exporter):
     assert exporter.generated_sitemap["excluded_link_discovered"] == 1
 
 
+# -- v2.8.0: artifact pages stay out of sitemap.xml and the site search -----
+
+def test_index_exclusion_reasons(mod, exporter):
+    exporter.sitemap_discovery_ok = True
+    ex = exporter.index_exclusion
+    assert ex(_page(mod, "https://example.at/")) == ""
+    assert ex(_page(mod, "https://example.at/x/", error="HTTP 500")) == \
+        "not-a-page"
+    assert ex(mod.PageRecord(url="https://example.at/x/",
+                             content_type="application/pdf")) == "not-a-page"
+    assert ex(_page(mod, "https://example.at/x/", is_stub=True)) == \
+        "redirect-stub"
+    assert ex(_page(mod, "https://example.at/x/", source="link")) == \
+        "link-only"
+    assert ex(_page(mod, "https://example.at/x/", noindex=True)) == "noindex"
+    assert ex(_page(mod, "https://example.at/x/",
+                    canonical="https://example.at/y/")) == \
+        "canonical-mismatch"
+    # the artifact reason is passed through verbatim ...
+    assert ex(_page(mod, "https://example.at/logo/",
+                    artifact="wp-attachment")) == "wp-attachment"
+    # ... and beats the link-only rule: an attachment sitemap lists these
+    # itself, so "the origin declared it" proves nothing
+    assert ex(_page(mod, "https://example.at/logo/", source="sitemap",
+                    artifact="phpthumb-cache")) == "phpthumb-cache"
+
+
+def test_generated_sitemap_excludes_artifacts(mod, exporter):
+    exporter.public_dir.mkdir(parents=True, exist_ok=True)
+    exporter.sitemap_discovery_ok = True
+    exporter.pages = [
+        _page(mod, "https://example.at/"),
+        # the origin's attachment sitemap declares these itself
+        _page(mod, "https://example.at/ueber-uns/partner/logo/",
+              artifact="wp-attachment"),
+        _page(mod, "https://example.at/phpthumb_cache_x_dat1382978924/",
+              artifact="phpthumb-cache"),
+    ]
+    exporter.write_generated_sitemap()
+    xml = (exporter.public_dir / "sitemap.xml").read_text()
+    assert "https://example.at/</loc>" in xml
+    assert "/partner/logo/" not in xml and "phpthumb_cache" not in xml
+    assert exporter.generated_sitemap["excluded_artifacts"] == 2
+    assert exporter.generated_sitemap["excluded_link_discovered"] == 0
+    assert exporter.generated_sitemap["url_count"] == 1
+
+
 def test_generated_sitemap_empty_not_written(mod, exporter):
     exporter.public_dir.mkdir(parents=True, exist_ok=True)
     exporter.pages = [_page(mod, "https://example.at/x/", error="boom")]

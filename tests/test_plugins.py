@@ -144,3 +144,103 @@ def test_exporter_gets_fresh_plugin_instances(mod, tmp_path):
     assert len(e1.plugins) == len(mod.PLUGIN_REGISTRY)
     assert all(p.exp is e1 for p in e1.plugins)
     assert not (set(map(id, e1.plugins)) & set(map(id, e2.plugins)))
+
+
+# -- v2.8.0: WordPress artifact-page detection -------------------------------
+
+# verbatim body class attributes from the real site
+ARTIFACT_CLASSES = (
+    "attachment wp-singular attachment-template-default attachmentid-1164 "
+    "attachment-png wp-embed-responsive wp-theme-dt-the7 dt-responsive-on")
+ARTIFACT_SINGLE = (
+    "attachment wp-singular attachment-template-default single "
+    "single-attachment postid-1165 attachmentid-1165 attachment-jpeg")
+PAGE_CLASSES = ("wp-singular page-template-default page page-id-1098 "
+                "wp-embed-responsive wp-theme-dt-the7 dt-responsive-on")
+HOME_CLASSES = "home wp-singular page-template-default page page-id-930"
+
+
+def _resp(body_classes, extra=""):
+    html = (f'<!doctype html><html><head><title>x</title></head>'
+            f'<body class="{body_classes}">{extra}</body></html>')
+
+    class R:
+        content = html.encode("utf-8")
+    return R()
+
+
+def _rec(mod, url="https://example.at/x/"):
+    return mod.PageRecord(url=url, source="sitemap",
+                          content_type="text/html", status=200)
+
+
+def test_attachment_pages_flagged(mod, tmp_path):
+    e = mod.Exporter(mod.Config(base_url="https://example.at",
+                                out_dir=tmp_path / "o"))
+    wp = e.plugin("wordpress")
+    for classes in (ARTIFACT_CLASSES, ARTIFACT_SINGLE):
+        rec = _rec(mod)
+        wp.page_saved("https://example.at/logo/", _resp(classes), rec)
+        assert rec.artifact == "wp-attachment", classes
+    # real pages are never flagged ...
+    for classes in (PAGE_CLASSES, HOME_CLASSES, "search search-results"):
+        rec = _rec(mod)
+        wp.page_saved("https://example.at/malerarbeiten/", _resp(classes),
+                      rec)
+        assert rec.artifact == "", classes
+    # ... and neither is a page that merely CONTAINS attachment-* classes
+    # on an <img> (WordPress' image size classes)
+    rec = _rec(mod)
+    wp.page_saved("https://example.at/malerarbeiten/",
+                  _resp(PAGE_CLASSES,
+                        '<img class="attachment-thumbnail attachment" src=x>'),
+                  rec)
+    assert rec.artifact == ""
+    assert wp.stats["attachment_pages"] == 2
+
+
+def test_phpthumb_cache_pages_flagged_by_url(mod, tmp_path):
+    e = mod.Exporter(mod.Config(base_url="https://example.at",
+                                out_dir=tmp_path / "o"))
+    wp = e.plugin("wordpress")
+    rec = _rec(mod)
+    # no attachment body class at all -- the URL rule still catches it
+    wp.page_saved("https://example.at/ueber-uns/partner/"
+                  "phpthumb_cache_huthansl-at_srcabc_dat1382975637/",
+                  _resp(PAGE_CLASSES), rec)
+    assert rec.artifact == "phpthumb-cache"
+    assert wp.stats["cache_pages"] == 1
+
+
+def test_artifact_detection_tolerates_odd_input(mod, tmp_path):
+    e = mod.Exporter(mod.Config(base_url="https://example.at",
+                                out_dir=tmp_path / "o"))
+    wp = e.plugin("wordpress")
+    wp.page_saved("https://example.at/x/", _resp(PAGE_CLASSES), None)  # no rec
+
+    class Latin1:
+        content = ('<html><body class="' + ARTIFACT_CLASSES
+                   + '">Grüße</body></html>').encode("latin-1")
+    rec = _rec(mod)
+    wp.page_saved("https://example.at/x/", Latin1(), rec)
+    assert rec.artifact == "wp-attachment"          # class tokens are ASCII
+
+    class NoBody:
+        content = b"not html at all"
+    rec2 = _rec(mod)
+    wp.page_saved("https://example.at/x/", NoBody(), rec2)
+    assert rec2.artifact == ""
+
+
+def test_list_attachment_pages_opt_out(mod, tmp_path):
+    cfg = mod.parse_args(["https://example.at", "-o", str(tmp_path)])
+    assert cfg.list_attachment_pages is False
+    cfg = mod.parse_args(["https://example.at", "-o", str(tmp_path),
+                          "--list-attachment-pages"])
+    assert cfg.list_attachment_pages is True
+    e = mod.Exporter(cfg)
+    rec = _rec(mod)
+    e.plugin("wordpress").page_saved("https://example.at/logo/",
+                                     _resp(ARTIFACT_CLASSES), rec)
+    assert rec.artifact == ""                       # opted out
+    assert e.index_exclusion(rec) == ""             # so it stays listed
