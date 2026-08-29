@@ -20,9 +20,9 @@ Three pieces:
    the indexable pages and `/search-index.json` is written (root-relative;
    `application/json` is already in the generated nginx `gzip_types`).
 
-2. RESULTS PAGE -- generated at a language-derived path (`<html lang>`
-   starts with "de" -> `/suche/`, else `/search/`; `--search-path`
-   overrides). Its DESIGN IS HARVESTED FROM THE LIVE SITE: a handful of
+2. RESULTS PAGE -- generated at `/search/` (`--search-path` overrides;
+   the page's own wording follows `<html lang>`, the URL does not).
+   Its DESIGN IS HARVESTED FROM THE LIVE SITE: a handful of
    `GET /?s=<term>` probes (at most PROBE_MAX_REQUESTS, all inside
    run_end) give us the theme's own results skeleton, its result-card
    markup -- turned into a template with `%%X%%` slots -- the per-page
@@ -38,7 +38,7 @@ Three pieces:
 
 3. WIRING -- every search form on every page gets `action="<search path>"`
    (the `name="s"` input stays, so URLs keep the WordPress shape
-   `/suche/?s=term`), the Yoast JSON-LD SearchAction `urlTemplate` is
+   `/search/?s=term`), the Yoast JSON-LD SearchAction `urlTemplate` is
    pointed at the same path, and a ~190-byte script at the top of `<head>`
    redirects any surviving `?s=`/`?q=` URL (bookmarks, external links,
    the JSON-LD entry point, forms this plugin did not recognize) to the
@@ -133,17 +133,10 @@ WS_RE = re.compile(r"\s+")
 TITLE_SEPARATORS = (" - ", " \u2013 ", " \u2014 ", " | ", " \u00b7 ",
                     " \u00bb ", " :: ", " / ")
 
-DEFAULT_PATHS = (("de", "/suche/"),)    # language prefix -> path
-FALLBACK_PATH = "/search/"
-
-
-def path_for_lang(lang: str) -> str:
-    """Results-page path derived from the site's <html lang>."""
-    low = (lang or "").strip().lower()
-    for prefix, path in DEFAULT_PATHS:
-        if low.startswith(prefix):
-            return path
-    return FALLBACK_PATH
+# One path for every site, whatever its language: it is a URL, not UI
+# text (the page's own wording still follows <html lang>). Override with
+# --search-path.
+DEFAULT_PATH = "/search/"
 
 
 def validate_search_path(path: str) -> str:
@@ -437,6 +430,33 @@ def _wrap(el, before: str, after: str) -> None:
     el.insert_after(NavigableString(after))
 
 
+DATE_META = ("article:published_time", "article:modified_time")
+DATE_JSONLD = re.compile(r'"datePublished"\s*:\s*"([^"]{4,40})"')
+
+
+def page_date(soup) -> str:
+    """The page's publication date as an ISO string ("" when unknown).
+
+    WordPress orders search results by post_date, so the static search
+    needs one per page. Preferred source is the harvested result card;
+    this is the fallback read from the page itself: an OpenGraph
+    article: timestamp, else the datePublished of a JSON-LD block (the
+    only date many page templates expose), else a <time datetime>."""
+    for prop in DATE_META:
+        m = soup.find("meta", attrs={"property": prop})
+        if m is not None and (m.get("content") or "").strip():
+            return m["content"].strip()
+    for script in soup.find_all("script"):
+        if "ld+json" not in (script.get("type") or "").lower():
+            continue
+        text = "".join(c for c in script.contents if isinstance(c, str))
+        m = DATE_JSONLD.search(text)
+        if m:
+            return m.group(1).strip()
+    t = soup.find("time", attrs={"datetime": True})
+    return (t["datetime"] or "").strip() if t is not None else ""
+
+
 def _rel_set(tag) -> set:
     """bs4 gives `rel` as a LIST on parsed markup but as a plain STRING on
     tags we build ourselves -- iterating the latter would walk single
@@ -482,7 +502,8 @@ RENDERER_JS = r'''
     t: "Search results for \u201c%s\u201d"
   };
   var MARKS = /[\u0300-\u036f]/g;
-  var WORDCH = /[0-9a-z\u00c0-\u024f\u0370-\u1fff\u3040-\uffff]/;
+  // WordPress matches with LIKE '%term%' -- plain substrings, no word
+  // boundaries, so there is nothing to weigh
   var SPLIT = /[^0-9A-Za-z\u00c0-\u024f\u0370-\u1fff\u3040-\uffff]+/;
   var TOK = /%%([A-Z])%%/g;
 
@@ -513,22 +534,47 @@ RENDERER_JS = r'''
     }
     return out;
   }
-  function weigh(text, term, wordScore, subScore) {
-    var i = text.indexOf(term);
-    if (i < 0) { return 0; }
-    return (i === 0 || !WORDCH.test(text.charAt(i - 1))) ? wordScore
-                                                         : subScore;
-  }
-  function score(d, ts) {                // AND over terms, like WordPress
-    var s = 0, i, hit;
-    if (!d.f) { d.f = [fold(d[1] || ""), fold(d[2] || ""), fold(d[3] || "")]; }
-    for (i = 0; i < ts.length; i++) {
-      hit = weigh(d.f[0], ts[i], 10, 5) + weigh(d.f[1], ts[i], 4, 2)
-          + weigh(d.f[2], ts[i], 3, 1);
-      if (!hit) { return 0; }
-      s += hit;
+  function fields(d) {                   // [post_title, excerpt, content]
+    if (!d.f) {
+      // the harvested slot carries the real post_title; d[1] is the SEO
+      // <title>, which WordPress never searches or ranks on
+      var s = d[4] || {};
+      d.f = [fold(s.t || d[1] || ""), fold(s.e || d[2] || ""),
+             fold(d[3] || "")];
     }
-    return s;
+    return d.f;
+  }
+  function matches(d, ts) {              // AND over terms, like WordPress
+    var f = fields(d), i;
+    for (i = 0; i < ts.length; i++) {
+      if (f[0].indexOf(ts[i]) < 0 && f[1].indexOf(ts[i]) < 0
+          && f[2].indexOf(ts[i]) < 0) { return false; }
+    }
+    return true;
+  }
+  function rank(d, ts, sentence) {
+    // WP_Query::parse_search_order, verbatim: ONE term (or a sentence
+    // match) orders by "title contains it" first, several terms use the
+    // CASE ladder. Everything else is decided by post_date DESC.
+    var f = fields(d), i, all = true, any = false;
+    if (ts.length < 2) {
+      return f[0].indexOf(ts.length ? ts[0] : sentence) >= 0 ? 1 : 2;
+    }
+    if (f[0].indexOf(sentence) >= 0) { return 1; }
+    if (ts.length < 7) {                 // WP's own sanity limit
+      for (i = 0; i < ts.length; i++) {
+        if (f[0].indexOf(ts[i]) >= 0) { any = true; } else { all = false; }
+      }
+      if (all) { return 2; }
+      if (any) { return 3; }
+    }
+    if (f[1].indexOf(sentence) >= 0) { return 4; }
+    if (f[2].indexOf(sentence) >= 0) { return 5; }
+    return 6;
+  }
+  function pubdate(d) {
+    var s = d[4] || {};
+    return s.i || "";                    // ISO post_date, "" sorts last
   }
   function clip(s, n) {                  // WP-style auto excerpt
     s = String(s);
@@ -604,13 +650,20 @@ RENDERER_JS = r'''
     } catch (e2) { /* ancient browser: nothing more we can do */ }
   }
   function run(docs, q) {
-    var ts = terms(q), hits = [], i, s;
+    var sentence = fold(String(q).replace(/^\s+|\s+$/g, ""));
+    var ts = terms(q), hits = [], i, d;
+    if (!ts.length && sentence) { ts = [sentence]; }
     for (i = 0; i < docs.length; i++) {
-      s = ts.length ? score(docs[i], ts) : 0;
-      if (s > 0) { hits.push([s, docs[i]]); }
+      d = docs[i];
+      if (ts.length && matches(d, ts)) {
+        hits.push([rank(d, ts, sentence), pubdate(d), d]);
+      }
     }
+    // bucket ASC, post_date DESC -- WordPress' ORDER BY. The path is only
+    // a deterministic last resort for two same-second pages.
     hits.sort(function (x, y) {
-      return y[0] - x[0] || String(x[1][1]).localeCompare(String(y[1][1]));
+      return x[0] - y[0] || (x[1] < y[1] ? 1 : x[1] > y[1] ? -1 : 0)
+          || (String(x[2][0]) < String(y[2][0]) ? -1 : 1);
     });
     if (!hits.length) {
       if (C.empty) { swap(C.empty); } else { message(put(T.z, "%s", esc(q))); }
@@ -618,7 +671,7 @@ RENDERER_JS = r'''
     }
     var html = "", n = hits.length < C.max ? hits.length : C.max;
     for (i = 0; i < n; i++) {
-      html += C.tpl ? card(hits[i][1]) : plain(hits[i][1]);
+      html += C.tpl ? card(hits[i][2]) : plain(hits[i][2]);
     }
     var el = box();
     if (!el) { return; }
@@ -696,10 +749,10 @@ class Search(Plugin):
                  "which every static host answers with the homepage")
         group.add_argument(
             "--search-path", default="", metavar="PATH",
-            help="path of the generated search-results page, e.g. "
-                 "/suche/ (default: derived from <html lang> -- '/suche/' "
-                 "for German sites, '/search/' otherwise). Must start and "
-                 "end with '/'")
+            help="path of the generated search-results page (default "
+                 "/search/, whatever the site language -- the page's own "
+                 "wording still follows <html lang>). Must start and end "
+                 "with '/'")
         group.add_argument(
             "--search-max-chars", type=int, default=2000, metavar="N",
             help="per-page text cap in the search index (default 2000; "
@@ -787,7 +840,7 @@ class Search(Plugin):
             text = (extract_text(root, limit)
                     if (root is not None and limit) else "")
             entry = {"desc": desc, "text": text, "lang": lang.strip(),
-                     "site": site}
+                     "site": site, "date": page_date(soup)}
         except Exception as exc:            # noqa: BLE001
             # a crash here would abort process_page and lose the whole
             # page from the export -- never worth it for a search index
@@ -833,7 +886,7 @@ class Search(Plugin):
                     f"results page path and UI (override with --search-path)")
         else:
             lang = ""
-        path = path_for_lang(lang)
+        path = DEFAULT_PATH
         configured = (self.exp.cfg.search_path or "").strip()
         if configured:
             try:
@@ -894,7 +947,7 @@ class Search(Plugin):
         exp = self.exp
         seen: dict = {}
         for p in exp.pages:
-            if exp.index_exclusion(p):
+            if exp.index_exclusion(p, scope="search"):
                 continue
             seen.setdefault(p.save_url or p.url, p)
         return sorted(seen.items())
@@ -1056,7 +1109,11 @@ class Search(Plugin):
             if not text:
                 empty += 1                  # counted, still indexed
             doc = [path, title, desc, text]
-            slot = slots.get(path)
+            slot = dict(slots.get(path) or {})
+            if not slot.get("i") and entry.get("date"):
+                # no harvested card: the page's own JSON-LD/OpenGraph date
+                # still lets the results sort like WordPress' post_date
+                slot["i"] = entry["date"]
             if slot:
                 doc.append(slot)            # docs without slots stay 4 long
             docs.append(doc)
@@ -1629,7 +1686,14 @@ class Search(Plugin):
                 inp["value"] = ""
         self._drop_dead_hrefs(root)
         self._assets.extend(self._scan_assets(root, cfg["path"]))
-        return "".join(str(c) for c in root.contents).strip()
+        # Comment nodes must go BEFORE serializing: bs4's str() on a
+        # Comment yields its bare text WITHOUT the <!-- --> delimiters, so
+        # the theme's "<!-- #post-0 .post .no-results -->" would end up as
+        # visible copy on the page. (Dropping them also keeps the export's
+        # no-comments-anywhere policy.)
+        for c in root.find_all(string=lambda s: isinstance(s, Comment)):
+            c.extract()
+        return root.decode_contents().strip()
 
     def _harvest(self, cfg: dict) -> dict | None:
         """Skeleton + card template + per-page slots + empty state, taken

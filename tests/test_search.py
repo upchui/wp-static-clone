@@ -189,21 +189,26 @@ def test_drop_class_regex_matches_whole_tokens_only(mod):
         assert rx.fullmatch(drop), drop
 
 
-def test_path_for_lang(mod):
+def test_default_path_is_language_independent(mod, exporter, plug):
+    """The path is a URL, not UI text -- the page's wording still follows
+    <html lang>, but /search/ is the same everywhere."""
     s = _mod(mod)
-    assert s.path_for_lang("de") == "/suche/"
-    assert s.path_for_lang("de-AT") == "/suche/"
-    assert s.path_for_lang("DE_at") == "/suche/"
-    assert s.path_for_lang("en-US") == "/search/"
-    assert s.path_for_lang("") == "/search/"
+    assert s.DEFAULT_PATH == "/search/"
+    exporter.pages = [_page(mod, "https://example.at/x/", title="X")]
+    plug.pre_discover_soup(
+        BeautifulSoup('<html lang="de"><head></head><body>'
+                      '<main id="content"><p>Hallo</p></main></body></html>',
+                      "html.parser"), "https://example.at/x/")
+    st = plug.settings()
+    assert st["path"] == "/search/" and st["de"] is True
 
 
 def test_validate_search_path(mod):
     v = _mod(mod).validate_search_path
-    assert v("/suche/") == "/suche/"
-    assert v(" /hilfe/suche/ ") == "/hilfe/suche/"
-    for bad in ("", "/", "suche/", "/suche", "/suche/?x=1", "/suche/#a",
-                "/../etc/", "/a//b/", "/wp-content/suche/", '/su"che/',
+    assert v("/search/") == "/search/"
+    assert v(" /hilfe/search/ ") == "/hilfe/search/"
+    for bad in ("", "/", "suche/", "/suche", "/search/?x=1", "/search/#a",
+                "/../etc/", "/a//b/", "/wp-content/search/", '/su"che/',
                 "/su che/", "/su\\che/"):
         with pytest.raises(ValueError):
             v(bad)
@@ -234,12 +239,12 @@ def test_fix_search_action_all_shapes(mod):
         {"@type": ["Thing", "SearchAction"], "target": ["https://x.at/?s={q}"]},
         {"@type": "ReadAction", "target": ["https://x.at/keep/"]},
     ]}
-    assert fix(data, "/suche/?s={search_term_string}") == 3
+    assert fix(data, "/search/?s={search_term_string}") == 3
     g = data["@graph"]
     assert (g[0]["potentialAction"][0]["target"]["urlTemplate"]
-            == "https://x.at/suche/?s={search_term_string}")
-    assert g[1]["target"] == "https://x.at/suche/?s={search_term_string}"
-    assert g[2]["target"] == ["https://x.at/suche/?s={search_term_string}"]
+            == "https://x.at/search/?s={search_term_string}")
+    assert g[1]["target"] == "https://x.at/search/?s={search_term_string}"
+    assert g[2]["target"] == ["https://x.at/search/?s={search_term_string}"]
     assert g[3]["target"] == ["https://x.at/keep/"]     # untouched
 
 
@@ -286,19 +291,19 @@ def test_postprocess_wires_forms_jsonld_and_head(mod, exporter, plug):
     assert plug.postprocess_soup(soup) is True
     # form
     form = soup.find("form")
-    assert form["action"] == "/suche/" and form["method"] == "get"
+    assert form["action"] == "/search/" and form["method"] == "get"
     assert form.find("input", attrs={"name": "s"}) is not None   # kept
-    assert form.find("a", class_="submit")["href"] == "/suche/"  # decoy fixed
+    assert form.find("a", class_="submit")["href"] == "/search/"  # decoy fixed
     # JSON-LD
     ld = soup.find("script", attrs={"type": "application/ld+json"}).string
-    assert r"\/suche\/?s={search_term_string}" in ld
+    assert r"\/search\/?s={search_term_string}" in ld
     assert json.loads(ld)["@graph"][0]["potentialAction"][0]["target"][
-        "urlTemplate"] == "https://example.at/suche/?s={search_term_string}"
+        "urlTemplate"] == "https://example.at/search/?s={search_term_string}"
     # head redirect, right after the charset meta, before anything else
     snippet = soup.find("script", attrs={"data-wpse-search": "redirect"})
     assert snippet is not None
     assert snippet.find_previous_sibling().get("charset") == "utf-8"
-    assert 'var p="/suche/"' in snippet.string
+    assert 'var p="/search/"' in snippet.string
     assert "location.replace(p+location.search)" in snippet.string
     assert "example.at" not in snippet.string        # stays root-relative
     # idempotent: a second pass changes nothing and adds no second snippet
@@ -335,7 +340,7 @@ def test_cli_search_path_overrides_language(mod, tmp_path):
 def test_cli_rejects_bad_search_path(mod, tmp_path, capsys):
     with pytest.raises(SystemExit):
         mod.parse_args(["https://example.at", "-o", str(tmp_path),
-                        "--search-path", "suche"])
+                        "--search-path", "search"])
     assert "--search-path" in capsys.readouterr().err
     with pytest.raises(SystemExit):
         mod.parse_args(["https://example.at", "-o", str(tmp_path),
@@ -389,24 +394,24 @@ def test_run_end_writes_index_with_sitemap_filter(mod, exporter, plug):
         (exporter.public_dir / "search-index.json").read_text("utf-8"))
     assert data["v"] == 2 and data["lang"] == "de"
     paths = [d[0] for d in data["docs"]]
-    assert paths == ["/fassaden/", "/kontakt/"]
-    assert "/geheim/" not in paths          # noindex
-    assert "/anhang/" not in paths          # link-only
+    # noindex and link-only pages ARE searchable: both are instructions to
+    # search ENGINES, and WordPress' own site search returns such pages
+    assert paths == ["/anhang/", "/fassaden/", "/geheim/", "/kontakt/"]
     assert "/alt/" not in paths             # redirect stub
     assert "/err/" not in paths             # failed
     assert "/partner/logo/" not in paths    # WP attachment artifact
-    doc = data["docs"][0]
+    doc = next(d for d in data["docs"] if d[0] == "/fassaden/")
     assert doc[1] == "Fassaden"             # site suffix stripped
     assert doc[2] == "Wärmeschutzfassaden und mehr"
     assert doc[3] == "Vollwärmeschutz für die Straße."
-    assert plug.stats["pages_indexed"] == 2
+    assert plug.stats["pages_indexed"] == 4
     assert plug.stats["index_bytes"] > 0
 
 
 def test_run_end_generates_results_page_from_404(mod, exporter, plug):
     _prepare(mod, exporter, plug)
     plug.run_end()
-    page = exporter.public_dir / "suche" / "index.html"
+    page = exporter.public_dir / "search" / "index.html"
     assert page.is_file()
     html = page.read_text("utf-8")
     soup = BeautifulSoup(html, "html.parser")
@@ -417,7 +422,7 @@ def test_run_end_generates_results_page_from_404(mod, exporter, plug):
     robots = soup.find("meta", attrs={"name": "robots"})
     assert robots["content"] == "noindex,follow"
     assert (soup.find("link", rel="canonical")["href"]
-            == "https://example.at/suche/")
+            == "https://example.at/search/")
     assert soup.title.get_text() == "Suche - Huthansl"
     # theme chrome survived, 404 markers gone
     assert "primary-menu" in html and "Startseite" in html
@@ -433,7 +438,7 @@ def test_run_end_generates_results_page_from_404(mod, exporter, plug):
     assert "min-height" in soup.find(id="content")["style"]
     # the theme's header search form came along with the chrome and was
     # already wired during the page pass -- it points here
-    assert soup.find("form")["action"] == "/suche/"
+    assert soup.find("form")["action"] == "/search/"
     # both UI string sets ship; the config picks German at runtime, and no
     # origin host leaks into our script
     script = soup.find("script", attrs={"data-wpse-search": "renderer"}).string
@@ -451,14 +456,14 @@ def test_run_end_generates_results_page_from_404(mod, exporter, plug):
 def test_results_page_falls_back_to_minimal_markup(mod, exporter, plug):
     _prepare(mod, exporter, plug, with_404=False)
     plug.run_end()
-    html = (exporter.public_dir / "suche" / "index.html").read_text("utf-8")
+    html = (exporter.public_dir / "search" / "index.html").read_text("utf-8")
     soup = BeautifulSoup(html, "html.parser")
     assert soup.html["lang"] == "de"
     assert soup.find(id="wpse-search-results") is not None
     assert (soup.find("meta", attrs={"name": "robots"})["content"]
             == "noindex,follow")
     assert soup.find("h1").get_text() == "Suchergebnisse"
-    assert soup.find("form")["action"] == "/suche/"
+    assert soup.find("form")["action"] == "/search/"
     assert plug.stats["page_source"] == "built-in minimal page"
     assert any("minimal built-in markup" in w for w in exporter.warnings)
 
@@ -474,10 +479,10 @@ def test_results_page_gets_its_own_form_when_template_has_none(mod, exporter,
         b'</body></html>')
     plug.run_end()
     soup = BeautifulSoup(
-        (exporter.public_dir / "suche" / "index.html").read_text("utf-8"),
+        (exporter.public_dir / "search" / "index.html").read_text("utf-8"),
         "html.parser")
     form = soup.find(id="wpse-search").find("form")
-    assert form["action"] == "/suche/" and form["method"] == "get"
+    assert form["action"] == "/search/" and form["method"] == "get"
     assert form.find("input", attrs={"name": "s"}) is not None
 
 
@@ -486,7 +491,7 @@ def test_results_page_does_not_duplicate_an_existing_form(mod, exporter,
     _prepare(mod, exporter, plug)                   # PAGE has a header form
     plug.run_end()
     soup = BeautifulSoup(
-        (exporter.public_dir / "suche" / "index.html").read_text("utf-8"),
+        (exporter.public_dir / "search" / "index.html").read_text("utf-8"),
         "html.parser")
     assert len(soup.find_all("form")) == 1
 
@@ -498,7 +503,7 @@ def test_results_page_falls_back_to_homepage(mod, exporter, plug):
         b'</head><body class="home"><div id="header">Chrome</div>'
         b'<main id="content"><p>Startseiteninhalt</p></main></body></html>')
     plug.run_end()
-    html = (exporter.public_dir / "suche" / "index.html").read_text("utf-8")
+    html = (exporter.public_dir / "search" / "index.html").read_text("utf-8")
     assert "Chrome" in html                     # chrome inherited
     assert "Startseiteninhalt" not in html      # content well emptied
     assert plug.stats["page_source"] == "index.html (homepage)"
@@ -507,7 +512,7 @@ def test_results_page_falls_back_to_homepage(mod, exporter, plug):
 def test_existing_page_at_search_path_stands_the_feature_down(mod, exporter,
                                                               plug):
     """Origin content always wins -- and then nothing may be wired to it."""
-    target = exporter.public_dir / "suche" / "index.html"
+    target = exporter.public_dir / "search" / "index.html"
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_bytes(ORIGIN_PAGE)
     exporter.written_paths.add(target)
@@ -515,7 +520,7 @@ def test_existing_page_at_search_path_stands_the_feature_down(mod, exporter,
     plug.run_end()
     assert target.read_bytes() == ORIGIN_PAGE
     assert plug.stats["page_written"] is False
-    assert plug.stats["collision"] == "/suche/"
+    assert plug.stats["collision"] == "/search/"
     assert not (exporter.public_dir / "search-index.json").exists()
     assert any("--search-path" in w for w in exporter.warnings)
     # no page may be pointed at a results page that does not exist
@@ -534,7 +539,7 @@ def test_existing_search_index_stands_the_feature_down(mod, exporter, plug):
     plug.run_end()
     assert target.read_bytes() == b'{"origin":true}'
     assert plug.stats["collision"] == "/search-index.json"
-    assert not (exporter.public_dir / "suche").exists()
+    assert not (exporter.public_dir / "search").exists()
     assert any("/search-index.json" in w for w in exporter.warnings)
 
 
@@ -608,7 +613,7 @@ def test_harvested_page_keeps_the_theme_design(mod, exporter, plug):
     exporter.cfg.search_harvest = True
     _prepare(mod, exporter, plug, with_404=False)
     plug.run_end()
-    html = (exporter.public_dir / "suche" / "index.html").read_text("utf-8")
+    html = (exporter.public_dir / "search" / "index.html").read_text("utf-8")
     soup = BeautifulSoup(html, "html.parser")
     # the theme's own grid container, tagged for the renderer, emptied
     box = soup.find(id="wpse-search-results")
@@ -646,7 +651,7 @@ def test_harvest_drops_dead_author_link(mod, exporter, plug):
     _prepare(mod, exporter, plug, with_404=False)
     plug.run_end()
     script = BeautifulSoup(
-        (exporter.public_dir / "suche" / "index.html").read_text("utf-8"),
+        (exporter.public_dir / "search" / "index.html").read_text("utf-8"),
         "html.parser").find(
             "script", attrs={"data-wpse-search": "renderer"}).string
     # /author/admin/ was never exported: the anchor stays, the href goes
@@ -679,7 +684,7 @@ def test_harvest_failure_falls_back(mod, exporter, plug):
     plug.run_end()
     assert plug.stats["harvest"]["used"] is False
     assert plug.stats["page_source"] == "404.html"
-    assert (exporter.public_dir / "suche" / "index.html").is_file()
+    assert (exporter.public_dir / "search" / "index.html").is_file()
 
 
 def test_no_search_harvest_flag_makes_no_requests(mod, exporter, plug):
@@ -713,4 +718,4 @@ def test_disabled_by_flag_and_by_no_rewrite(mod, tmp_path):
         assert p.docs == {}
         p.run_end()                                      # no crash, no files
         assert not (e.public_dir / "search-index.json").exists()
-        assert not (e.public_dir / "suche").exists()
+        assert not (e.public_dir / "search").exists()

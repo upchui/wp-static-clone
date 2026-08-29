@@ -2321,13 +2321,17 @@ class Exporter:
                   or xfp.strip().lower() == "https" else "http")
         return f"{scheme}://{self.host}"
 
-    def index_exclusion(self, p: PageRecord) -> str:
+    def index_exclusion(self, p: PageRecord, scope: str = "sitemap") -> str:
         """Why a crawled page must NOT be listed in the generated sitemap
-        nor be offered by the site search -- "" when it belongs in both.
+        (scope "sitemap") or offered by the site search (scope "search")
+        -- "" when it belongs there.
 
-        The single source of truth for "is this a real, indexable page":
-        the generated sitemap and plugins/search.py both consult it, so
-        the two answers can never drift apart."""
+        The single source of truth for "is this a real page": the
+        generated sitemap and plugins/search.py both consult it, so the
+        two answers can never drift apart. They differ in exactly one
+        way: `noindex` and "the origin sitemap did not list it" are
+        instructions to SEARCH ENGINES. WordPress' own site search
+        returns such pages, so the exported search does too."""
         if p.error or "html" not in p.content_type:
             return "not-a-page"
         if p.is_stub:
@@ -2337,13 +2341,14 @@ class Exporter:
             # link-only rule: a WordPress attachment sitemap lists these
             # itself, so "the origin sitemap knows it" proves nothing.
             return p.artifact
-        if (p.source != "sitemap" and self.sitemap_discovery_ok
-                and not self.cfg.sitemap_include_linked):
-            # the origin sitemap did not list it -- don't ask Google to
-            # index what the site itself does not advertise
-            return "link-only"
-        if p.noindex:
-            return "noindex"
+        if scope != "search":
+            if (p.source != "sitemap" and self.sitemap_discovery_ok
+                    and not self.cfg.sitemap_include_linked):
+                # the origin sitemap did not list it -- don't ask Google
+                # to index what the site itself does not advertise
+                return "link-only"
+            if p.noindex:
+                return "noindex"
         if (p.canonical and self.is_internal(p.canonical)
                 and self.canonical_target(p) != (p.save_url or p.url)):
             return "canonical-mismatch"  # it declares another URL canonical

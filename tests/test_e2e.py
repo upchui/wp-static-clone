@@ -271,7 +271,7 @@ def test_static_search_exported(export):
     import json as _json
     pub = export["public"]
     # results page at the German path (the fixture declares lang="de")
-    page = pub / "suche" / "index.html"
+    page = pub / "search" / "index.html"
     assert page.is_file()
     html = page.read_text(encoding="utf-8")
     assert 'id="wpse-search-results"' in html
@@ -283,19 +283,22 @@ def test_static_search_exported(export):
     assert index["v"] == 2 and index["lang"] == "de"
     paths = [d[0] for d in index["docs"]]
     assert "/" in paths and "/ueber-uns/" in paths
-    assert "/geheim/" not in paths                       # noindex
+    # noindex keeps a page out of the SITEMAP but not out of the site
+    # search -- WordPress' own search returns noindexed pages too
+    assert "/geheim/" in paths
+    assert "/geheim/" not in (pub / "sitemap.xml").read_text(encoding="utf-8")
     corpus = " ".join(d[3] for d in index["docs"])
     assert "Vollwärmeschutz" in corpus
     # every page's form points at the results page, every page can redirect
     home = (pub / "index.html").read_text(encoding="utf-8")
-    assert 'action="/suche/"' in home
+    assert 'action="/search/"' in home
     assert 'data-wpse-search="redirect"' in home
     assert "location.replace" in home
     # search results are not indexable content
-    assert "/suche/" not in (pub / "sitemap.xml").read_text(encoding="utf-8")
+    assert "/search/" not in (pub / "sitemap.xml").read_text(encoding="utf-8")
     stats = export["report"]["seo"]["search"]
     assert stats["page_written"] is True and stats["collision"] is None
-    assert stats["path"] == "/suche/" and stats["pages_indexed"] >= 2
+    assert stats["path"] == "/search/" and stats["pages_indexed"] >= 2
     assert stats["forms_rewritten"] >= 1
 
 
@@ -320,7 +323,7 @@ def test_static_search_uses_the_live_design(export):
     markup: harvested container, harvested card template, harvested
     heading prefix, and the search-only asset pulled in behind it."""
     pub = export["public"]
-    html = (pub / "suche" / "index.html").read_text(encoding="utf-8")
+    html = (pub / "search" / "index.html").read_text(encoding="utf-8")
     soup = BeautifulSoup(html, "html.parser")
     stats = export["report"]["seo"]["search"]
     assert stats["page_source"] == "live search page"

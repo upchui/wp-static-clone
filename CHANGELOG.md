@@ -1,5 +1,50 @@
 # Changelog
 
+## 2.9.0 (2026-08-30)
+
+The exported search now returns results in WordPress' own order.
+
+### Changed
+- **Ranking is `WP_Query::parse_search_order`, verbatim.** The old
+  hand-rolled score (title 10/5, description 4/2, text 3/1, alphabetical
+  tie-break) put results in an order the live site never produces. Now:
+  a relevance bucket first -- one term → "the post_title contains it",
+  several terms → WordPress' CASE ladder (whole phrase in title / all
+  terms in title / any term in title / phrase in excerpt / phrase in
+  content / rest) -- and `post_date` descending inside each bucket.
+  Measured against the live site for seven queries: **the static order
+  is now identical to the live order**, where it previously matched on
+  zero of the first seven positions for a query like "arbeiten".
+  - The bucket reads the real `post_title` from the harvested card, not
+    the SEO `<title>` (WordPress ranks the former; for a home page
+    called "Home" the two differ completely).
+  - `post_date` comes from the harvested card; pages without one fall
+    back to the `datePublished` of their JSON-LD (or an OpenGraph
+    `article:` timestamp / a `<time datetime>`), which sorts identically.
+- **The site search now returns `noindex` and link-only pages**, while
+  the sitemap still excludes them: both are instructions to search
+  *engines*, and WordPress' own site search returns such pages (on the
+  reference site this brings back `/impressum/`). Artifact, stub, error
+  and canonical-duplicate pages stay out of both.
+- **The results page lives at `/search/` for every site.** The path is a
+  URL, not UI text -- the page's own wording still follows
+  `<html lang>`. `--search-path` overrides as before.
+
+### Fixed
+- The theme's `<!-- #post-0 .post .no-results .not-found -->` comment
+  showed up as **visible text** under the "nothing found" message:
+  bs4's `str()` on a Comment node returns its bare text without the
+  `<!--`/`-->` delimiters. Harvested fragments now drop comment nodes
+  before serialization (which also keeps the export's
+  no-comments-anywhere policy).
+
+### Known differences from the live search
+- No pagination: live shows 10 hits per page via `/page/2/?s=…`, a URL a
+  static host cannot serve; all hits (up to 50) render in one grid.
+- WordPress matches the **raw** `post_content`, page builder shortcodes
+  included, so it occasionally returns a page whose visible text does
+  not contain the term at all. A front-end crawl cannot see that source.
+
 ## 2.8.0 (2026-08-30)
 
 ### Fixed
