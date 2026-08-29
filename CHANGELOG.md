@@ -1,5 +1,47 @@
 # Changelog
 
+## 2.10.0 (2026-08-30)
+
+Multilingual hardening, step 1: stop the silent failure modes and make
+the language situation visible. (Per-language search follows separately.)
+
+### Fixed
+- **A `Set-Cookie` is never stored any more.** The `requests.Session`
+  jar was shared by every crawl worker and never cleared, so a single
+  language or consent cookie (`pll_language`, `_icl_current_language`)
+  was replayed for the rest of the run — the crawl could pin itself to
+  one language mid-export and write the wrong-language body under the
+  right path, with no warning. A static mirror is now always built from
+  cookie-free responses; `--header 'Cookie: …'` still works for sites
+  behind a cookie gate. Regression-tested end to end: the fixture origin
+  serves a different body when its cookie comes back, and removing the
+  policy makes that test fail.
+
+### Added
+- **`Vary: Accept-Language` / `Vary: Cookie` is detected** and reported:
+  the origin picks the variant per request, a mirror can only freeze one
+  per URL. Listed in `report.json` under `seo.runtime_negotiated_pages`.
+- **Language breakdown per export.** New `PageRecord.lang` (from
+  `<html lang>`), a `Languages:` line in `report.txt` and
+  `seo.languages` in `report.json`, counted per primary subtag (`de-AT`
+  and `de-DE` are one `de`).
+- **A warning when links to another internal host are folded onto the
+  main host.** They share one output tree and the first write of a path
+  wins — harmless for a `www.`/IP alias, silent content loss when the
+  hosts serve different content (one language each). Counted in
+  `seo.folded_internal_hosts`.
+- README section "Multilingual sites": what is supported (one language
+  per path on one host), what is generated single-language (search,
+  `404.html`), what is lost (sitemap `hreflang`) and what is not
+  supported (one host per language, `?lang=` URLs).
+
+### Changed
+- The search plugin's multilingual warning said the language decides the
+  results-page path and offered `--search-path` as the fix — both wrong
+  since 2.9.0. It now names what is actually degraded (one results page,
+  one mixed-language index) and points at `--no-search`. It also no
+  longer fires for mere dialects (`de-DE` + `de-AT`).
+
 ## 2.9.1 (2026-08-30)
 
 ### Fixed

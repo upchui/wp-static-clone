@@ -1204,3 +1204,98 @@ def test_webmanifest_localized(mod, tmp_path):
     out = (e.public_dir / "site.webmanifest").read_text()
     assert '"start_url":"/"' in out
     assert '"src":"/wp-content/icon.png"' in out
+
+
+# -- v2.10.0: multilingual safety nets --------------------------------------
+
+def test_session_never_keeps_cookies(exporter):
+    """A language/consent cookie replayed across the crawl could pin the
+    whole export to one language -- silently, and with the wrong body
+    under the right path."""
+    import requests.cookies as rc
+    jar = exporter.session.cookies
+    cookie = rc.create_cookie("pll_language", "de", domain="example.at")
+
+    class Req:
+        host = origin_req_host = "example.at"
+        unverifiable = False
+        type = "http"
+
+        def get_full_url(self):
+            return "https://example.at/"
+
+        def has_header(self, _name):
+            return False
+
+    assert jar._policy.set_ok(cookie, Req()) is False
+    jar.set_cookie(cookie)                       # a forced cookie still...
+    assert exporter.session.headers.get("Cookie") is None   # ...isn't a header
+
+
+def test_language_counts_group_by_primary_subtag(mod, exporter):
+    exporter.pages = [
+        _page(mod, "https://example.at/", lang="de-DE"),
+        _page(mod, "https://example.at/at/", lang="de-AT"),
+        _page(mod, "https://example.at/en/", lang="en-US"),
+        _page(mod, "https://example.at/stub/", lang="en", is_stub=True),
+        _page(mod, "https://example.at/err/", lang="en", error="HTTP 500"),
+        _page(mod, "https://example.at/nolang/"),
+    ]
+    # most frequent first, dialects folded, stubs/errors/langless ignored
+    assert exporter.language_counts() == {"de": 2, "en": 1}
+    exporter.pages = []
+    assert exporter.language_counts() == {}
+
+
+def test_runtime_negotiation_warning(exporter):
+    exporter._warn_runtime_negotiation()
+    assert exporter.warnings == []               # nothing seen, nothing said
+    exporter.negotiated_pages = ["https://example.at/", "https://example.at/x/"]
+    exporter._warn_runtime_negotiation()
+    warn = exporter.warnings[-1]
+    assert "2 page(s)" in warn and "Vary: Accept-Language" in warn
+    assert "/de/" in warn                        # names the way out
+
+
+def test_connect_address_is_not_a_folded_host(mod, tmp_path):
+    """--host IP is the SAME endpoint by construction -- folding it onto
+    the logical host is the point of the flag, not a hazard."""
+    e = mod.Exporter(mod.Config(base_url="http://10.0.0.5:8080",
+                                host_header="example.at",
+                                out_dir=tmp_path / "o"))
+    assert e._alias_norms >= {"example.at", "10.0.0.5:8080", "10.0.0.5"}
+    e.parse_and_save_html(
+        "https://example.at/",
+        b'<html lang="de"><head><title>T</title></head><body>'
+        b'<a href="http://10.0.0.5:8080/x/">same site</a>'
+        b'<a href="https://en.example.at/y/">other host</a>'
+        b"</body></html>", None)
+    assert "10.0.0.5:8080" not in e.folded_hosts     # the connect address
+    assert e.folded_hosts == {}                      # en. is not internal
+    e.internal_norms.add("en.example.at")
+    e.parse_and_save_html(
+        "https://example.at/",
+        b'<html><head><title>T</title></head><body>'
+        b'<a href="https://en.example.at/y/">other language</a>'
+        b"</body></html>", None)
+    assert e.folded_hosts == {"en.example.at": 1}    # ... until declared
+
+
+def test_folded_host_warning(exporter):
+    exporter._warn_folded_hosts()
+    assert exporter.warnings == []
+    exporter.folded_hosts = {"en.example.at": 12, "fr.example.at": 3}
+    exporter._warn_folded_hosts()
+    warn = exporter.warnings[-1]
+    assert "en.example.at (12 link(s))" in warn
+    assert "fr.example.at (3 link(s))" in warn
+    assert "export each host separately" in warn
+
+
+def test_page_lang_recorded_from_html_tag(mod, exporter):
+    rec = mod.PageRecord(url="https://example.at/en/")
+    exporter.parse_and_save_html(
+        "https://example.at/en/",
+        b'<!doctype html><html lang="en-US"><head><title>T</title></head>'
+        b"<body>x</body></html>", rec)
+    assert rec.lang == "en-US"

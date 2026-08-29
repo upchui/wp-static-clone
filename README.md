@@ -149,6 +149,23 @@ For non-Docker nginx, check the module with `nginx -V 2>&1 | grep -o with-http_s
 
 `--staging` keeps a preview mirror out of every index — `robots.txt` `Disallow: /`, an `X-Robots-Tag: noindex, nofollow` header in the nginx/Apache configs (assets included) and a `noindex` robots meta injected into every page (rewrite mode) — so it never competes with the live site as duplicate content.
 
+### Multilingual sites
+
+**Supported: one language per URL path on one host** — `/de/…` + `/en/…`, the Polylang and WPML default. The crawl is purely path-based, so every language tree is exported like any other subtree; per-language sitemaps inside a sitemap index are followed, `hreflang` links and `<html lang>` survive untouched, and a `/` → `/de/` redirect produces the usual stub plus a 301 rule in all three deploy formats. `report.txt`/`report.json` list the exported pages per language.
+
+Two things are generated **once, in one language**, and are announced as warnings when the site turns out to be multilingual:
+
+- **the site search** — one results page with the chrome and wording of the majority language, and one index holding every language at once (so a search in one language can match pages in another). `--no-search` opts out.
+- **the captured `404.html`** and the `error_page`/`ErrorDocument` rules pointing at it.
+
+Also lost today: the `xhtml:link hreflang` annotations of the origin sitemaps do not survive into the generated `/sitemap.xml`. `--no-generate-sitemap` keeps the origin sitemap files verbatim, annotations included — the better choice for a multilingual site that relies on them.
+
+**Not supported: one host per language** (`de.example.com` / `example.fr`). Those hosts are either not exported at all, or — with `--internal-host` — folded into the *same* output tree, where the first page written to a path wins and the other language is silently lost. The exporter warns when it folds links from another internal host. Export each language host separately instead.
+
+**Not supported: `?lang=de` style URLs.** URLs with a query string are never exported (they are listed in the report). Configure Polylang/TranslatePress for path prefixes before exporting.
+
+Finally: a site that picks the language from a **cookie or `Accept-Language`** rather than from the URL cannot be mirrored faithfully — one URL can only hold one variant. The exporter never stores a `Set-Cookie` (so a language cookie can never pin the crawl mid-run) and warns when pages answer with `Vary: Accept-Language` or `Vary: Cookie`.
+
 ---
 
 ## Key options

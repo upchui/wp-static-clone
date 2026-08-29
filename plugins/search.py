@@ -44,8 +44,14 @@ Three pieces:
    the JSON-LD entry point, forms this plugin did not recognize) to the
    results page before first paint.
 
-The wiring runs in `postprocess_soup`, not `rewrite_soup`: the search path
-depends on the site language, which is only known after the crawl.
+The wiring runs in `postprocess_soup`, not `rewrite_soup`: the results
+page's wording and harvested chrome depend on the site language, which is
+only known once the crawl is over.
+
+MULTILINGUAL SITES: everything here is single-language by construction --
+one results page, one index without a language field, probes against the
+default language's `/?s=` only. On a site with more than one language
+that is announced as a warning; `--no-search` opts out.
 
 Rewrite mode only (`--no-rewrite` re-serializes nothing, so nothing can be
 injected). Disable with `--no-search`.
@@ -854,7 +860,7 @@ class Search(Plugin):
     # -- phase 2: decide (once, after the crawl) -----------------------------
     def settings(self) -> dict:
         """Language, path and site name -- resolved once, after the crawl,
-        because the path is derived from the pages' <html lang>. Also
+        because the wording follows the pages' <html lang>. Also
         settles the collision question BEFORE any page is wired: if the
         origin already serves the search path or the index path, the whole
         feature stands down instead of pointing the forms at a page that
@@ -879,11 +885,16 @@ class Search(Plugin):
             top = max(langs.values())
             winners = sorted(k for k, v in langs.items() if v == top)
             lang = home_lang if home_lang in winners else winners[0]
-            if len(langs) > 1:
+            if len({k.split("-")[0] for k in langs}) > 1:
                 self.exp.warnings.append(
-                    f"static search: pages declare more than one language "
-                    f"({', '.join(sorted(langs))}) -- using {lang!r} for the "
-                    f"results page path and UI (override with --search-path)")
+                    f"static search: the site is multilingual "
+                    f"({', '.join(sorted(langs))}) but the exported search "
+                    f"is not: ONE results page is generated, with the "
+                    f"wording, title pattern and harvested chrome of "
+                    f"{lang!r}, and its index holds every language at once "
+                    f"-- a visitor searching in another language sees "
+                    f"{lang!r} labels and can match foreign-language "
+                    f"pages. Use --no-search to leave the search alone")
         else:
             lang = ""
         path = DEFAULT_PATH
@@ -960,9 +971,9 @@ class Search(Plugin):
         """Point the theme's search forms and the JSON-LD SearchAction at
         the results page and inject the ?s= redirect into <head>.
 
-        Runs here rather than in rewrite_soup because the results-page path
-        is derived from the site language, which is only known once the
-        crawl is over. postprocess_html() iterates exactly the pages the
+        Runs here rather than in rewrite_soup because the results page is
+        built from the site language, which is only known once the crawl
+        is over. postprocess_html() iterates exactly the pages the
         core re-serialized (every real page plus 404.html, no redirect
         stubs) and is already gated on cfg.rewrite."""
         if not self.enabled:

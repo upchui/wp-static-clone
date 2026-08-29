@@ -74,6 +74,28 @@ def _make_handler(root: Path):
                 self.end_headers()
                 self.wfile.write(body)
                 return
+            if path in ("/cookie-lang", "/cookie-lang/",
+                        "/cookie-check", "/cookie-check/"):
+                # A language-cookie origin. /cookie-lang/ SETS pll_language
+                # and links to /cookie-check/, which is therefore crawled a
+                # round LATER -- if the exporter kept the cookie, that page
+                # answers COOKIE-PINNED. It must not.
+                pinned = "pll_language" in (self.headers.get("Cookie") or "")
+                link = ('<a href="/cookie-check/">weiter</a>'
+                        if path.startswith("/cookie-lang") else "")
+                body = (f'<!doctype html><html lang="de"><head>'
+                        f'<meta charset="utf-8"><title>Cookie</title></head>'
+                        f'<body>{link}<main id="content"><p>'
+                        f'{"COOKIE-PINNED" if pinned else "COOKIE-FREE"}'
+                        f"</p></main></body></html>").encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Set-Cookie", "pll_language=de; Path=/")
+                self.send_header("Vary", "Accept-Language, Cookie")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             if path == "/dienst":
                 # content served at the slash-LESS URL (see REDIRECTS)
                 body = (b'<!doctype html><html><head><meta charset="utf-8">'
@@ -300,6 +322,32 @@ def test_static_search_exported(export):
     assert stats["page_written"] is True and stats["collision"] is None
     assert stats["path"] == "/search/" and stats["pages_indexed"] >= 2
     assert stats["forms_rewritten"] >= 1
+
+
+def test_multilingual_and_cookie_safety(export):
+    """A second language subtree is exported normally; a language cookie
+    the origin sets must never come back on a later request."""
+    pub, report = export["public"], export["report"]
+    # the English subtree is a normal page with its hreflang links intact
+    en = (pub / "en" / "index.html").read_text(encoding="utf-8")
+    assert 'lang="en-US"' in en
+    assert 'hreflang="de"' in en and 'hreflang="en"' in en
+    # per-language breakdown in the report
+    langs = report["seo"]["languages"]
+    assert langs["de"] >= 5 and langs["en"] == 1
+    # the cookie pages: /cookie-lang/ sets pll_language and links to
+    # /cookie-check/, which is crawled a round later -- it would answer
+    # COOKIE-PINNED if the exporter had kept the cookie
+    for name in ("cookie-lang", "cookie-check"):
+        page = (pub / name / "index.html").read_text("utf-8")
+        assert "COOKIE-FREE" in page, name
+        assert "COOKIE-PINNED" not in page, name
+    # ... and the runtime negotiation it announces is reported, not hidden
+    assert any("/cookie-lang/" in u
+               for u in report["seo"]["runtime_negotiated_pages"])
+    assert any("Vary: Accept-Language" in w for w in report["warnings"])
+    # one host, so nothing was folded
+    assert report["seo"]["folded_internal_hosts"] == {}
 
 
 def test_artifact_pages_excluded_but_exported(export):

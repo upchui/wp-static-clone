@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 TOOL_NAME = "wp-static-export"
-VERSION = "2.9.1"
+VERSION = "2.10.0"
 
 
 @dataclass
@@ -65,6 +65,9 @@ class PageRecord:
     mobile: str = ""                 # same | different | dynamic | check-failed
                                      # (plugin-owned: plugins/mobile_check.py)
     last_modified: str = ""          # raw Last-Modified response header
+    lang: str = ""                   # the page's <html lang> (BCP-47), for
+                                     # the report's language breakdown and
+                                     # multilingual diagnostics
     save_url: str = ""               # canonical URL the content was saved under
                                      # (differs from url for redirect sources)
     is_stub: bool = False            # only a redirect stub was written here

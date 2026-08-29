@@ -553,7 +553,27 @@ def test_mixed_languages_warn_and_pick_the_homepage(mod, exporter, plug):
                           f'<p>x</p></main></body></html>', "html.parser"),
             url)
     assert plug.settings()["path"] == "/search/"      # homepage wins the tie
-    assert any("more than one language" in w for w in exporter.warnings)
+    assert plug.settings()["lang"] == "en"           # ... and its language
+    # the warning must say what is actually degraded, not blame the path
+    warn = next(w for w in exporter.warnings if "static search" in w)
+    assert "the site is multilingual" in warn
+    assert "every language at once" in warn
+    assert "--search-path" not in warn                # fixed in 2.10.0
+
+
+def test_language_dialects_are_not_a_multilingual_site(mod, exporter, plug):
+    """de-DE + de-AT is one language -- warning it as multilingual would
+    be noise on every Austrian/Swiss site."""
+    exporter.pages = [_page(mod, "https://example.at/", title="Home"),
+                      _page(mod, "https://example.at/at/", title="AT")]
+    for url, lang in (("https://example.at/", "de-DE"),
+                      ("https://example.at/at/", "de-AT")):
+        plug.pre_discover_soup(
+            BeautifulSoup(f'<html lang="{lang}"><body><main id="content">'
+                          f'<p>x</p></main></body></html>', "html.parser"),
+            url)
+    plug.settings()
+    assert not any("multilingual" in w for w in exporter.warnings)
 
 
 # -- harvesting the live results-page design ---------------------------------

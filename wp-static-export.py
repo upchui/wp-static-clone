@@ -137,6 +137,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import http.cookiejar as cookiejar
 import importlib.util
 import ipaddress
 import json
@@ -839,6 +840,17 @@ class Exporter:
         self._build_host_regexes()
 
         self.session = requests.Session()
+        # Never keep a Set-Cookie. The jar is shared by every crawl worker
+        # and is never cleared, so ONE language or consent cookie
+        # (Polylang's pll_language, WPML's _icl_current_language, a
+        # cookie-based A/B split) would be replayed for the rest of the
+        # run -- the crawl could pin itself to one language mid-export and
+        # write the wrong-language body under the right path, silently.
+        # A static mirror must be built from cookie-free responses.
+        # Sending a cookie deliberately still works: --header 'Cookie: ...'
+        # sets a request header and is unaffected by this policy.
+        self.session.cookies.set_policy(
+            cookiejar.DefaultCookiePolicy(allowed_domains=[]))
         retry = Retry(total=2, backoff_factor=0.4,
                       status_forcelist=(429, 500, 502, 503, 504),
                       allowed_methods=("GET", "HEAD"))
@@ -907,6 +919,15 @@ class Exporter:
         self._next_request = 0.0
         self.skipped_query_urls: set[str] = set()
         self.external_hosts: set[str] = set()
+        # pages whose variant the origin negotiates at request time, and
+        # internal hosts other than the main one whose URLs were folded
+        # onto it (one output tree, first write wins -- see run summary)
+        self.negotiated_pages: list[str] = []
+        self.folded_hosts: dict[str, int] = {}
+        # spellings of the SAME endpoint we crawl through -- folding these
+        # onto the main host is the whole point of --host, not a hazard
+        self._alias_norms = {self.base_norm, self.connect_norm,
+                             self.connect_norm.partition(":")[0]}
         self.sitemap_files: list[str] = []
         self.warnings: list[str] = []
         self.soft_404 = False
@@ -1009,6 +1030,53 @@ class Exporter:
                 f"host {host} serves wp-content paths -- it is very likely "
                 f"THIS WordPress site under another name; re-run with "
                 f"--internal-host {host} (ignore if it is a real CDN)")
+        self._warn_runtime_negotiation()
+        self._warn_folded_hosts()
+
+    def language_counts(self) -> dict:
+        """Exported pages per primary language subtag ('de-AT' and 'de-DE'
+        count as one 'de'), most frequent first. Empty on a site whose
+        pages carry no <html lang>."""
+        counts: dict = {}
+        for p in self.pages:
+            if p.error or p.is_stub or not p.lang:
+                continue
+            primary = p.lang.replace("_", "-").split("-")[0].lower()
+            if primary:
+                counts[primary] = counts.get(primary, 0) + 1
+        return dict(sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])))
+
+    def _warn_runtime_negotiation(self) -> None:
+        """Vary: Accept-Language / Cookie means the origin serves a
+        different body per request. A mirror can only keep one variant
+        per URL -- typical for a multilingual site that switches on a
+        language cookie instead of the URL."""
+        if not self.negotiated_pages:
+            return
+        n = len(self.negotiated_pages)
+        self.warnings.append(
+            f"{n} page(s) answer with 'Vary: Accept-Language' or "
+            f"'Vary: Cookie' -- the origin picks the variant per request, "
+            f"the export freezes exactly one per URL. On a multilingual "
+            f"site make sure every language has its own URL "
+            f"(e.g. /de/, /en/) instead of relying on a language cookie")
+
+    def _warn_folded_hosts(self) -> None:
+        """Links to another INTERNAL host lose their hostname: one output
+        tree, first write of a path wins. Fine for a www./IP alias of the
+        same site, silent content loss when the hosts serve different
+        content -- one language per subdomain being the classic case."""
+        if not self.folded_hosts:
+            return
+        hosts = ", ".join(f"{h} ({n} link(s))"
+                          for h, n in sorted(self.folded_hosts.items()))
+        self.warnings.append(
+            f"links to other internal hosts were folded onto "
+            f"{self.base_norm}: {hosts}. They share ONE output tree, so a "
+            f"path served by two hosts keeps only the version written "
+            f"first. Harmless for an alias of the same site -- but if "
+            f"those hosts serve DIFFERENT content (e.g. one language "
+            f"each), export each host separately instead")
 
     def plugin(self, name: str) -> Plugin:
         """The per-run instance of the named plugin."""
@@ -1618,6 +1686,14 @@ class Exporter:
                     self.write_bytes(target, resp.content)
             return [], []
 
+        # Vary: Accept-Language / Cookie means the origin picks the variant
+        # per request -- a static mirror can only freeze ONE of them per
+        # URL, so say so instead of silently exporting whichever came back.
+        vary = (resp.headers.get("Vary") or "").lower()
+        if "accept-language" in vary or "cookie" in vary:
+            with self.stats_lock:
+                self.negotiated_pages.append(url)
+
         for p in self.plugins:
             p.page_fetched(url, resp, rec)
 
@@ -1689,6 +1765,18 @@ class Exporter:
             if not self.is_internal(absolute):
                 note_external(absolute)
                 return
+            if tag_name == "a" and not self.looks_like_asset(absolute):
+                # to_base_host() is about to drop the netloc, and
+                # local_path_for() is netloc-blind too: two internal hosts
+                # share ONE output tree and the first write of a path
+                # wins. Harmless for a www./IP alias of the same site,
+                # silent content loss when the hosts differ (a language
+                # per subdomain) -- count it so run() can say so.
+                cand_norm = norm_host(urlsplit(absolute).netloc)
+                if cand_norm and cand_norm not in self._alias_norms:
+                    with self.stats_lock:
+                        self.folded_hosts[cand_norm] = (
+                            self.folded_hosts.get(cand_norm, 0) + 1)
             absolute = self.to_base_host(absolute)
             if tag_name == "a" and not self.looks_like_asset(absolute):
                 n = self.normalize_page_url(absolute)
@@ -1831,6 +1919,9 @@ class Exporter:
                 rec.canonical = canonical["href"].strip()
             viewport = soup.find("meta", attrs={"name": re.compile("^viewport$", re.I)})
             rec.has_viewport = bool(viewport and (viewport.get("content") or "").strip())
+            html_tag = soup.find("html")
+            if html_tag is not None:
+                rec.lang = (html_tag.get("lang") or "").strip()
 
         # write file
         target = save_as or self.local_path_for(page_url, is_page=True)
@@ -3236,6 +3327,10 @@ esac
                 "pages_without_title": [p.url for p in no_title],
                 "pages_without_meta_description": [p.url for p in no_desc],
                 "pages_without_viewport_meta": [p.url for p in no_viewport],
+                "languages": self.language_counts(),
+                "runtime_negotiated_pages": sorted(self.negotiated_pages),
+                "folded_internal_hosts": dict(sorted(
+                    self.folded_hosts.items())),
                 "skipped_query_string_urls": sorted(self.skipped_query_urls),
                 "excluded_urls": sorted(self.excluded_urls),
                 "respect_robots": self.cfg.respect_robots,
@@ -3294,6 +3389,9 @@ esac
             "WP cruft removed: " + (", ".join(
                 f"{k}={v}" for k, v in sorted(self.cruft_removed.items()))
                 or "none"),
+            "Languages:       " + (", ".join(
+                f"{k}={v}" for k, v in self.language_counts().items())
+                or "no <html lang> on the exported pages"),
             *txt_head,
             *(["Staging:         noindex everywhere (robots.txt, "
                "X-Robots-Tag, meta robots)"] if self.cfg.staging else []),
