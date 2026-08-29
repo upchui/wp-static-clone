@@ -87,6 +87,8 @@ CRUFT_HTML = """<html><head>
 <link rel="pingback" href="https://example.at/xmlrpc.php">
 <link rel="stylesheet" href="https://example.at/s.css">
 <script src="https://static.cloudflareinsights.com/beacon.min.js/v123"></script>
+<script type="text/javascript">(function(url){var logHuman=function(){if(window.wfLogHumanRan){return;}window.wfLogHumanRan=true;var wfscr=document.createElement('script');wfscr.src=url+'&r='+Math.random();};})('/?wordfence_lh=1&hid=F90E142780B15707A48648BA6A7234FF');</script>
+<script>var keepme = 1;</script>
 </head><body></body></html>"""
 
 
@@ -96,13 +98,17 @@ def test_strip_wp_cruft(exporter):
     exporter.strip_resource_hints(soup)
     exporter.plugin("wordpress").clean_soup(soup)
     exporter.plugin("cloudflare").clean_soup(soup)
+    exporter.plugin("wordfence").clean_soup(soup)
     out = str(soup)
     for gone in ("generator", "api.w.org", "EditURI", "shortlink",
-                 "pingback", "oembed", "rss+xml", "cloudflareinsights"):
+                 "pingback", "oembed", "rss+xml", "cloudflareinsights",
+                 "wordfence_lh", "wfLogHumanRan"):
         assert gone not in out, gone
     assert 'rel="canonical"' in out
     assert 'hreflang="de"' in out
     assert 'rel="stylesheet"' in out
+    assert "keepme" in out                  # ordinary inline scripts survive
+    assert exporter.cruft_removed["wordfence-beacon"] == 1
 
 
 def test_wlwmanifest_asset_candidate_skipped(exporter):

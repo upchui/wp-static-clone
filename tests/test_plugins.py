@@ -64,7 +64,7 @@ def test_shipped_plugins_registered(mod):
     assert [cls.name for cls in mod.PLUGIN_REGISTRY] == [
         "cloudflare", "complianz", "downloads", "image_compress",
         "image_optimize", "lazyload", "minify", "mobile_check",
-        "slider_revolution", "theme_fixes", "wordpress"]
+        "slider_revolution", "theme_fixes", "wordfence", "wordpress"]
     assert set(mod.PLUGIN_MODULES) == {cls.name
                                        for cls in mod.PLUGIN_REGISTRY}
 

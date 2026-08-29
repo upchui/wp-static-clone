@@ -11,7 +11,7 @@ lands in this folder.
 What plugins do today (each line names a shipped example to read):
 
 * register extra HTML attributes for crawling/rewriting — [`lazyload.py`](lazyload.py), [`complianz.py`](complianz.py)
-* transform every page's DOM (strip, decode, hydrate) — [`wordpress.py`](wordpress.py), [`cloudflare.py`](cloudflare.py), [`slider_revolution.py`](slider_revolution.py)
+* transform every page's DOM (strip, decode, hydrate) — [`wordpress.py`](wordpress.py), [`cloudflare.py`](cloudflare.py), [`wordfence.py`](wordfence.py), [`slider_revolution.py`](slider_revolution.py)
 * filter CSS/JS text before it is written — [`minify.py`](minify.py)
 * inspect page responses and run extra requests — [`mobile_check.py`](mobile_check.py)
 * claim non-HTML responses and materialize files — [`downloads.py`](downloads.py)
@@ -169,7 +169,7 @@ Hooks returning a value are filters; the rest are notifications.
 | `pre_discover_soup(soup, page_url)` [T] | rewrite mode, BEFORE URL discovery and rewriting — mutations are seen by both | slider_revolution (slide hydration) |
 | `expand_scan_text(work) -> str` [T] | pre-transform of JS/JSON text before the URL sweep | complianz (template placeholders) |
 | `scan_text_urls(work) -> (pages, assets)` [T] | derive URLs from runtime URL-construction patterns | slider_revolution |
-| `clean_soup(soup)` [T] | after core `strip_resource_hints()`, under the `cfg.rewrite` + `cfg.strip_wp_cruft` gate | wordpress, cloudflare |
+| `clean_soup(soup)` [T] | after core `strip_resource_hints()`, under the `cfg.rewrite` + `cfg.strip_wp_cruft` gate | wordpress, cloudflare, wordfence |
 | `rewrite_soup(soup)` [T] | after core `rewrite_soup_relative()` | cloudflare (cfemail → mailto:) |
 | `pre_serialize(soup)` [T] | inside `Exporter.serialize()`, before `str(soup)` | minify (inline CSS/JS) |
 | `post_serialize(data) -> bytes` [T] | last step on the serialized HTML bytes | minify (whitespace/comments) |

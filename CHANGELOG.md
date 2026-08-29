@@ -1,5 +1,15 @@
 # Changelog
 
+## 2.5.0 (2026-08-29)
+
+### Added
+- **Wordfence plugin**: the Wordfence "Live Traffic" human-detection
+  beacon -- an inline script on every page that fires
+  `/?wordfence_lh=1&hid=…&r=…` against the (static) host on the first
+  user interaction -- is now stripped with the rest of the WP cruft
+  (kept with `--no-strip-wp-cruft`). Counted as `wordfence-beacon` in
+  the cruft summary/report.
+
 ## 2.4.0 (2026-08-29)
 
 Structural: configuration moves out of the core file, and plugin-owned

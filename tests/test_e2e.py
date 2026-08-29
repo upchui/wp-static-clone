@@ -191,7 +191,8 @@ def test_resource_hints_stripped(export):
 def test_wp_cruft_stripped(export):
     html = (export["public"] / "index.html").read_text(encoding="utf-8")
     for gone in ("generator", "shortlink", "EditURI", "wlwmanifest", "oembed",
-                 "api.w.org", "pingback", "cloudflareinsights", "rss+xml"):
+                 "api.w.org", "pingback", "cloudflareinsights", "rss+xml",
+                 "wordfence_lh", "wfLogHumanRan"):
         assert gone not in html, gone
     assert 'rel="canonical"' in html
     assert 'hreflang="de"' in html
