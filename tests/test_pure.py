@@ -253,6 +253,45 @@ def test_minify_removes_conditionals_and_hacks(mod):
     assert '"/*easeName*/"' in js
 
 
+# -- v2.2.1: banner mid-file / legacy CDO-CDC wrappers / cc_on ---------------
+
+def test_minify_css_multiline_banner_midfile(mod):
+    mod = mod.PLUGIN_MODULES["minify"]
+    css = (".x{color:red}\n"
+           "/*! Prefix flex for IE10  in LESS\n"
+           " * https://gist.github.com/codler/2148ba4ff096a19f08ea\n"
+           " * Copyright (c) 2014 Han Lin Yap http://yap.nu; MIT license */\n"
+           "@keyframes mk_scale{from{opacity:1}to{opacity:0}}")
+    out = mod.minify_css(css)
+    assert "/*" not in out and "yap.nu" not in out
+    assert ".x{color:red}" in out and "@keyframes mk_scale" in out
+
+
+def test_minify_strips_cdo_cdc_wrappers(mod):
+    mod = mod.PLUGIN_MODULES["minify"]
+    assert mod.minify_css("<!--\nbody { color: red; }\n-->") == \
+        "body{color:red}"
+    assert mod.minify_js("<!--\nvar a = 1; // c\n//-->") == "var a=1;"
+    assert mod.minify_js("<!--\nvar a = 1;\n-->") == "var a=1;"
+    # own-line tokens mid-file (concatenated bundles) go too
+    assert mod.minify_css("a{x:1}\n-->\n<!--\nb{y:2}") == "a{x:1}b{y:2}"
+    assert mod.minify_js("<!--\nvar a = 1;\n//-->\nvar b = 2;") == \
+        "var a=1;var b=2;"
+    # anchored/own-line only: comment-lookalike STRING LITERALS stay
+    assert mod.minify_css("a{background:url('a-->b.png')}") == \
+        "a{background:url('a-->b.png')}"
+    assert mod.minify_js('var s = "-->"; var t = "<!--";') == \
+        'var s="-->";var t="<!--";'
+
+
+def test_minify_js_strips_cc_comments(mod):
+    # IE conditional compilation: rjsmin eats it with
+    # keep_bang_comments=False -- pinned so a library change can't
+    # silently bring the relics back
+    mod = mod.PLUGIN_MODULES["minify"]
+    assert mod.minify_js("/*@cc_on var ie=1; @*/var a=1;") == "var a=1;"
+
+
 # -- v2.2.0: srcset parser / canon_path segment handling / urlsafe b64 -------
 
 def test_iter_srcset(mod):

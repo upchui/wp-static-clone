@@ -883,6 +883,70 @@ def test_serialize_minify(mod, tmp_path):
     assert "keep me" not in e.serialize(soup3).decode()
 
 
+# -- v2.2.1: module scripts / multi-node tags / pre + style-attr comments ----
+
+def test_serialize_minify_module_scripts(mod, tmp_path):
+    e = mod.Exporter(mod.Config(base_url="https://example.at",
+                                out_dir=tmp_path / "o"))
+    soup = BeautifulSoup(
+        "<html><head>\n"
+        '    <script type="module">/*! auto-generated */\n'
+        "import { a } from './x.js';\n"
+        "export const t = `k${ a }`;\n// note\n</script>\n"
+        '    <script type="application/ecmascript">var e = 1 ; // x</script>\n'
+        '    <script type="text/template"><b>{{x}}</b></script>\n'
+        '    <script type="importmap">{ "imports" : {} }</script>\n'
+        '    <script type="application/ld+json">{ "a" : 1 }</script>\n'
+        "</head><body>x</body></html>", "html.parser")
+    out = e.serialize(soup).decode()
+    assert "auto-generated" not in out and "// note" not in out
+    assert "import{a}from'./x.js';export const t=`k${ a }`;" in out
+    assert "var e=1;" in out                            # ecmascript variant
+    assert "<b>{{x}}</b>" in out                        # template untouched
+    assert '{ "imports" : {} }' in out                  # importmap untouched
+    assert '{ "a" : 1 }' in out                         # JSON-LD untouched
+
+
+def test_serialize_minify_multi_node_and_wrapped_tags(mod, tmp_path):
+    e = mod.Exporter(mod.Config(base_url="https://example.at",
+                                out_dir=tmp_path / "o"))
+    soup = BeautifulSoup(
+        "<html><head><style>a {  x : 1 ; }</style>"
+        "<script>var a = 1;  // c\n</script>"
+        "<style><!--\nbody { color : red ; }\n--></style>"
+        "<script><!--\nvar w = 1; // z\n//--></script>"
+        "<script></script><style></style>"
+        "</head><body>x</body></html>", "html.parser")
+    # a plugin appending a second node makes .string None -- must not skip
+    soup.style.append("b {  y : 2 ; }")
+    soup.script.append("var b = 2;  // d\n")
+    assert soup.style.string is None and soup.script.string is None
+    out = e.serialize(soup).decode()
+    assert "a{x:1}b{y:2}" in out                        # both nodes minified
+    assert "var a=1;var b=2;" in out and "// c" not in out
+    assert "body{color:red}" in out and "var w=1;" in out
+    assert "<!--" not in out and "-->" not in out       # wrappers gone
+    assert "<script></script>" in out                   # empty tags: no crash
+
+
+def test_serialize_removes_comments_in_pre_and_style_attr(mod, tmp_path):
+    e = mod.Exporter(mod.Config(base_url="https://example.at",
+                                out_dir=tmp_path / "o"))
+    soup = BeautifulSoup(
+        "<html><body>"
+        "<pre>a  <!-- secret -->  b</pre>"
+        '<div style="color: red /* old */">x</div>'
+        "<textarea>keep <!-- visible --> text</textarea>"
+        "</body></html>", "html.parser")
+    out = e.serialize(soup).decode()
+    assert "secret" not in out
+    assert "<pre>a    b</pre>" in out                   # pre whitespace kept
+    assert 'style="color:red"' in out
+    # RCDATA: bs4 keeps it as text and serializes entity-escaped --
+    # the browser decodes it back to the same visible "<!-- ... -->"
+    assert "keep &lt;!-- visible --&gt; text" in out
+
+
 def test_minify_missing_libs_warns(mod, tmp_path, monkeypatch):
     pmod = mod.PLUGIN_MODULES["minify"]
     monkeypatch.setattr(pmod, "rjsmin", None)

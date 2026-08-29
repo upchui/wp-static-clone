@@ -1,5 +1,36 @@
 # Changelog
 
+## 2.2.1 (2026-08-29)
+
+Comment-stripping completeness: every remaining path where a comment
+could survive minification is closed.
+
+### Fixed
+- Inline `<script type="module">` blocks (WordPress 6.x ships the
+  wp-emoji loader this way) were skipped by inline minification, so
+  their `/*! ... */` banners and comments survived on every page.
+  Modules and `ecmascript` type variants are now minified; `importmap`,
+  `speculationrules`, JSON-LD and template blocks stay untouched.
+- `<style>`/`<script>` tags holding zero or several DOM nodes (empty
+  tags, or tags another plugin appended text to) were silently skipped
+  by inline minification; the text children are now joined, minified
+  and written back as one node.
+- Legacy SGML comment-hiding wrappers (`<style><!-- ... --></style>`,
+  `<script><!-- ... //--></script>`) survived both minifiers, which
+  preserve the `<!--`/`-->` tokens. They are stripped in
+  `minify_css`/`minify_js` — anchored plus own-line matching only, so
+  string literals like `url("a-->b")` or `"-->"` remain untouched;
+  external `.css`/`.js` files (concatenated bundles with mid-file
+  wrappers) benefit too.
+- CSS comments in `style="..."` attributes were never touched; the
+  attribute is now minified when it contains one.
+- HTML comments inside `<pre>` survived (the whitespace pass must
+  protect those blocks); real Comment nodes are now removed tree-wide
+  before serialization — they never render, `<textarea>` content is
+  visible text and stays.
+- IE JScript conditional compilation (`/*@cc_on ... @*/`) removal is
+  pinned by a test (rjsmin already strips it).
+
 ## 2.2.0 (2026-08-28)
 
 Bugfix release: a systematic audit of the whole codebase (three parallel

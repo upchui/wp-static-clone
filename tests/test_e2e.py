@@ -369,3 +369,11 @@ def test_min_files_lose_license_banners(export):
     theme = (export["public"] / "wp-content" / "themes" / "fix" /
              "style.css").read_text()
     assert "/*" not in theme                    # no comments at all
+
+
+def test_inline_module_script_minified(export):
+    html = (export["public"] / "index.html").read_text(encoding="utf-8")
+    assert "module banner" not in html
+    assert "// note" not in html
+    assert "const mk=1;" in html
+    assert "e2e-pre-comment" not in html        # comments inside <pre> go too

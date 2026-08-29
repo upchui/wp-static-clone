@@ -1,12 +1,17 @@
 """Minification of exported HTML, CSS and JS (rewrite mode only).
 
-Conservative: ALL HTML comments are removed (including the IE
-conditional-comment relics and /*! license banners */), indentation is
-collapsed; JSON-LD, pre/textarea and non-JS script blocks stay untouched.
+EVERY comment is removed, whatever the type: HTML comments (IE
+conditional relics too, and even inside <pre> -- they never render),
+CSS/JS comments incl. /*! license banners */, legacy <!-- ... //-->
+hiding wrappers, comments in style="" attributes, and inline module
+scripts. Indentation is collapsed. JSON-LD, template/data script blocks
+and textarea content (visible text) stay untouched.
 Needs the rjsmin and rcssmin packages -- a stale venv fails loudly at the
 CLI instead of silently producing an unminified export.
 """
 import re
+
+from bs4 import Comment
 
 from wp_static_export import Plugin
 
@@ -25,12 +30,24 @@ MINIFY_PROTECT_RE = re.compile(
 HTML_COMMENT_ALL_RE = re.compile(r"<!--.*?-->", re.DOTALL)
 INDENT_RE = re.compile(r"[ \t]*\n[ \t\n]*")
 
+# legacy SGML comment-hiding wrappers around inline CSS/JS: both minifiers
+# PRESERVE the tokens (CDO/CDC are legal CSS; <!-- is Annex-B JS syntax).
+# Strip anchored (start/end) plus own-line occurrences -- concatenated
+# bundles carry wrappers mid-file on their own lines. Own-line is safe:
+# CSS has no multi-line strings; in JS a line-start <!-- / --> IS a
+# comment per Annex B. A global sub would clobber url("a-->b") / "-->".
+CDO_RE = re.compile(r"\A\s*<!--")
+CSS_CDC_RE = re.compile(r"-->\s*\Z")
+JS_CDC_RE = re.compile(r"(?://[ \t]*)?-->\s*\Z")
+HIDE_LINE_RE = re.compile(r"(?m)^[ \t]*(?:<!--|(?://[ \t]*)?-->)[ \t]*$\n?")
+
 
 def minify_css(text: str) -> str:
     # keep_bang_comments=False: /*! license banners */ go too -- explicit,
     # so a future library-default change can't bring them back
     if not rcssmin:
         return text
+    text = HIDE_LINE_RE.sub("", CSS_CDC_RE.sub("", CDO_RE.sub("", text)))
     out = rcssmin.cssmin(text, keep_bang_comments=False)
     # rcssmin deliberately preserves the ancient IE5/Mac hack pair
     # ("/*\*/ rule /**/") -- obsolete for two decades, strip exactly
@@ -39,7 +56,10 @@ def minify_css(text: str) -> str:
 
 
 def minify_js(text: str) -> str:
-    return rjsmin.jsmin(text, keep_bang_comments=False) if rjsmin else text
+    if not rjsmin:
+        return text
+    text = HIDE_LINE_RE.sub("", JS_CDC_RE.sub("", CDO_RE.sub("", text)))
+    return rjsmin.jsmin(text, keep_bang_comments=False)
 
 
 def minify_html_bytes(data: bytes) -> bytes:
@@ -116,16 +136,37 @@ class Minify(Plugin):
     def pre_serialize(self, soup) -> None:
         if not self.enabled:
             return
+        # real HTML Comment nodes ANYWHERE in the tree go -- this also
+        # covers <pre> blocks, which the byte-level pass must protect for
+        # whitespace reasons (comments render as nothing, so removal is
+        # invisible). textarea is RCDATA (its "<!-- -->" is visible text,
+        # a NavigableString under current bs4) -- guard anyway in case an
+        # older parser hands us a Comment node there
+        for c in soup.find_all(string=lambda s: isinstance(s, Comment)):
+            if c.find_parent("textarea") is None:
+                c.extract()
+        for tag in soup.find_all(style=True):
+            if "/*" in tag["style"] or "<!--" in tag["style"]:
+                tag["style"] = minify_css(tag["style"])
         for style in soup.find_all("style"):
-            if style.string:
-                style.string = minify_css(style.string)
+            # .string is None for 0 or >=2 children (empty tags, or a
+            # plugin appended text) -- join the text children and set
+            # .string, which replaces them all. NOT .strings: that
+            # filters on the tag's string-container class (Stylesheet/
+            # Script) and would drop plain appended NavigableStrings.
+            css = "".join(c for c in style.contents if isinstance(c, str))
+            if css:
+                style.string = minify_css(css)
         for script in soup.find_all("script"):
-            stype = (script.get("type") or "").lower()
+            stype = (script.get("type") or "").strip().lower()
             if (script.get("src") or "json" in stype or "template" in stype
-                    or (stype and "javascript" not in stype)):
+                    or (stype not in ("", "module")
+                        and "javascript" not in stype
+                        and "ecmascript" not in stype)):
                 continue    # external / data blocks / non-JS types: untouched
-            if script.string:
-                script.string = minify_js(script.string)
+            js = "".join(c for c in script.contents if isinstance(c, str))
+            if js:
+                script.string = minify_js(js)
 
     def post_serialize(self, data: bytes) -> bytes:
         return minify_html_bytes(data) if self.enabled else data

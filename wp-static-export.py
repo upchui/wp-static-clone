@@ -165,7 +165,7 @@ if sys.version_info < (3, 10):
              f"(running {sys.version.split()[0]})")
 
 TOOL_NAME = "wp-static-export"
-VERSION = "2.2.0"
+VERSION = "2.2.1"
 
 # --------------------------------------------------------------------------
 # Classification helpers
