@@ -88,6 +88,54 @@ def test_plugin_registries_aggregated(mod):
     assert "mobile-variants" in mod.EXTRA_OUTPUT_DIRS   # mobile_check
 
 
+# -- v2.4.0: plugin-declared config fields -----------------------------------
+
+def test_plugin_config_fields_merged(mod, tmp_path):
+    import sys
+    base = sys.modules["wps_config"].Config
+    assert issubclass(mod.Config, base)
+    # plugin-owned fields exist on the final class with their defaults ...
+    cfg = mod.Config(base_url="https://example.at", out_dir=tmp_path)
+    assert cfg.minify is True                           # minify
+    assert cfg.optimize_images is True                  # image_optimize
+    assert cfg.compress_images is True                  # image_compress
+    assert cfg.image_quality == 85
+    assert cfg.mobile_check is True                     # mobile_check
+    assert cfg.mobile_user_agent == ""
+    assert cfg.sr7_hydrate is True                      # slider_revolution
+    # ... but not on the plugin-free core Config
+    core_fields = {f.name for f in mod.dataclasses.fields(base)}
+    assert "minify" not in core_fields
+    assert "image_quality" not in core_fields
+    assert "strip_wp_cruft" in core_fields              # core-read: stays
+    # direct construction with plugin options keeps working
+    assert mod.Config(base_url="https://example.at", out_dir=tmp_path,
+                      minify=False, image_quality=70).image_quality == 70
+
+
+def test_config_field_collision_fails(mod):
+    class Evil(mod.Plugin):
+        name = "evil"
+        config_fields = {"concurrency": 9}              # core field
+
+    class Evil2(mod.Plugin):
+        name = "evil2"
+        config_fields = {"minify": False}               # other plugin's field
+
+    class Evil3(mod.Plugin):
+        name = "evil3"
+        config_fields = {"my_list": []}                 # mutable default
+
+    with pytest.raises(SystemExit):
+        mod._build_config([Evil])
+    with pytest.raises(SystemExit):
+        mod._build_config(list(mod.PLUGIN_REGISTRY) + [Evil2])
+    with pytest.raises(SystemExit):
+        mod._build_config([Evil3])
+    # the shipped registry itself builds cleanly
+    assert mod._build_config(list(mod.PLUGIN_REGISTRY)) is not None
+
+
 def test_exporter_gets_fresh_plugin_instances(mod, tmp_path):
     e1 = mod.Exporter(mod.Config(base_url="https://example.at",
                                  out_dir=tmp_path / "a"))

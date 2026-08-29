@@ -150,7 +150,7 @@ import time
 import unicodedata
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+import dataclasses
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from urllib.parse import urljoin, urlsplit, urlunsplit, unquote, quote
@@ -164,8 +164,35 @@ if sys.version_info < (3, 10):
     sys.exit(f"wp-static-export needs Python 3.10+ "
              f"(running {sys.version.split()[0]})")
 
-TOOL_NAME = "wp-static-export"
-VERSION = "2.3.0"
+# --------------------------------------------------------------------------
+# Config / state -- lives in config.py next to this script. Loaded by
+# path (like the plugins) and registered as the module `wps_config`;
+# plugin-owned options are added to the Config class in load_plugins()
+# via the plugins' `config_fields` registry.
+# --------------------------------------------------------------------------
+
+def _load_config_module():
+    path = Path(__file__).resolve().parent / "config.py"
+    if not path.is_file():
+        sys.exit(f"wp-static-export: config module not found: {path}\n"
+                 f"config.py ships next to the script -- restore it.")
+    spec = importlib.util.spec_from_file_location("wps_config", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["wps_config"] = module   # findable for plugins / tests
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        # like importlib: never leave a half-initialized module behind
+        sys.modules.pop("wps_config", None)
+        raise
+    return module
+
+
+wps_config = _load_config_module()
+TOOL_NAME = wps_config.TOOL_NAME
+VERSION = wps_config.VERSION
+Config = wps_config.Config       # re-bound with plugin fields in load_plugins()
+PageRecord = wps_config.PageRecord
 
 # --------------------------------------------------------------------------
 # Classification helpers
@@ -526,6 +553,11 @@ class Plugin:
     lazy_img_attrs: tuple = ()       # extra lazy-load-plugin <img> attributes
     page_skip_pattern_fragments: tuple = ()  # extra PAGE_SKIP regex fragments
     extra_output_dirs: tuple = ()    # extra out-dir trees (--clean/.dockerignore)
+    config_fields: dict = {}         # plugin-owned Config fields: name ->
+                                     # immutable default; merged into the
+                                     # final Config class at load time, so
+                                     # direct Config(...) construction
+                                     # accepts them like core options
 
     # -- CLI phase (classmethods: run before any Exporter exists) ----------
     @classmethod
@@ -682,16 +714,42 @@ def _scan_plugins(plugins_dir: Path) -> list[tuple]:
             if not p.name.startswith("_")]
 
 
+def _build_config(registry: list) -> type:
+    """The final Config class: the core fields from config.py plus every
+    plugin's config_fields (declared in the plugin, so the core Config
+    stays plugin-free while direct Config(...) construction keeps
+    accepting plugin options). Collisions and mutable defaults fail
+    loudly at load time, like every other plugin-system error."""
+    extra: list[tuple] = []
+    taken = {f.name for f in dataclasses.fields(wps_config.Config)}
+    for cls in registry:
+        for fname, default in cls.config_fields.items():
+            if fname in taken:
+                sys.exit(f"{TOOL_NAME}: plugin {cls.name!r}: config field "
+                         f"{fname!r} collides with an existing option")
+            if isinstance(default, (list, dict, set, bytearray)):
+                sys.exit(f"{TOOL_NAME}: plugin {cls.name!r}: config field "
+                         f"{fname!r} needs an immutable default, "
+                         f"got {type(default).__name__}")
+            taken.add(fname)
+            extra.append((fname, type(default), default))
+    if not extra:
+        return wps_config.Config
+    return dataclasses.make_dataclass("Config", extra,
+                                      bases=(wps_config.Config,))
+
+
 def load_plugins() -> None:
     """Discover and register the plugins from the plugins/ directory next
     to this script, then aggregate their static registries into the
-    module-level constants. Runs exactly once, at the bottom of this
-    module -- later calls are no-ops (which is why there is no directory
-    parameter: it could never take effect)."""
+    module-level constants and their config_fields into the Config
+    class. Runs exactly once, at the bottom of this module -- later
+    calls are no-ops (which is why there is no directory parameter: it
+    could never take effect)."""
     global URL_ATTRS, PAGE_URL_ATTRS, B64_URL_ATTRS, HTML_NOISE_EXTRA
     global VERIFY_SCRIPT_REF_DIRS, VERIFY_SKIP_REF_PREFIXES
     global SRCSET_ATTRS, CSS_URL_ATTRS, LAZY_IMG_ATTRS, EXTRA_OUTPUT_DIRS
-    global PAGE_SKIP_PATTERNS
+    global PAGE_SKIP_PATTERNS, Config
     if PLUGIN_REGISTRY:
         return
     pdir = Path(__file__).resolve().parent / "plugins"
@@ -715,6 +773,7 @@ def load_plugins() -> None:
     if skip_fragments:
         PAGE_SKIP_PATTERNS = _compile_page_skip(
             PAGE_SKIP_FRAGMENTS + skip_fragments)
+    Config = _build_config(PLUGIN_REGISTRY)
 
 
 class HostResolveAdapter(HTTPAdapter):
@@ -738,74 +797,8 @@ class HostResolveAdapter(HTTPAdapter):
 
 
 # --------------------------------------------------------------------------
-# Config / state
+# Exporter -- Config / PageRecord live in config.py (module `wps_config`)
 # --------------------------------------------------------------------------
-
-@dataclass
-class Config:
-    base_url: str
-    out_dir: Path
-    rewrite: bool = True
-    clean: bool = False
-    follow_links: bool = True
-    concurrency: int = 5
-    delay: float = 0.0
-    timeout: float = 25.0
-    max_pages: int = 5000
-    user_agent: str = f"{TOOL_NAME}/{VERSION} (+static site exporter)"
-    insecure: bool = False
-    host_header: str | None = None
-    extra_headers: dict = field(default_factory=dict)
-    port: int = 8080
-    extra_sitemaps: list = field(default_factory=list)
-    # plugin-owned (plugins/mobile_check.py); user_agent "" means the
-    # plugin's default (iPhone UA)
-    mobile_check: bool = True
-    mobile_user_agent: str = ""
-    generate_sitemap: bool = True
-    strip_wp_cruft: bool = True
-    # plugin-owned option (declared here so direct Config() construction
-    # keeps working; consumed only by plugins/image_optimize.py)
-    optimize_images: bool = True
-    # plugin-owned (plugins/image_compress.py)
-    compress_images: bool = True
-    image_quality: int = 85
-    staging: bool = False
-    target_domain: str | None = None
-    sitemap_include_linked: bool = False
-    fail_on: str = "none"            # none | errors | verify
-    quiet: bool = False
-    excludes: list = field(default_factory=list)
-    respect_robots: bool = False
-    # plugin-owned (plugins/slider_revolution.py)
-    sr7_hydrate: bool = True
-    internal_hosts: list = field(default_factory=list)
-    resolve_internal: bool = True
-    # plugin-owned (plugins/minify.py)
-    minify: bool = True
-
-
-@dataclass
-class PageRecord:
-    url: str
-    status: int = 0
-    final_url: str = ""
-    error: str = ""
-    title: str = ""
-    has_title: bool = False
-    has_description: bool = False
-    has_viewport: bool = False
-    noindex: bool = False
-    canonical: str = ""
-    content_type: str = ""
-    source: str = "sitemap"          # sitemap | link | manual
-    mobile: str = ""                 # same | different | dynamic | check-failed
-                                     # (plugin-owned: plugins/mobile_check.py)
-    last_modified: str = ""          # raw Last-Modified response header
-    save_url: str = ""               # canonical URL the content was saved under
-                                     # (differs from url for redirect sources)
-    is_stub: bool = False            # only a redirect stub was written here
-
 
 class Exporter:
     def __init__(self, cfg: Config):

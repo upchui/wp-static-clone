@@ -58,6 +58,8 @@ def normalize_html(data: bytes) -> bytes:
 
 class MobileCheck(Plugin):
     name = "mobile_check"
+    # mobile_user_agent "" means the plugin's default (iPhone UA)
+    config_fields = {"mobile_check": True, "mobile_user_agent": ""}
     extra_output_dirs = (VARIANT_DIR,)
 
     @classmethod

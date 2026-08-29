@@ -1,5 +1,24 @@
 # Changelog
 
+## 2.4.0 (2026-08-29)
+
+Structural: configuration moves out of the core file, and plugin-owned
+options move into their plugins. No behavior change.
+
+### Changed
+- **`Config` and `PageRecord` live in their own file `config.py`** next
+  to the script, loaded by path (like the plugins) and importable as
+  `wps_config`. `TOOL_NAME`/`VERSION` moved along with them.
+- **Plugin-owned Config options are now declared in the plugin** via
+  the new `config_fields` class registry (name → immutable default) and
+  merged into the final `Config` class at load time — `minify`,
+  `optimize_images`, `compress_images`/`image_quality`,
+  `mobile_check`/`mobile_user_agent` and `sr7_hydrate` left the core
+  dataclass. Direct `Config(...)` construction keeps accepting them;
+  field-name collisions and mutable defaults abort loudly at load time
+  like every other plugin-system error. (`strip_wp_cruft` stays in the
+  core: the core's clean gate reads it.)
+
 ## 2.3.0 (2026-08-29)
 
 Image recompression: exported images get the same "smaller without

@@ -193,7 +193,7 @@ Full list including examples: `wp-static-export.py --help`.
 
 ## Plugins
 
-The core (`wp-static-export.py`) contains only the generic export pipeline — sitemap discovery, crawl, URL rewriting, verification, deployment files, report — plus a fixed set of **hook points** (called at defined stages of the pipeline) and **registries** (attribute names, URL patterns and the like that the core reads). Everything feature- or vendor-specific attaches to those and lives as a plugin in the [`plugins/`](plugins/) folder next to the script:
+The core (`wp-static-export.py`, with its `Config`/state records split out into [`config.py`](config.py)) contains only the generic export pipeline — sitemap discovery, crawl, URL rewriting, verification, deployment files, report — plus a fixed set of **hook points** (called at defined stages of the pipeline) and **registries** (attribute names, URL patterns and the like that the core reads). Options a plugin owns are declared in the plugin itself (`config_fields`) and merged into `Config` at load time. Everything feature- or vendor-specific attaches to those and lives as a plugin in the [`plugins/`](plugins/) folder next to the script:
 
 | Plugin | Provides |
 |---|---|

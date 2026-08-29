@@ -152,6 +152,7 @@ ordering dependency exists there.
 | `verify_script_ref_dirs` | `VERIFY_SCRIPT_REF_DIRS` | extra top-level dirs whose `"/dir/..."` refs inside inline scripts the verification resolves | cloudflare (`cf-fonts`, `cdn-cgi`) |
 | `verify_skip_ref_prefixes` | `VERIFY_SKIP_REF_PREFIXES` | local refs the verification never checks (resolved at runtime) | cloudflare (email-protection) |
 | `extra_output_dirs` | `EXTRA_OUTPUT_DIRS` | extra output trees next to `public/` that `--clean` removes and `.dockerignore` excludes | mobile_check (`mobile-variants`) |
+| `config_fields` | the final `Config` class | plugin-owned Config fields (name → immutable default), merged at load time so direct `Config(...)` construction accepts them; collisions/mutable defaults abort loudly | minify, image_optimize, image_compress, mobile_check, slider_revolution |
 
 ## Hook reference
 
@@ -189,14 +190,18 @@ Hooks returning a value are filters; the rest are notifications.
 Plugins are **trusted local code**: they get the full `Exporter`. The
 pieces plugins actually use:
 
-* `exp.cfg` — the run's `Config`. Options a plugin owns are still
-  *declared* on the dataclass in the core (with a `# plugin-owned`
-  comment) so that programmatic `Config(...)` construction keeps
-  working; only the plugin reads them (`minify`, `sr7_hydrate`,
-  `optimize_images`, `mobile_check`, `mobile_user_agent`). A
-  third-party plugin can instead set its own attribute in
-  `finish_args` (`cfg.my_option = args.my_option`) and read it with
-  `getattr(cfg, "my_option", default)`.
+* `exp.cfg` — the run's `Config`. The core fields live in
+  [`config.py`](../config.py) next to the script (importable as
+  `wps_config`); options a plugin owns are declared IN THE PLUGIN via
+  the `config_fields` class attribute (name → immutable default, e.g.
+  `config_fields = {"minify": True}`) and merged into the final
+  `Config` class at load time — so programmatic `Config(...)`
+  construction accepts them like core options, and only the plugin
+  reads them. Field-name collisions and mutable defaults abort loudly
+  at load time. A quick-and-dirty plugin can instead set its own
+  attribute in `finish_args` (`cfg.my_option = args.my_option`) and
+  read it with `getattr(cfg, "my_option", default)` — but declared
+  `config_fields` are the supported way.
 * `exp.fetch(url, headers=..., stream=...)` — the ONLY way to make
   requests: it enforces the global rate gate and never follows a
   redirect off the target site. Never talk to foreign hosts.

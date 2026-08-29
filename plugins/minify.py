@@ -93,6 +93,7 @@ def strip_svg_comments(text: str) -> str:
 
 class Minify(Plugin):
     name = "minify"
+    config_fields = {"minify": True}
 
     @classmethod
     def add_cli_args(cls, group):

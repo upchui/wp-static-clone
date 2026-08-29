@@ -113,6 +113,7 @@ def read_image_size(path: Path) -> tuple[int, int] | None:
 
 class ImageOptimize(Plugin):
     name = "image_optimize"
+    config_fields = {"optimize_images": True}
 
     @classmethod
     def add_cli_args(cls, group):

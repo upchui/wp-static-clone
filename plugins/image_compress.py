@@ -51,6 +51,7 @@ def significant_gain(orig_size: int, new_size: int, min_gain: float) -> bool:
 
 class ImageCompress(Plugin):
     name = "image_compress"
+    config_fields = {"compress_images": True, "image_quality": 85}
 
     @classmethod
     def add_cli_args(cls, group):

@@ -25,6 +25,7 @@ PLUGIN_URL_RE = re.compile(r"SR7\.E\.plugin_url\s*=\s*['\"]([^'\"]+)['\"]")
 
 class SliderRevolution(Plugin):
     name = "slider_revolution"
+    config_fields = {"sr7_hydrate": True}
     b64_url_attrs = ("data-dbsrc",)
 
     @classmethod
