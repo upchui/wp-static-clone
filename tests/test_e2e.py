@@ -377,3 +377,23 @@ def test_inline_module_script_minified(export):
     assert "// note" not in html
     assert "const mk=1;" in html
     assert "e2e-pre-comment" not in html        # comments inside <pre> go too
+
+
+def test_images_recompressed(export, mod):
+    stats = export["report"]["seo"]["image_compression"]
+    assert stats["failed"] == 0                 # every fixture PNG decodes
+    assert stats["animated_skipped"] == 0
+    assert stats["png"] >= 1                    # solid-color PNGs shrink
+    assert stats["bytes_saved"] > 0
+    # replaced files are still valid PNGs with unchanged dimensions
+    read = mod.PLUGIN_MODULES["image_optimize"].read_image_size
+    up = export["public"] / "wp-content" / "uploads"
+    assert read(up / "plain.png") == (320, 200)
+    assert read(up / "hero.png") == (640, 480)
+
+
+def test_svg_comments_stripped(export):
+    svg = (export["public"] / "wp-content" / "themes" / "fix" /
+           "icon.svg").read_text(encoding="utf-8")
+    assert "e2e-svg-comment" not in svg
+    assert "keep-me" in svg                     # CDATA content untouched

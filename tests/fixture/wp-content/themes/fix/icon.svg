@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10">
+<!-- e2e-svg-comment -->
+<style><![CDATA[/* keep-me */ .a{fill:red}]]></style>
+<circle class="a" cx="5" cy="5" r="4"/>
+</svg>

@@ -16,6 +16,7 @@ What plugins do today (each line names a shipped example to read):
 * inspect page responses and run extra requests — [`mobile_check.py`](mobile_check.py)
 * claim non-HTML responses and materialize files — [`downloads.py`](downloads.py)
 * post-process the exported HTML tree after the crawl — [`image_optimize.py`](image_optimize.py)
+* recompress the exported image files in place — [`image_compress.py`](image_compress.py)
 * skip URLs, contribute 301 rules to the server configs, and add their
   own CLI flags, console summary lines and report sections — most of them
 
@@ -116,6 +117,9 @@ crawl, per ASSET  save_non_html_response  claim e.g. download endpoints
 post-crawl        wants_postprocess       any True -> extra pass over every
                   postprocess_soup        exported HTML page (return True
                                           when you changed the soup)
+finalization      run_end                 whole-output-tree passes over
+                                          the written files (crash-
+                                          isolated per plugin)
 verify            reads VERIFY_SCRIPT_REF_DIRS / VERIFY_SKIP_REF_PREFIXES
 deploy files      redirect_rules          extra (from_path, to_ref) 301s
 console summary   summary_lines
@@ -129,7 +133,9 @@ and one shipped pair does depend on it: `downloads.postprocess_soup`
 rewrites `/download/…/` links onto the materialized files *before*
 `image_optimize.postprocess_soup` resolves `img src` paths against the
 disk. Keep that in mind before renaming plugin files (renaming is the
-supported way to reorder).
+supported way to reorder). `run_end` also fires in load order; the
+shipped users touch disjoint file sets (raster images vs `.svg`), so no
+ordering dependency exists there.
 
 ## Registry reference
 
@@ -173,6 +179,7 @@ Hooks returning a value are filters; the rest are notifications.
 | `filter_text_asset(url, kind, text) -> str` [T] | LAST transform of a rewritten CSS/JS asset before it is written | minify |
 | `wants_postprocess() -> bool` | gates the post-crawl read-modify-write pass over every exported page | image_optimize, downloads |
 | `postprocess_soup(soup) -> bool` | post-crawl transform per exported page; return `True` when changed | image_optimize, downloads |
+| `run_end()` | post-crawl finalization: whole-tree work over `public_dir`, after the HTML post-processing pass and before verification/report (main thread; spawn your own executor for parallelism) | image_compress, minify (SVG comments) |
 | `redirect_rules(seen_from) -> list` | extra `(from_path, to_ref)` 301 rules for nginx/Netlify/Apache configs; skip paths already in `seen_from`, filter unsafe characters yourself | downloads |
 | `summary_lines() -> list[str]` | console lines for the final summary | minify, mobile_check, downloads |
 | `add_report(report, txt_head, txt_sections)` | mutate `report.json` (dict), append `report.txt` head lines / `report_section()` blocks; runs before the JSON dump | all feature plugins |
@@ -235,7 +242,10 @@ with self.exp.stats_lock:
 ```
 
 Plain `list.append` on your own instance lists is fine (GIL-atomic);
-read-modify-write of counters and dicts is not.
+read-modify-write of counters and dicts is not. `run_end` itself runs
+on the main thread — but a plugin that spawns its own pool there
+(`image_compress` uses `cfg.concurrency`) follows the same
+`stats_lock` rules.
 
 **`report["warnings"]` aliases `exp.warnings`.** The report dict holds
 the *same list object*, and `add_report` runs before the JSON dump — so

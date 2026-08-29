@@ -2,3 +2,4 @@ requests>=2.32
 beautifulsoup4>=4.12
 rjsmin>=1.2
 rcssmin>=1.1
+Pillow>=10.4

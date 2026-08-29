@@ -5,7 +5,8 @@ conditional relics too, and even inside <pre> -- they never render),
 CSS/JS comments incl. /*! license banners */, legacy <!-- ... //-->
 hiding wrappers, comments in style="" attributes, and inline module
 scripts. Indentation is collapsed. JSON-LD, template/data script blocks
-and textarea content (visible text) stay untouched.
+and textarea content (visible text) stay untouched. XML comments in
+exported .svg assets go too (outside CDATA sections).
 Needs the rjsmin and rcssmin packages -- a stale venv fails loudly at the
 CLI instead of silently producing an unminified export.
 """
@@ -78,6 +79,18 @@ def minify_html_bytes(data: bytes) -> bytes:
     return "".join(parts).encode("utf-8")
 
 
+SVG_CDATA_RE = re.compile(r"(<!\[CDATA\[.*?\]\]>)", re.DOTALL)
+
+
+def strip_svg_comments(text: str) -> str:
+    """XML comments out of SVG text; CDATA sections stay byte-identical
+    (their '<!--' is character data, e.g. inside embedded scripts)."""
+    parts = SVG_CDATA_RE.split(text)
+    for i in range(0, len(parts), 2):       # even indexes = outside CDATA
+        parts[i] = HTML_COMMENT_ALL_RE.sub("", parts[i])
+    return "".join(parts)
+
+
 class Minify(Plugin):
     name = "minify"
 
@@ -103,7 +116,8 @@ class Minify(Plugin):
 
     def __init__(self, exporter):
         super().__init__(exporter)
-        self.stats = {"html": 0, "css": 0, "js": 0, "bytes_saved": 0}
+        self.stats = {"html": 0, "css": 0, "js": 0, "svg": 0,
+                      "bytes_saved": 0}
 
     @property
     def enabled(self) -> bool:
@@ -171,12 +185,41 @@ class Minify(Plugin):
     def post_serialize(self, data: bytes) -> bytes:
         return minify_html_bytes(data) if self.enabled else data
 
+    def run_end(self) -> None:
+        """SVG assets are text but copied byte-identical by the crawl --
+        strip their XML comments in the post-crawl pass. Comments only:
+        no whitespace games, CDATA untouched, non-UTF-8 files skipped."""
+        if not self.enabled:
+            return
+        for svg in sorted(self.exp.public_dir.rglob("*")):
+            if not (svg.suffix.lower() == ".svg" and svg.is_file()):
+                continue
+            try:
+                raw = svg.read_bytes()
+                text = raw.decode("utf-8")   # strict: exotic encodings stay
+            except (OSError, UnicodeDecodeError):
+                continue
+            out = strip_svg_comments(text)
+            if out == text:
+                continue
+            data = out.encode("utf-8")
+            try:
+                svg.write_bytes(data)
+            except OSError as exc:
+                self.exp.warnings.append(
+                    f"svg comment strip: cannot write {svg.name}: {exc}")
+                continue
+            with self.exp.stats_lock:
+                self.stats["svg"] += 1
+                self.stats["bytes_saved"] += len(raw) - len(data)
+
     def summary_lines(self) -> list[str]:
         if not (self.enabled and any(self.stats.values())):
             return []
         return [f"[seo] minified: {self.stats['html']} HTML, "
                 f"{self.stats['css']} CSS, "
-                f"{self.stats['js']} JS files "
+                f"{self.stats['js']} JS, "
+                f"{self.stats['svg']} SVG files "
                 f"({self.stats['bytes_saved'] // 1024} KB saved)"]
 
     def add_report(self, report: dict, txt_head: list,

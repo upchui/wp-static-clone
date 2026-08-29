@@ -947,6 +947,20 @@ def test_serialize_removes_comments_in_pre_and_style_attr(mod, tmp_path):
     assert "keep &lt;!-- visible --&gt; text" in out
 
 
+def test_minify_run_end_strips_svg_comments(mod, tmp_path):
+    e = mod.Exporter(mod.Config(base_url="https://example.at",
+                                out_dir=tmp_path / "o"))
+    e.public_dir.mkdir(parents=True)
+    p = e.public_dir / "icon.svg"
+    p.write_text("<svg><!-- x --><rect/></svg>", encoding="utf-8")
+    weird = e.public_dir / "weird.svg"
+    weird.write_bytes(b"\xff\xfe<svg/>")               # not UTF-8: untouched
+    e.plugin("minify").run_end()
+    assert "<!--" not in p.read_text(encoding="utf-8")
+    assert weird.read_bytes() == b"\xff\xfe<svg/>"
+    assert e.plugin("minify").stats["svg"] == 1
+
+
 def test_minify_missing_libs_warns(mod, tmp_path, monkeypatch):
     pmod = mod.PLUGIN_MODULES["minify"]
     monkeypatch.setattr(pmod, "rjsmin", None)

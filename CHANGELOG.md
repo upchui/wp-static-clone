@@ -1,5 +1,36 @@
 # Changelog
 
+## 2.3.0 (2026-08-29)
+
+Image recompression: exported images get the same "smaller without
+looking different" treatment the text assets already had.
+
+### Added
+- **Image recompression plugin** (`plugins/image_compress.py`, on by
+  default): every exported PNG/JPEG/GIF/WebP is re-encoded -- PNG and
+  static GIF losslessly (incl. an exact-lossless palette reduction for
+  PNGs with <=256 colors), JPEG at `--image-quality` (default 85,
+  progressive, EXIF orientation baked into the pixels, ICC profile
+  kept, all other metadata dropped), lossless WebP repacked at maximum
+  effort. A re-encode replaces the original only when significantly
+  smaller (>=10% lossy / >=2% lossless), it must decode back to the
+  expected dimensions, and the lossless paths must render
+  pixel-identically to the original; animated images are never
+  touched. Results in the console summary and under
+  `seo.image_compression` in the report. Disable with
+  `--no-compress-images`.
+- **New plugin hook `run_end()`**: post-crawl finalization over the
+  written output tree, after HTML post-processing and before
+  verification/report; crash-isolated per plugin.
+- SVG files are text: XML comments in exported `.svg` assets are now
+  stripped by the minify plugin (outside CDATA sections) -- the last
+  comment-carrying file type.
+
+### Changed
+- **New hard dependency: Pillow** (`Pillow>=10.4`). Like the
+  minifiers, a stale venv fails loudly at the CLI
+  (`pip install -r requirements.txt`, or `--no-compress-images`).
+
 ## 2.2.1 (2026-08-29)
 
 Comment-stripping completeness: every remaining path where a comment

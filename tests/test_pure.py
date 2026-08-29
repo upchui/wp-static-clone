@@ -11,7 +11,7 @@ def png_bytes(w, h):
         return struct.pack(">I", len(data)) + c + struct.pack(">I", zlib.crc32(c))
     ihdr = struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)
     return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr)
-            + chunk(b"IDAT", zlib.compress(b"\x00" + b"\x00" * 3 * w))
+            + chunk(b"IDAT", zlib.compress((b"\x00" + b"\x00" * 3 * w) * h))
             + chunk(b"IEND", b""))
 
 
@@ -290,6 +290,30 @@ def test_minify_js_strips_cc_comments(mod):
     # silently bring the relics back
     mod = mod.PLUGIN_MODULES["minify"]
     assert mod.minify_js("/*@cc_on var ie=1; @*/var a=1;") == "var a=1;"
+
+
+# -- v2.3.0: SVG comment stripping / image recompression helpers -------------
+
+def test_strip_svg_comments(mod):
+    m = mod.PLUGIN_MODULES["minify"]
+    svg = ('<svg><!-- gone --><style><![CDATA[/* keep */ <!-- data -->'
+           ']]></style><!-- gone2 --></svg>')
+    out = m.strip_svg_comments(svg)
+    assert "gone" not in out
+    assert "keep" in out and "<!-- data -->" in out      # CDATA untouched
+    assert m.strip_svg_comments("<svg/>") == "<svg/>"
+    assert m.strip_svg_comments("<svg><!-- open") == "<svg><!-- open"
+
+
+def test_significant_gain(mod):
+    ic = mod.PLUGIN_MODULES["image_compress"]
+    assert ic.significant_gain(1000, 900, 0.10)          # exactly 10%
+    assert not ic.significant_gain(1000, 901, 0.10)
+    assert ic.significant_gain(1000, 980, 0.02)
+    assert not ic.significant_gain(1000, 981, 0.02)
+    assert not ic.significant_gain(0, 0, 0.02)           # empty original
+    assert not ic.significant_gain(100, 0, 0.02)         # empty re-encode
+    assert not ic.significant_gain(100, 100, 0.0)        # never grow/equal
 
 
 # -- v2.2.0: srcset parser / canon_path segment handling / urlsafe b64 -------

@@ -165,7 +165,7 @@ if sys.version_info < (3, 10):
              f"(running {sys.version.split()[0]})")
 
 TOOL_NAME = "wp-static-export"
-VERSION = "2.2.1"
+VERSION = "2.3.0"
 
 # --------------------------------------------------------------------------
 # Classification helpers
@@ -627,6 +627,13 @@ class Plugin:
         """Post-crawl transform of an exported page; True = changed."""
         return False
 
+    def run_end(self) -> None:
+        """Post-crawl finalization: whole-output-tree work over the
+        written files (public_dir.rglob), after the HTML post-processing
+        pass and before verification/report. Called on the main thread,
+        one plugin at a time and crash-isolated like every post-crawl
+        step; spawn your own executor for parallel file work."""
+
     def summary_lines(self) -> list[str]:
         """Console lines for the final run() summary."""
         return []
@@ -760,6 +767,9 @@ class Config:
     # plugin-owned option (declared here so direct Config() construction
     # keeps working; consumed only by plugins/image_optimize.py)
     optimize_images: bool = True
+    # plugin-owned (plugins/image_compress.py)
+    compress_images: bool = True
+    image_quality: int = 85
     staging: bool = False
     target_domain: str | None = None
     sitemap_include_linked: bool = False
@@ -3362,6 +3372,12 @@ esac
             step("sitemap generation", self.write_generated_sitemap)
         step("robots.txt finalization", self.finalize_robots)
         step("HTML post-processing", self.postprocess_html)
+        # generic plugin finalization: whole-tree passes over the written
+        # files -- after postprocess_html (postprocessors must see the
+        # original bytes), before verification and the report so results
+        # land in both
+        for p in self.plugins:
+            step(f"plugin finalization ({p.name})", p.run_end)
         step("verification", self.verify_export)
         step("deploy file generation", self.write_deploy_files)
         step("report", self.write_report)

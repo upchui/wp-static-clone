@@ -10,7 +10,7 @@ The result renders exactly like the live site when served over HTTP — without 
 
 ## Installation
 
-Python 3.10+ (Linux/macOS — URLs containing NTFS-illegal characters produce per-file warnings on Windows). Required packages: `requests`, `beautifulsoup4` and — for the default minification — `rjsmin` + `rcssmin`:
+Python 3.10+ (Linux/macOS — URLs containing NTFS-illegal characters produce per-file warnings on Windows). Required packages: `requests`, `beautifulsoup4` and — for the default optimizations — `rjsmin` + `rcssmin` (minification) and `Pillow` (image recompression):
 
 ```bash
 python3 -m venv .venv
@@ -128,6 +128,7 @@ The export is SEO-complete out of the box:
 - **One canonical URL per page** — the generated nginx config 301s `/page` → `/page/` (matching the exported structure) and serves the redirects observed on the origin as real 301s (`redirects.inc`), visitor query strings included; old origin sitemap URLs 301 onto the generated `/sitemap.xml`. Redirect stubs carry `noindex`; `/404.html` answers 404 instead of an indexable 200. On Netlify and Apache the trailing-slash canonicalization comes from the platform itself (Pretty URLs / `DirectorySlash`, both on by default).
 - **WordPress cruft removed** — generator meta, wp-json/oEmbed/feed discovery, EditURI/RSD, wlwmanifest, pingback, `?p=` shortlinks, the Cloudflare Insights beacon (which only produces CORS errors off Cloudflare) and `dns-prefetch`/internal `preconnect` resource hints (which trigger browser Local-Network-Access prompts when they point at internal hosts) are stripped. `canonical`, `hreflang`, `og:*`/`twitter:*` and JSON-LD stay. Disable with `--no-strip-wp-cruft`.
 - **Image optimization** — `loading="lazy"` + `decoding="async"` on images (except each page's first image and plugin-lazyloaded ones) and `width`/`height` attributes read straight from the local PNG/JPEG/GIF/WebP headers (CLS). Disable with `--no-optimize-images`.
+- **Image recompression** — every exported PNG/JPEG/GIF/WebP is re-encoded and replaced only when significantly smaller: PNG/static-GIF losslessly (incl. exact palette reduction, verified pixel-identical), JPEG at quality 85 (progressive, EXIF orientation baked in, ICC profile kept, other metadata dropped), lossless WebP repacked; animated images untouched. Disable with `--no-compress-images`, tune with `--image-quality N`.
 - **Minification** — every exported HTML page, CSS and JS file (incl. `*.min.*`) plus inline styles/scripts (incl. `type="module"`) and `style` attributes is minified, with **all comments removed**: license banners, IE conditional comments and conditional-compilation relics, CSS hack pairs, legacy `<!-- ... //-->` comment-hiding wrappers, even HTML comments inside `<pre>` (they never render). JSON-LD, template/data script blocks and `<textarea>` content stay untouched; comment-lookalike *string literals* in plugin JS (e.g. SR7 WebGL shader placeholders) are functional code and remain. Disable with `--no-minify`.
 - **Slider Revolution 7 works statically** — SR7 lazy-loads later slides from `/wp-json/…` at runtime, which freezes the slider on slide 1 in a static mirror. The exporter fetches each slider's full object once at export time and embeds the missing slide layers into the page (the runtime's own cache check then makes zero requests), downloading the later-slide images along the way. Disable with `--no-sr7-hydrate`.
 - **Download endpoints become real files** — dynamic download URLs (`/download/123/?tmstv=…`, Download Monitor & co. serving `Content-Disposition: attachment`) are saved under their real file name (`/download/123/Vollmacht.pdf`), all links are rewritten onto the file, and the old endpoint URLs 301 onto it in every deploy format.
@@ -169,6 +170,8 @@ For non-Docker nginx, check the module with `nginx -V 2>&1 | grep -o with-http_s
 | `--no-generate-sitemap` | keep origin sitemap files instead of generating `/sitemap.xml` |
 | `--no-strip-wp-cruft` | keep WP head cruft (generator, wp-json/oEmbed discovery, shortlink, …) |
 | `--no-optimize-images` | skip `loading=lazy` / `width`/`height` injection |
+| `--no-compress-images` | skip the in-place image recompression |
+| `--image-quality N` | JPEG re-encode quality 1-95 (default 85) |
 | `--no-minify` | skip HTML/CSS/JS minification |
 | `--staging` | full noindex mode (robots.txt, `X-Robots-Tag`, meta robots) for previews |
 | `--target-domain D` | hard-rewrite canonical/og/JSON-LD/sitemap URLs to domain `D` (Netlify/Apache) |
@@ -197,6 +200,7 @@ The core (`wp-static-export.py`) contains only the generic export pipeline — s
 | `minify` | HTML/CSS/JS minification (`--no-minify`) |
 | `slider_revolution` | SR7 lazy-slide hydration, `data-dbsrc` URLs, runtime resource discovery (`--no-sr7-hydrate`) |
 | `image_optimize` | `loading=lazy` / `width`/`height` injection, header-based image-size readers (`--no-optimize-images`) |
+| `image_compress` | in-place recompression of exported raster images (`--no-compress-images`, `--image-quality`) |
 | `mobile_check` | the mobile-vs-desktop HTML comparison incl. `mobile-variants/` output (`--no-mobile-check`, `--mobile-user-agent`) |
 | `downloads` | dynamic download endpoints materialized as real files, link rewriting, 301 rules |
 | `wordpress` | WP head-cruft removal, WPForms AJAX skip, WooCommerce cart/checkout skip |
