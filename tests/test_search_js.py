@@ -93,6 +93,14 @@ LIVE_ORDER = {
                        "/ueber-uns/", "/"],
     "wohnräume": ["/fliesenlegerarbeiten/", "/malerarbeiten/"],
     "beton": [],
+    # an EMPTY query is WordPress' LIKE '%%': every page, every one of
+    # them in the title bucket, so plain post_date DESC
+    "": ["/datenschutzerklaerung/", "/raeumungen/", "/kleine-grabarbeiten/",
+         "/bodenlegerarbeiten/", "/maschinen-geraete/",
+         "/fliesenlegerarbeiten/", "/estricharbeiten/", "/malerarbeiten/",
+         "/maurerarbeiten/", "/anstreicherarbeiten/", "/fassaden/",
+         "/impressum/", "/kontakt/", "/ueber-uns/partner/", "/ueber-uns/",
+         "/"],
 }
 
 HARNESS = r"""

@@ -492,12 +492,10 @@ RENDERER_JS = r'''
   var C = __CFG__;
   var T = C.de ? {
     z: "Keine Ergebnisse f\u00fcr \u201e%s\u201c.",
-    e: "Bitte einen Suchbegriff eingeben.",
     f: "Der Suchindex konnte nicht geladen werden.",
     t: "Suchergebnisse f\u00fcr \u201e%s\u201c"
   } : {
     z: "No results for \u201c%s\u201d.",
-    e: "Please enter a search term.",
     f: "The search index could not be loaded.",
     t: "Search results for \u201c%s\u201d"
   };
@@ -652,10 +650,12 @@ RENDERER_JS = r'''
   function run(docs, q) {
     var sentence = fold(String(q).replace(/^\s+|\s+$/g, ""));
     var ts = terms(q), hits = [], i, d;
-    if (!ts.length && sentence) { ts = [sentence]; }
+    // An empty query is WordPress' LIKE '%%': it matches every page and
+    // puts them all in the title bucket, i.e. plain post_date DESC.
+    if (!ts.length) { ts = [sentence]; }
     for (i = 0; i < docs.length; i++) {
       d = docs[i];
-      if (ts.length && matches(d, ts)) {
+      if (matches(d, ts)) {
         hits.push([rank(d, ts, sentence), pubdate(d), d]);
       }
     }
@@ -694,7 +694,7 @@ RENDERER_JS = r'''
   function render() {
     var q = param("s") || param("q");
     echo(q);
-    if (!q) { message(T.e); return; }
+    // no early return for an empty query: WordPress lists everything
     if (C.docs) { run(C.docs, q); return; }
     var x = new XMLHttpRequest();
     x.open("GET", C.idx, true);

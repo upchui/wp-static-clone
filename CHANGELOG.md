@@ -1,5 +1,14 @@
 # Changelog
 
+## 2.9.1 (2026-08-30)
+
+### Fixed
+- **An empty query listed nothing.** `/search/?s=` answered "Bitte einen
+  Suchbegriff eingeben."; WordPress treats an empty search as
+  `LIKE '%%'` and returns *every* page, all of them in the title bucket,
+  i.e. plain `post_date` descending. Verified against the live site: 16
+  results in the identical order. The prompt string is gone.
+
 ## 2.9.0 (2026-08-30)
 
 The exported search now returns results in WordPress' own order.
