@@ -22,12 +22,19 @@ Three pieces:
 
 2. RESULTS PAGE -- generated at a language-derived path (`<html lang>`
    starts with "de" -> `/suche/`, else `/search/`; `--search-path`
-   overrides) by CLONING an already-exported page -- `404.html` first
-   (complete theme chrome, empty content well), else the homepage, else a
-   minimal self-contained page. The main content well is emptied and
-   filled with the results container plus a small dependency-free
-   renderer. The page is `noindex,follow`ed, exactly like WordPress
-   noindexes search results.
+   overrides). Its DESIGN IS HARVESTED FROM THE LIVE SITE: a handful of
+   `GET /?s=<term>` probes (at most PROBE_MAX_REQUESTS, all inside
+   run_end) give us the theme's own results skeleton, its result-card
+   markup -- turned into a template with `%%X%%` slots -- the per-page
+   meta WordPress renders (author, date, excerpt) and the theme's own
+   "nothing found" block. The static page ships the theme's own
+   container and, whenever the index fits, renders into it while the
+   document is still parsing, so the theme's grid/masonry code
+   initializes over real cards exactly as it does live. When the
+   origin's search cannot be harvested (disabled, dead,
+   --no-search-harvest) the page falls back to cloning the exported
+   404.html, then the homepage, then minimal built-in markup. It is
+   `noindex,follow`ed, exactly like WordPress noindexes search results.
 
 3. WIRING -- every search form on every page gets `action="<search path>"`
    (the `name="s"` input stays, so URLs keep the WordPress shape
@@ -43,20 +50,42 @@ depends on the site language, which is only known after the crawl.
 Rewrite mode only (`--no-rewrite` re-serializes nothing, so nothing can be
 injected). Disable with `--no-search`.
 """
+import copy
 import json
+import random
 import re
+import string
 import unicodedata
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import parse_qs, quote, urljoin, urlsplit, urlunsplit
 
+import requests
 from bs4 import (BeautifulSoup, CData, Comment, Declaration, Doctype,
                  NavigableString, ProcessingInstruction, Tag)
 
+import wp_static_export as core          # registries are rebound at load
 from wp_static_export import Plugin, canon_path
 
 INDEX_PATH = "/search-index.json"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2                       # docs gained a 5th slot element
 RESULTS_ID = "wpse-search-results"
 MARKER = "wpse-search"                  # data attribute on our injected tags
+
+# -- live-design harvesting --------------------------------------------------
+PROBE_MAX_REQUESTS = 12      # HARD ceiling on live /?s= requests per export
+PROBE_MAX_PAGES = 8          # paginator follow depth per term (loop guard)
+PROBE_MAX_ITEMS = 200        # sanity cap on cards taken from one response
+# index size up to which the docs are inlined into the results page: doing
+# so makes the renderer run BEFORE DOMContentLoaded, so the theme's own
+# grid/masonry code initializes over real cards (an XHR always loses that
+# race and leaves the cards unpositioned -- see relayout())
+INLINE_MAX_BYTES = 256 * 1024
+# words usable as probe terms: letters only, no digits/underscore
+WORD_RE = re.compile(r"[^\W\d_]{2,32}", re.UNICODE)
+# pagination blocks to drop from the harvested content well (second net;
+# the primary rule is "contains a link that still carries ?s=")
+PAGER_CLASS_RE = re.compile(
+    r"(?:paginator|pagination|page-numbers|nav-links|page-links"
+    r"|posts-nav|post-nav|paging[\w-]*)")
 
 # -- content extraction ------------------------------------------------------
 # Generic, NOT theme-specific: the main content well of a WordPress page in
@@ -309,6 +338,124 @@ def js_literal(value) -> str:
             .replace("\u2029", "\\u2029"))
 
 
+# -- probe-term selection (pure) ---------------------------------------------
+
+def fold_word(word: str) -> str:
+    """Lowercase, NFD-stripped, ss-folded -- the same normalization the
+    renderer's fold() applies, so probe terms and matching agree."""
+    w = unicodedata.normalize("NFD", (word or "").lower())
+    w = "".join(c for c in w if not unicodedata.combining(c))
+    return w.replace("\u00df", "ss")
+
+
+def doc_words(text: str) -> set:
+    """Folded word set of one indexed document."""
+    return {fold_word(m.group(0)) for m in WORD_RE.finditer(text or "")}
+
+
+def word_forms(text: str) -> dict:
+    """folded token -> one original spelling from the text. Frequency
+    counting folds ('Straße' and 'Strasse' are one term), but the PROBE
+    must go out in the spelling the site actually contains."""
+    out: dict = {}
+    for m in WORD_RE.finditer(text or ""):
+        out.setdefault(fold_word(m.group(0)), m.group(0))
+    return out
+
+
+def rare_term(words_per_doc: list, titles: list) -> str:
+    """A term the live search will answer with a SMALL, unambiguous result
+    set: the longest ASCII word of >= 8 characters that occurs in exactly
+    one indexed document. Rare enough that its echo in the results page
+    ("<title>Du hast nach X gesucht") can be split off without guessing,
+    and taken from our own corpus, so the origin really does find it."""
+    freq: dict = {}
+    for ws in words_per_doc:
+        for w in ws:
+            freq[w] = freq.get(w, 0) + 1
+    unique = [w for w, n in freq.items() if n == 1]
+    for minlen, ascii_only in ((8, True), (8, False), (6, False)):
+        cands = [w for w in unique
+                 if len(w) >= minlen and (w.isascii() or not ascii_only)]
+        if cands:
+            return max(sorted(cands), key=len)
+    # no usable body text (--search-max-chars 0, image-only site): the
+    # longest word of a page TITLE still identifies a real page
+    tw = sorted({w for t in titles for w in doc_words(t) if len(w) >= 6})
+    return max(tw, key=len) if tw else ""
+
+
+def broad_term(texts_by_path: dict, uncovered: set, used: set) -> str:
+    """Greedy set cover: the candidate term that appears in the most still
+    uncovered documents. Single characters first (a WordPress LIKE search
+    on one letter matches nearly every page -- maximum coverage per
+    request), then whole words. Language-agnostic: the candidates come
+    from the corpus, not from a hardcoded list."""
+    if not uncovered:
+        return ""
+    chars: dict = {}
+    words: dict = {}
+    for path in uncovered:
+        raw = texts_by_path.get(path) or ""
+        # characters from the ORIGINAL text: folding 'ä' to 'a' could
+        # hand us a letter the page does not literally contain
+        for c in {c for c in raw.lower() if c.isalpha()}:
+            chars[c] = chars.get(c, 0) + 1
+        for w in {w for w in doc_words(raw) if 4 <= len(w) <= 24}:
+            words[w] = words.get(w, 0) + 1
+    for pool in (chars, words):
+        best, best_n = "", 0
+        for term in sorted(pool):
+            if term not in used and pool[term] > best_n:
+                best, best_n = term, pool[term]
+        if best:                       # single letters beat words outright
+            return best
+    return ""
+
+
+def split_echo(text: str, term: str) -> tuple | None:
+    """(prefix, suffix) around the LAST occurrence of `term`, or None.
+    The echo is always the tail of these strings ('Ergebnisse für "te"',
+    'Du hast nach te gesucht - Site'), so rfind is exact -- verified
+    against the live markup for 1-, 2- and 21-character terms."""
+    if not term or not text:
+        return None
+    i = text.rfind(term)
+    if i < 0:
+        return None
+    return text[:i], text[i + len(term):]
+
+
+def _set_text(el, text: str) -> None:
+    el.clear()
+    el.append(NavigableString(text))
+
+
+def _wrap(el, before: str, after: str) -> None:
+    """Bracket an optional element with the renderer's cut markers."""
+    el.insert_before(NavigableString(before))
+    el.insert_after(NavigableString(after))
+
+
+def _rel_set(tag) -> set:
+    """bs4 gives `rel` as a LIST on parsed markup but as a plain STRING on
+    tags we build ourselves -- iterating the latter would walk single
+    characters."""
+    rel = tag.get("rel") or []
+    if isinstance(rel, str):
+        rel = rel.split()
+    return {str(r).lower() for r in rel}
+
+
+def _href_path(a) -> str:
+    """Root-relative path of an <a> in ALREADY LOCALIZED markup ('' when
+    the href is external, absolute or empty)."""
+    href = (a.get("href") or "").split("#")[0].split("?")[0]
+    if not href.startswith("/") or href.startswith("//"):
+        return ""
+    return canon_path(href)
+
+
 # -- the injected JavaScript -------------------------------------------------
 # Both snippets are ASCII apart from the German UI words; every regex
 # character class uses \u escapes so no encoding step can mangle them.
@@ -324,17 +471,12 @@ RENDERER_JS = r'''
   "use strict";
   var C = __CFG__;
   var T = C.de ? {
-    n: "%n Treffer f\u00fcr \u201e%s\u201c",
-    n1: "1 Treffer f\u00fcr \u201e%s\u201c",
-    z: "Keine Ergebnisse f\u00fcr \u201e%s\u201c. Bitte mit einem anderen "
-       + "Begriff suchen.",
+    z: "Keine Ergebnisse f\u00fcr \u201e%s\u201c.",
     e: "Bitte einen Suchbegriff eingeben.",
     f: "Der Suchindex konnte nicht geladen werden.",
     t: "Suchergebnisse f\u00fcr \u201e%s\u201c"
   } : {
-    n: "%n results for \u201c%s\u201d",
-    n1: "1 result for \u201c%s\u201d",
-    z: "No results for \u201c%s\u201d. Please try a different term.",
+    z: "No results for \u201c%s\u201d.",
     e: "Please enter a search term.",
     f: "The search index could not be loaded.",
     t: "Search results for \u201c%s\u201d"
@@ -342,6 +484,7 @@ RENDERER_JS = r'''
   var MARKS = /[\u0300-\u036f]/g;
   var WORDCH = /[0-9a-z\u00c0-\u024f\u0370-\u1fff\u3040-\uffff]/;
   var SPLIT = /[^0-9A-Za-z\u00c0-\u024f\u0370-\u1fff\u3040-\uffff]+/;
+  var TOK = /%%([A-Z])%%/g;
 
   function esc(s) {
     return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;")
@@ -354,15 +497,6 @@ RENDERER_JS = r'''
     s = String(s).toLowerCase();
     if (s.normalize) { s = s.normalize("NFD").replace(MARKS, ""); }
     return s.replace(/\u00df/g, "ss");
-  }
-  function foldMap(s) {                  // folded text + folded->source map
-    var t = "", m = [], i, j, f;
-    for (i = 0; i < s.length; i++) {
-      f = fold(s.charAt(i));
-      for (j = 0; j < f.length; j++) { t += f.charAt(j); m.push(i); }
-    }
-    m.push(s.length);                    // sentinel: end of the last char
-    return { t: t, m: m };
   }
   function param(name) {
     var m = new RegExp("[?&]" + name + "=([^&]*)").exec(location.search);
@@ -396,50 +530,81 @@ RENDERER_JS = r'''
     }
     return s;
   }
-  function snippet(d, ts) {
-    var src = d[3] || d[2] || "";
-    if (!src) { return ""; }
-    var fm = foldMap(src), t = fm.t, m = fm.m;
-    var at = -1, i, p, from;
-    for (i = 0; i < ts.length; i++) {
-      p = t.indexOf(ts[i]);
-      if (p >= 0 && (at < 0 || p < at)) { at = p; }
+  function clip(s, n) {                  // WP-style auto excerpt
+    s = String(s);
+    if (s.length <= n) { return s; }
+    var t = s.slice(0, n), i = t.lastIndexOf(" ");
+    if (i > n * 0.6) { t = t.slice(0, i); }
+    return t + "\u2026";
+  }
+  function cut(t, a, b, keep) {          // keep/drop an optional block
+    var i = t.indexOf(a), j = t.indexOf(b);
+    if (i < 0 || j < 0 || j < i) { return t; }
+    return keep ? t.slice(0, i) + t.slice(i + a.length, j) + t.slice(j + b.length)
+                : t.slice(0, i) + t.slice(j + b.length);
+  }
+  function card(d) {                     // harvested theme card
+    var s = d[4] || {}, t = C.tpl;
+    var body = s.e || clip(d[3] || d[2] || "", C.snip);
+    t = cut(t, "%%QB%%", "%%QE%%", !!s.m);
+    t = cut(t, "%%AB%%", "%%AE%%", !!s.a);
+    t = cut(t, "%%TB%%", "%%TE%%", !!s.d);
+    t = cut(t, "%%MB%%", "%%ME%%", !!(s.a || s.d));
+    t = cut(t, "%%XB%%", "%%XE%%", !!body);
+    var v = { U: esc(d[0]), T: esc(s.t || d[1] || d[0]), X: esc(body),
+              D: esc(s.d || ""), I: esc(s.i || ""), A: esc(s.a || ""),
+              P: esc(s.p || ""), C: esc(s.c || C.cls || ""), M: s.m || "" };
+    return t.replace(TOK, function (mm, k) {
+      return v[k] === undefined ? "" : v[k];
+    });
+  }
+  function plain(d) {                    // no harvest: built-in markup
+    var body = clip(d[3] || d[2] || "", C.snip);
+    return '<article class="wpse-result post">'
+      + '<h2 class="entry-title"><a href="' + esc(d[0]) + '">'
+      + esc(d[1] || d[0]) + "</a></h2>"
+      + (body ? '<div class="entry-content"><p>' + esc(body) + "</p></div>" : "")
+      + "</article>";
+  }
+  function box() { return document.getElementById("__RESULTS_ID__"); }
+  function swap(html) {
+    // REPLACES the container: a message left inside a grid container the
+    // theme sized to height:0 would be invisible
+    var el = box();
+    if (el) { el.outerHTML = html; }
+    var b = document.body;
+    if (b && b.className) {
+      b.className = b.className.replace(/\bsearch-results\b/,
+                                        "search-no-results");
     }
-    if (at < 0) { at = 0; }
-    var b = Math.min(t.length, at + Math.ceil(C.snip / 2));
-    var a = Math.max(0, b - C.snip);
-    b = Math.min(t.length, a + C.snip);
-    var ranges = [];
-    for (i = 0; i < ts.length; i++) {
-      from = a;
-      while (from < b) {
-        p = t.indexOf(ts[i], from);
-        if (p < 0 || p + ts[i].length > b) { break; }
-        ranges.push([m[p], m[p + ts[i].length]]);
-        from = p + ts[i].length;
+  }
+  function message(text) {
+    swap('<p class="wpse-search-status">' + text + "</p>");
+  }
+  function relayout(el) {
+    // Only needed on the XHR path: with an inlined index this code runs
+    // while the document is still parsing, so the theme's own DOM-ready
+    // grid init sees the finished cards and nothing has to be redone.
+    if (document.readyState === "loading") { return; }
+    var $ = window.jQuery;
+    try {
+      if ($ && $.fn && $.fn.isotope && $.data(el, "isotope")) {
+        $(el).isotope("reloadItems").isotope("layout");
+        return;
       }
-    }
-    ranges.sort(function (x, y) { return x[0] - y[0]; });
-    var sa = m[a], sb = m[b], out = "", cur = sa, k, r;
-    for (k = 0; k < ranges.length; k++) {
-      r = ranges[k];
-      if (r[0] < cur) { continue; }      // overlapping term hits
-      out += esc(src.slice(cur, r[0])) + "<mark>"
-           + esc(src.slice(r[0], r[1])) + "</mark>";
-      cur = r[1];
-    }
-    out += esc(src.slice(cur, sb));
-    return (sa > 0 ? "\u2026 " : "") + out
-         + (sb < src.length ? " \u2026" : "");
+    } catch (e) { /* no isotope grid on this theme */ }
+    try {
+      var ev;
+      if (typeof window.Event === "function") { ev = new window.Event("resize"); }
+      else {
+        ev = document.createEvent("Event");
+        ev.initEvent("resize", true, false);
+      }
+      window.dispatchEvent(ev);          // debounced-resize grid handlers
+    } catch (e2) { /* ancient browser: nothing more we can do */ }
   }
-  function show(status, body) {
-    var el = document.getElementById("__RESULTS_ID__");
-    if (!el) { return; }
-    el.innerHTML = '<p class="wpse-search-status">' + status + "</p>"
-      + '<div class="wpse-search-hits">' + (body || "") + "</div>";
-  }
-  function run(data, q) {
-    var ts = terms(q), docs = (data && data.docs) || [], hits = [], i, s;
+  function run(docs, q) {
+    var ts = terms(q), hits = [], i, s;
     for (i = 0; i < docs.length; i++) {
       s = ts.length ? score(docs[i], ts) : 0;
       if (s > 0) { hits.push([s, docs[i]]); }
@@ -447,27 +612,37 @@ RENDERER_JS = r'''
     hits.sort(function (x, y) {
       return y[0] - x[0] || String(x[1][1]).localeCompare(String(y[1][1]));
     });
-    var qe = esc(q);
-    if (!hits.length) { show(put(T.z, "%s", qe)); return; }
-    var html = "", d, sn;
-    for (i = 0; i < hits.length && i < C.max; i++) {
-      d = hits[i][1];
-      sn = snippet(d, ts);
-      html += '<article class="wpse-result post">'
-        + '<h2 class="entry-title"><a href="' + esc(d[0]) + '">'
-        + esc(d[1] || d[0]) + "</a></h2>"
-        + (sn ? '<div class="entry-content"><p>' + sn + "</p></div>" : "")
-        + "</article>";
+    if (!hits.length) {
+      if (C.empty) { swap(C.empty); } else { message(put(T.z, "%s", esc(q))); }
+      return;
     }
-    show(put(hits.length === 1 ? T.n1 : put(T.n, "%n", hits.length),
-             "%s", qe), html);
+    var html = "", n = hits.length < C.max ? hits.length : C.max;
+    for (i = 0; i < n; i++) {
+      html += C.tpl ? card(hits[i][1]) : plain(hits[i][1]);
+    }
+    var el = box();
+    if (!el) { return; }
+    el.innerHTML = html;
+    relayout(el);
   }
-  function boot() {
-    var q = param("s") || param("q"), i;
-    var ins = document.querySelectorAll("input[name=s],input[name=q]");
+  function echo(q) {                     // page title band + breadcrumb
+    var n = document.querySelectorAll("[data-__MARKER__=term]"), i;
+    for (i = 0; i < n.length; i++) {
+      n[i].innerHTML = "";
+      n[i].appendChild(document.createTextNode(q));
+    }
+    document.title = C.tt ? (C.tt[0] + q + C.tt[1])
+                          : (put(T.t, "%s", q) + C.sfx);
+  }
+  function prefill(q) {
+    var ins = document.querySelectorAll("input[name=s],input[name=q]"), i;
     for (i = 0; i < ins.length; i++) { ins[i].value = q; }
-    if (q) { document.title = put(T.t, "%s", q) + C.sfx; }
-    if (!q) { show(T.e); return; }
+  }
+  function render() {
+    var q = param("s") || param("q");
+    echo(q);
+    if (!q) { message(T.e); return; }
+    if (C.docs) { run(C.docs, q); return; }
     var x = new XMLHttpRequest();
     x.open("GET", C.idx, true);
     x.onreadystatechange = function () {
@@ -476,13 +651,16 @@ RENDERER_JS = r'''
       if (x.status >= 200 && x.status < 300) {
         try { data = JSON.parse(x.responseText); } catch (e) { data = null; }
       }
-      if (data) { run(data, q); } else { show(T.f); }
+      if (data && data.docs) { run(data.docs, q); } else { message(T.f); }
     };
     x.send();
   }
+  render();                              // synchronous: before DOM-ready
   if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", boot);
-  } else { boot(); }
+    document.addEventListener("DOMContentLoaded", function () {
+      prefill(param("s") || param("q"));  // footer forms exist only now
+    });
+  } else { prefill(param("s") || param("q")); }
 })();
 '''
 
@@ -506,7 +684,7 @@ MINIMAL_PAGE = (
 class Search(Plugin):
     name = "search"
     config_fields = {"search": True, "search_path": "",
-                     "search_max_chars": 2000}
+                     "search_max_chars": 2000, "search_harvest": True}
 
     # -- CLI -----------------------------------------------------------------
     @classmethod
@@ -527,6 +705,13 @@ class Search(Plugin):
             help="per-page text cap in the search index (default 2000; "
                  "lower it for very large sites, 0 indexes titles and "
                  "meta descriptions only)")
+        group.add_argument(
+            "--no-search-harvest", dest="search_harvest",
+            action="store_false",
+            help="do not probe the live '/?s=' endpoint for the results-"
+                 f"page design (default: on, at most {PROBE_MAX_REQUESTS} "
+                 "extra GET requests). The results page is then built from "
+                 "the exported 404 page with built-in markup")
 
     @classmethod
     def finish_args(cls, ap, args, cfg):
@@ -541,6 +726,7 @@ class Search(Plugin):
         cfg.search = args.search
         cfg.search_path = args.search_path
         cfg.search_max_chars = args.search_max_chars
+        cfg.search_harvest = args.search_harvest
 
     # -- per-run state -------------------------------------------------------
     def __init__(self, exporter):
@@ -549,12 +735,20 @@ class Search(Plugin):
         # worker threads under exp.stats_lock
         self.docs: dict = {}
         self._settings = None
+        self._probe_budget = PROBE_MAX_REQUESTS
+        self._assets: list = []          # absolute asset URLs of our page
+        self._path_hint = "/"            # base for resolving harvested refs
         self.stats = {
             "enabled": True, "path": "", "lang": "", "ui_language": "",
             "index_path": INDEX_PATH, "pages_indexed": 0,
-            "pages_without_text": 0, "index_bytes": 0, "page_written": False,
-            "page_source": "", "forms_rewritten": 0, "pages_wired": 0,
-            "jsonld_search_actions_fixed": 0, "collision": None,
+            "pages_without_text": 0, "index_bytes": 0, "index_inlined": False,
+            "page_written": False, "page_source": "", "forms_rewritten": 0,
+            "pages_wired": 0, "jsonld_search_actions_fixed": 0,
+            "collision": None,
+            "harvest": {"used": False, "reason": "", "probe_requests": 0,
+                        "terms": [], "cards": 0, "pages_with_slots": 0,
+                        "template": False, "empty_state": False,
+                        "title_pattern": False, "assets_downloaded": 0},
         }
 
     @property
@@ -836,15 +1030,31 @@ class Search(Plugin):
         self.stats["ui_language"] = "de" if cfg["de"] else "en"
         if cfg["collision"]:
             self.stats["collision"] = cfg["collision"]
-            return              # warned in settings(); origin content wins
-        self._write_index(cfg)
-        self._write_results_page(cfg)
+            return              # warned in settings(); NO probing either
+        self._path_hint = cfg["path"]
+        # 1) harvest the live design (the ONLY place probes happen, so
+        #    --no-rewrite / --no-search / a collision cost zero requests)
+        harvest = None
+        if self.exp.cfg.search_harvest:
+            harvest = self._harvest(cfg)
+            if harvest is None and not self.stats["harvest"]["reason"]:
+                self.stats["harvest"]["reason"] = "no usable probe response"
+        else:
+            self.stats["harvest"]["reason"] = "--no-search-harvest"
+        # 2) index (harvested card slots ride along in the docs)
+        docs, data = self._build_index(cfg, harvest)
+        self._write_index(data)
+        # 3) results page, 4) the assets only that page references
+        self._write_results_page(cfg, harvest, docs, len(data))
+        self._download_assets()
 
-    def _write_index(self, cfg: dict) -> None:
+    def _build_index(self, cfg: dict, harvest) -> tuple:
         docs = []
         empty = 0
+        slots = (harvest or {}).get("slots") or {}
         for url, rec in self._selected_pages():
             entry = self.docs.get(url) or {}
+            path = urlsplit(url).path or "/"
             title = strip_title_suffix(rec.title or "", cfg["suffix"])
             desc, text = entry.get("desc", ""), entry.get("text", "")
             if not (title or desc or text):
@@ -852,10 +1062,20 @@ class Search(Plugin):
                 continue
             if not text:
                 empty += 1                  # counted, still indexed
-            docs.append([urlsplit(url).path or "/", title, desc, text])
+            doc = [path, title, desc, text]
+            slot = slots.get(path)
+            if slot:
+                doc.append(slot)            # docs without slots stay 4 long
+            docs.append(doc)
         payload = {"v": SCHEMA_VERSION, "lang": cfg["lang"], "docs": docs}
         data = json.dumps(payload, ensure_ascii=False,
                           separators=(",", ":")).encode("utf-8")
+        self.stats["pages_indexed"] = len(docs)
+        self.stats["pages_without_text"] = empty
+        self.stats["index_bytes"] = len(data)
+        return docs, data
+
+    def _write_index(self, data: bytes) -> None:
         target = self.exp.local_path_for(
             f"{self.exp.scheme}://{self.exp.host}{INDEX_PATH}", is_page=False)
         if target is None or self.exp.write_bytes(target, data) is None:
@@ -863,23 +1083,27 @@ class Search(Plugin):
                 f"static search: {INDEX_PATH} could not be written -- the "
                 f"search will not work")
             return
-        self.stats["pages_indexed"] = len(docs)
-        self.stats["pages_without_text"] = empty
-        self.stats["index_bytes"] = len(data)
         if len(data) > 2 << 20:
             self.exp.warnings.append(
                 f"static search: {INDEX_PATH} is "
                 f"{len(data) // 1024} KB -- every visitor downloads it on "
                 f"the first search; consider --search-max-chars")
 
-    def _write_results_page(self, cfg: dict) -> None:
+    def _write_results_page(self, cfg: dict, harvest, docs,
+                            index_bytes: int) -> None:
         path = cfg["path"]
         target = self.exp.local_path_for(
             f"{self.exp.scheme}://{self.exp.host}{path}", is_page=True)
         if target is None:
             return                          # already warned in _collision()
-        soup, source = self._clone_skeleton(cfg)
-        self._build_results_page(soup, cfg)
+        if harvest is not None:
+            soup, source = harvest["soup"], "live search page"
+            self._build_from_harvest(soup, cfg, harvest)
+        else:                               # 404.html -> homepage -> minimal
+            soup, source = self._clone_skeleton(cfg)
+            self._build_results_page(soup, cfg)
+        self._inject_renderer(soup, cfg, harvest, docs, index_bytes)
+        self._assets.extend(self._scan_assets(soup, path))
         data = self.exp.serialize(soup)     # minify & co. apply for free
         if self.exp.write_bytes(target, data) is None:
             msg = f"static search: {path} could not be written"
@@ -892,8 +1116,11 @@ class Search(Plugin):
             return
         self.stats["page_written"] = True
         self.stats["page_source"] = source
+        h = self.stats["harvest"]
+        extra = (f", {h['cards']} cards harvested in "
+                 f"{h['probe_requests']} requests" if h["used"] else "")
         self.exp.say(f"[seo] static search: {path} generated from {source} "
-                     f"({self.stats['pages_indexed']} pages indexed)")
+                     f"({self.stats['pages_indexed']} pages indexed{extra})")
 
     def _clone_skeleton(self, cfg: dict):
         """A themed page skeleton: the exported 404 page first (full theme
@@ -982,7 +1209,54 @@ class Search(Plugin):
             span.append(heading)
             break
 
-        # 5) head: this page is not the 404 page and must not be indexed
+        # 5) head hygiene (shared with the harvested builder)
+        self._clean_head(soup, cfg, path)
+
+        # 6) the results container
+        loading = ("Suchergebnisse werden geladen \u2026" if is_de
+                   else "Loading search results \u2026")
+        block = BeautifulSoup(
+            f'<div class="wpse-search" id="wpse-search">'
+            f'<div class="wpse-search-results" id="{RESULTS_ID}">'
+            f'<p class="wpse-search-status">{loading}</p></div></div>',
+            "html.parser")
+        container = block.find("div", id="wpse-search")
+        if form is None and soup.find("form") is None:
+            # the template had no search box anywhere (a bare origin 404
+            # page, say) -- a results page you cannot search again from is
+            # a dead end, so give it a minimal form of its own
+            form = self._own_form(cfg)
+        if form is not None:
+            form["action"] = path
+            form["method"] = "get"
+            for a in form.find_all("a"):
+                if not (a.get("href") or "").strip():
+                    a["href"] = path
+            container.insert(0, form)
+        if h1 is None:
+            own = soup.new_tag("h1")
+            own["class"] = ["entry-title"]
+            own.append(heading)
+            container.insert(0, own)
+        host = root if root is not None else soup.find("body")
+        if host is None:                    # pathological markup
+            host = soup
+        host.append(block)
+
+    def _own_form(self, cfg: dict):
+        label = "Suchbegriff" if cfg["de"] else "Search term"
+        heading = "Suchergebnisse" if cfg["de"] else "Search results"
+        return BeautifulSoup(
+            f'<form class="searchform" method="get" role="search" '
+            f'action="{cfg["path"]}">'
+            f'<label class="screen-reader-text" for="wpse-s">{label}'
+            f'</label><input id="wpse-s" name="s" type="text" value="">'
+            f'<input type="submit" value="{heading}"></form>',
+            "html.parser").find("form")
+
+    def _clean_head(self, soup, cfg: dict, path: str) -> None:
+        """This page is not the page it was cloned from, and search
+        results must never be indexed."""
         for script in soup.find_all("script"):
             stype = (script.get("type") or "").lower()
             if "ld+json" in stype or script.get("data-" + MARKER):
@@ -993,10 +1267,13 @@ class Search(Plugin):
                     or key == "description"):
                 meta.decompose()
         for link in soup.find_all("link"):
-            rel = " ".join(link.get("rel") or []).lower()
-            if (rel in ("canonical", "shortlink", "next", "prev")
-                    or (rel == "alternate" and link.get("hreflang"))):
-                link.decompose()
+            rel = _rel_set(link)
+            ltype = (link.get("type") or "").lower()
+            if (rel & {"canonical", "shortlink", "next", "prev"}
+                    or ("alternate" in rel
+                        and (link.get("hreflang") or "xml" in ltype
+                             or "json" in ltype))):
+                link.decompose()            # + the search-result RSS feed
         head = soup.find("head")
         robots = soup.find("meta", attrs={"name": re.compile("^robots$",
                                                              re.I)})
@@ -1019,53 +1296,683 @@ class Search(Plugin):
             t.string = self._page_title(cfg)
             head.append(t)
 
-        # 6) the results container + the renderer
-        loading = ("Suchergebnisse werden geladen \u2026" if is_de
-                   else "Loading search results \u2026")
-        noscript = ("F\u00fcr die Suche wird JavaScript ben\u00f6tigt."
-                    if is_de else "Search requires JavaScript.")
-        block = BeautifulSoup(
-            f'<div class="wpse-search" id="wpse-search">'
-            f'<div class="wpse-search-results" id="{RESULTS_ID}">'
-            f'<p class="wpse-search-status">{loading}</p></div>'
-            f'<noscript><p class="wpse-search-status">{noscript}</p>'
-            f'</noscript></div>', "html.parser")
-        container = block.find("div", id="wpse-search")
-        if form is None and soup.find("form") is None:
-            # the template had no search box anywhere (a bare origin 404
-            # page, say) -- a results page you cannot search again from is
-            # a dead end, so give it a minimal form of its own
-            label = "Suchbegriff" if is_de else "Search term"
-            form = BeautifulSoup(
-                f'<form class="searchform" method="get" role="search">'
-                f'<label class="screen-reader-text" for="wpse-s">{label}'
-                f'</label><input id="wpse-s" name="s" type="text" value="">'
-                f'<input type="submit" value="{heading}"></form>',
-                "html.parser").find("form")
-        if form is not None:
-            form["action"] = path
-            form["method"] = "get"
-            for a in form.find_all("a"):
-                if not (a.get("href") or "").strip():
-                    a["href"] = path
-            container.insert(0, form)
-        if h1 is None:
-            own = soup.new_tag("h1")
-            own["class"] = ["entry-title"]
-            own.append(heading)
-            container.insert(0, own)
+    def _inject_renderer(self, soup, cfg, harvest, docs,
+                         index_bytes: int) -> None:
+        h = harvest or {}
+        snips = [len(s["e"]) for s in (h.get("slots") or {}).values()
+                 if s.get("e")]
+        inline = index_bytes <= INLINE_MAX_BYTES
+        self.stats["index_inlined"] = inline
+        conf = {"de": bool(cfg["de"]), "idx": INDEX_PATH, "max": 50,
+                "snip": max(180, min(600, max(snips))) if snips else 300,
+                "sfx": cfg["suffix"], "tpl": h.get("tpl") or "",
+                "cls": h.get("cls") or "", "empty": h.get("empty") or "",
+                "tt": list(h["title"]) if h.get("title") else None}
+        if inline:
+            # the whole point: rendering then happens while the document
+            # is still parsing, so the theme's own footer scripts
+            # initialize their grid over finished cards
+            conf["docs"] = docs
         script = soup.new_tag("script")
         script["data-" + MARKER] = "renderer"
         script.string = (RENDERER_JS
                          .replace("__RESULTS_ID__", RESULTS_ID)
-                         .replace("__CFG__", js_literal({
-                             "de": bool(is_de), "idx": INDEX_PATH,
-                             "max": 50, "snip": 180, "sfx": cfg["suffix"]})))
-        host = root if root is not None else soup.find("body")
-        if host is None:                    # pathological markup
-            host = soup
-        host.append(block)
+                         .replace("__MARKER__", MARKER)
+                         .replace("__CFG__", js_literal(conf)))
+        host = (content_root(soup) or soup.find("body") or soup)
         host.append(script)
+        noscript = soup.new_tag("noscript")
+        np = soup.new_tag("p")
+        np["class"] = ["wpse-search-status"]
+        np.append("F\u00fcr die Suche wird JavaScript ben\u00f6tigt."
+                  if cfg["de"] else "Search requires JavaScript.")
+        noscript.append(np)
+        script.insert_before(noscript)
+
+    # -- live-design harvest -------------------------------------------------
+
+    def _probe(self, url: str):
+        """One GET against the live search. Budgeted, never raises: any
+        failure just means one rung less of fidelity."""
+        exp = self.exp
+        if self._probe_budget <= 0:
+            return None
+        self._probe_budget -= 1
+        self.stats["harvest"]["probe_requests"] += 1
+        try:
+            resp = exp.fetch(url)
+        except requests.RequestException as exc:
+            self._harvest_stop(f"probe failed ({exc.__class__.__name__})")
+            return None
+        if exp.off_site_redirect(resp):
+            self._harvest_stop("the search endpoint redirects off-site")
+            return None
+        if not resp.ok:
+            self._harvest_stop(f"the search endpoint answered "
+                               f"HTTP {resp.status_code}")
+            return None
+        if "html" not in (resp.headers.get("Content-Type") or "").lower():
+            self._harvest_stop("the search endpoint does not answer HTML")
+            return None
+        return BeautifulSoup(resp.content, "html.parser")
+
+    def _harvest_stop(self, reason: str) -> None:
+        h = self.stats["harvest"]
+        if not h["reason"]:
+            h["reason"] = reason
+            self.exp.warnings.append(
+                f"static search: could not harvest the live results-page "
+                f"design ({reason}) -- the results page uses the exported "
+                f"404 page and built-in markup instead")
+
+    def _search_url(self, term: str) -> str:
+        return (f"{self.exp.scheme}://{self.exp.host}"
+                f"/?s={quote(term, safe='')}")
+
+    @staticmethod
+    def _echoes(soup, term: str) -> bool:
+        """A real results page repeats the query. A site that answers
+        /?s=xyz with the homepage (soft 404) does not -- and harvesting
+        the homepage as a 'results page' is exactly the failure mode this
+        guard exists for."""
+        t = soup.find("title")
+        blob = (t.get_text() if t else "")
+        for sel in ("h1", '[itemprop="name"]', ".breadcrumbs"):
+            for el in soup.select(sel):
+                blob += " " + el.get_text()
+        return term.lower() in blob.lower()
+
+    def _next_probe_url(self, soup, term: str, seen: set):
+        """The theme's OWN 'next page' link -- no /page/N/ guessing, so
+        every permalink shape (?paged=2 included) works."""
+        exp = self.exp
+        base = f"{exp.scheme}://{exp.host}/"
+        best = None
+        for a in soup.find_all("a", href=True):
+            href = urljoin(base, a["href"].replace("&amp;", "&"))
+            if not exp.is_internal(href) or href in seen:
+                continue
+            if parse_qs(urlsplit(href).query).get("s") != [term]:
+                continue
+            rel = {r.lower() for r in (a.get("rel") or [])}
+            cls = " ".join(a.get("class") or []).lower()
+            rank = 2 if ("next" in rel or "next" in cls) else 1
+            if best is None or rank > best[0]:
+                best = (rank, href)
+        return best[1] if best else None
+
+    def _prepare_soup(self, soup) -> None:
+        """Exactly what parse_and_save_html does to a crawled page:
+        resource hints + plugin clean_soup, localization, plugin
+        rewrite_soup. Without this our page would be the only one in the
+        export still carrying the Wordfence beacon and the CDN cruft."""
+        exp = self.exp
+        if exp.cfg.strip_wp_cruft:
+            exp.strip_resource_hints(soup)
+            for p in exp.plugins:
+                if p is not self:
+                    p.clean_soup(soup)
+        exp.rewrite_soup_relative(soup)
+        for p in exp.plugins:
+            if p is not self:
+                p.rewrite_soup(soup)
+
+    @staticmethod
+    def _find_results(root, paths: set, sig=None):
+        """(container, items) of the theme's result loop.
+
+        With a known item signature: match it directly. Without one: the
+        DEEPEST element at least TWO of whose direct children contain a
+        link to an indexed page -- theme-agnostic. A one-result response
+        is genuinely ambiguous (the whole ancestor chain scores 1), which
+        is why the signature is learned from a broad probe and applied to
+        the held-back responses afterwards."""
+        if sig is not None:
+            name, classes = sig
+            found = [t for t in root.find_all(name)
+                     if classes <= frozenset(t.get("class") or ())]
+            ids = {id(t) for t in found}
+            items = [t for t in found
+                     if not any(id(p) in ids for p in t.parents)]
+            if items and items[0].parent is not None:
+                return items[0].parent, items[:PROBE_MAX_ITEMS]
+            return None, []
+        hits = [a for a in root.find_all("a", href=True)
+                if _href_path(a) in paths]
+        anc_ids: set = set()
+        for a in hits:
+            node = a
+            while node is not None and node is not root:
+                anc_ids.add(id(node))
+                node = node.parent
+        best = None
+        for anc in root.find_all(True):
+            kids = [c for c in anc.find_all(True, recursive=False)
+                    if id(c) in anc_ids]
+            if len(kids) < 2:
+                continue
+            depth = len(list(anc.parents))
+            if best is None or depth > best[0]:
+                best = (depth, anc, kids)
+        if best is None:
+            return None, []
+        return best[1], best[2][:PROBE_MAX_ITEMS]
+
+    def _take_cards(self, h: dict, items: list, paths: set) -> int:
+        """Per-card slot values; builds the ONE template from the first
+        usable card. Returns how many NEW pages got slots."""
+        gained = 0
+        for item in items:
+            link = next((a for a in item.find_all("a", href=True)
+                         if _href_path(a) in paths), None)
+            if link is None:
+                continue
+            path = _href_path(link)
+            if path in h["slots"]:
+                continue
+            h["slots"][path] = self._slot_values(item, link)
+            gained += 1
+            if not h["tpl"]:
+                h["tpl"], h["cls"] = self._build_template(item, link)
+        return gained
+
+    @staticmethod
+    def _media_block(item, link):
+        """Highest ancestor of the card's <img> that does NOT contain the
+        title link -- the thumbnail block, whatever the theme calls it."""
+        img = item.find("img")
+        if img is None:
+            return None
+        node = img
+        while (node.parent is not None and node.parent is not item
+               and link not in node.parent.descendants):
+            node = node.parent
+        return node
+
+    @staticmethod
+    def _meta_block(item, link, time_el, author_el):
+        node = time_el if time_el is not None else author_el
+        if node is None:
+            return None
+        while (node.parent is not None and node.parent is not item
+               and link not in node.parent.descendants):
+            node = node.parent
+        return node
+
+    def _slot_values(self, item, link) -> dict:
+        """Generic, NOT tied to dt-the7 class names: title = the <a> whose
+        localized href is an indexed path, excerpt = the last <p>, date =
+        <time datetime>, author = .author/.vcard/[rel=author]/.fn."""
+        d = {"t": link.get_text(" ", strip=True)}
+        tm = item.find("time")
+        if tm is not None:
+            iso = (tm.get("datetime") or "").strip()
+            if iso:
+                d["i"] = iso
+            txt = tm.get_text(" ", strip=True)
+            if txt:
+                d["d"] = txt
+        au = item.select_one(".author, .vcard, [rel=author], .fn")
+        if au is not None:
+            name = (au.select_one(".fn") or au).get_text(" ", strip=True)
+            if name:
+                d["a"] = name
+        ps = item.find_all("p")
+        if ps:
+            # PLAIN TEXT, escaped at render time: an excerpt is prose, and
+            # shipping origin HTML through innerHTML buys nothing visible
+            txt = ps[-1].get_text(" ", strip=True)
+            if txt:
+                d["e"] = txt
+        pid = (item.get("data-post-id") or "").strip()
+        if pid:
+            d["p"] = pid
+        art = item.find("article") or item
+        cls = " ".join(art.get("class") or ())
+        if cls:
+            d["c"] = cls
+        media = self._media_block(item, link)
+        if media is not None:
+            self._drop_dead_hrefs(media)
+            self._assets.extend(self._scan_assets(media, self._path_hint))
+            d["m"] = str(media)
+        return d
+
+    def _build_template(self, item, link) -> tuple:
+        """The card with every variable value replaced by a %%X%% token
+        and every optional element bracketed by a %%?B%%/%%?E%% pair the
+        renderer can cut out. Built from a DEEP COPY: the live item stays
+        intact for its own slot extraction."""
+        href = link.get("href")
+        tpl = copy.copy(item)
+        link = next(a for a in tpl.find_all("a", href=True)
+                    if a.get("href") == href)
+        for attr, tok in (("data-post-id", "%%P%%"), ("data-date", "%%I%%"),
+                          ("data-name", "%%T%%")):
+            if tpl.has_attr(attr):
+                tpl[attr] = tok
+        art = tpl.find("article") or tpl
+        cls = " ".join(art.get("class") or ())
+        if cls:
+            art["class"] = "%%C%%"
+        link["href"] = "%%U%%"
+        if link.has_attr("title"):
+            link["title"] = "%%T%%"
+        _set_text(link, "%%T%%")
+        tm = tpl.find("time")
+        if tm is not None:
+            if tm.has_attr("datetime"):
+                tm["datetime"] = "%%I%%"
+            _set_text(tm, "%%D%%")
+        au = tpl.select_one(".author, .vcard, [rel=author], .fn")
+        if au is not None:
+            _set_text(au.select_one(".fn") or au, "%%A%%")
+        ps = tpl.find_all("p")
+        ex = ps[-1] if ps else None
+        if ex is not None:
+            _set_text(ex, "%%X%%")
+        media = self._media_block(tpl, link)
+        mb = self._meta_block(tpl, link, tm, au)
+        self._drop_dead_hrefs(tpl)          # /author/admin/ & co.
+        if ex is not None:
+            _wrap(ex, "%%XB%%", "%%XE%%")
+        tanchor = (tm.parent if (tm is not None and tm.parent is not mb
+                                 and tm.parent is not tpl) else tm)
+        if tanchor is not None and tanchor is not mb:
+            if tanchor.has_attr("title"):
+                del tanchor["title"]        # per-post tooltip ("11:05")
+            _wrap(tanchor, "%%TB%%", "%%TE%%")
+        if au is not None and au is not mb:
+            _wrap(au, "%%AB%%", "%%AE%%")
+        if mb is not None:
+            _wrap(mb, "%%MB%%", "%%ME%%")
+        if media is not None:
+            media.replace_with(NavigableString("%%QB%%%%M%%%%QE%%"))
+        generic = " ".join(c for c in cls.split()
+                           if not re.fullmatch(r"post-\d+", c))
+        return str(tpl), generic
+
+    def _drop_dead_hrefs(self, node) -> None:
+        """Every root-relative href in HARVESTED markup that does not
+        resolve to an exported file loses its href -- the tag, its classes
+        and its text stay, so the card looks identical, but verify_export
+        never sees a dead reference. Author archives (/author/admin/) are
+        the normal case; a site that DOES export them keeps a live link."""
+        exp = self.exp
+        for a in node.find_all("a", href=True):
+            href = a["href"].split("#")[0].split("?")[0]
+            if not href.startswith("/") or href.startswith("//"):
+                continue
+            target = exp.local_path_for(
+                f"{exp.scheme}://{exp.host}{href}", is_page=True)
+            try:
+                ok = target is not None and (
+                    target.is_file()
+                    or (target.parent / "index.html").is_file())
+            except OSError:
+                ok = False
+            if not ok:
+                del a["href"]
+
+    def _title_pattern(self, soup, term: str):
+        t = soup.find("title")
+        return split_echo(t.get_text() if t else "", term)
+
+    def _take_empty(self, soup, cfg: dict, token: str) -> str:
+        """The theme's own 'nothing found' block, query echoes removed."""
+        self._prepare_soup(soup)
+        root = content_root(soup)
+        if root is None or not root.find(True):
+            return ""
+        self._scrub_query(root, token)
+        for form in root.find_all("form"):
+            form["action"] = cfg["path"]
+            form["method"] = "get"
+            for a in form.find_all("a"):
+                if not (a.get("href") or "").strip():
+                    a["href"] = cfg["path"]
+        for inp in root.find_all("input"):
+            if (inp.get("name") or "") in ("s", "q"):
+                inp["value"] = ""
+        self._drop_dead_hrefs(root)
+        self._assets.extend(self._scan_assets(root, cfg["path"]))
+        return "".join(str(c) for c in root.contents).strip()
+
+    def _harvest(self, cfg: dict) -> dict | None:
+        """Skeleton + card template + per-page slots + empty state, taken
+        from the live search endpoint. None when nothing usable came back
+        (every rung of the caller's ladder still works)."""
+        indexed = self._selected_pages()
+        paths, texts = {}, {}
+        for url, rec in indexed:
+            p = urlsplit(url).path or "/"
+            entry = self.docs.get(url) or {}
+            paths[p] = rec
+            texts[p] = " ".join(x for x in (rec.title or "",
+                                            entry.get("desc") or "",
+                                            entry.get("text") or "") if x)
+        if not paths:
+            self._harvest_stop("no indexable pages")
+            return None
+        h = {"soup": None, "term": "", "sig": None, "container": None,
+             "tpl": "", "cls": "", "slots": {}, "empty": "", "title": None}
+        pending = []                     # responses seen before the sig
+        used_terms: set = set()
+        forms: dict = {}                 # folded token -> original spelling
+        for text in texts.values():
+            for folded, original in word_forms(text).items():
+                forms.setdefault(folded, original)
+
+        def consume(soup, term):
+            """Localize, then take container + cards out of one response."""
+            self._prepare_soup(soup)
+            root = content_root(soup) or soup.body
+            if root is None:
+                return False
+            container, items = self._find_results(root, set(paths), h["sig"])
+            if container is None:
+                return False
+            if h["sig"] is None:
+                h["sig"] = (items[0].name,
+                            frozenset(items[0].get("class") or ()))
+            gained = self._take_cards(h, items, set(paths))
+            if h["soup"] is None:
+                h["soup"], h["term"], h["container"] = soup, term, container
+            return gained
+
+        # 1) rare probe. It is also the GATE: only a term this
+        #    distinctive proves the endpoint is a real search. A site that
+        #    answers /?s=anything with the homepage would echo a
+        #    one-letter broad term by pure chance, so the cheap guard has
+        #    to run against the rare term or not at all.
+        rare = rare_term([doc_words(texts[p]) for p in paths],
+                         [rec.title or "" for rec in paths.values()])
+        if not rare:
+            self._harvest_stop("no distinctive term to probe with")
+            return None
+        used_terms.add(rare)
+        rare_probe = forms.get(rare, rare)
+        soup = self._probe(self._search_url(rare_probe))
+        if soup is None:
+            return None                      # _probe already explained why
+        if not self._echoes(soup, rare_probe):
+            self._harvest_stop("the search endpoint does not echo the query "
+                               "(no WordPress search behind it?)")
+            return None
+        h["title"] = self._title_pattern(soup, rare_probe)
+        if not consume(soup, rare_probe):
+            pending.append((soup, rare_probe))   # sig not known yet
+        # 2) broad probes -- greedy cover, paginator-driven. Two terms in
+        #    a row that add nothing mean the live search simply does not
+        #    return the remaining pages (attachments, excluded post types)
+        #    -- spending the rest of the budget on that is pure waste.
+        fruitless = 0
+        while (self._probe_budget > 1 and len(h["slots"]) < len(paths)
+               and fruitless < 2):
+            uncovered = set(paths) - set(h["slots"])
+            folded = broad_term(texts, uncovered, used_terms)
+            if not folded:
+                break
+            used_terms.add(folded)
+            term = forms.get(folded, folded)
+            before = len(h["slots"])
+            url, seen, hops = self._search_url(term), set(), 0
+            while url and hops < PROBE_MAX_PAGES and self._probe_budget > 1:
+                seen.add(url)
+                hops += 1
+                soup = self._probe(url)
+                if soup is None or not self._echoes(soup, term):
+                    break
+                nxt = self._next_probe_url(soup, term, seen)
+                gained = consume(soup, term)
+                for held, t in pending:              # sig may exist now
+                    consume(held, t)
+                pending = []
+                if not gained:
+                    break                            # nothing new here
+                url = nxt
+            fruitless = 0 if len(h["slots"]) > before else fruitless + 1
+        if h["soup"] is None:
+            self._harvest_stop("no results container found")
+            return None
+        # 3) empty-state probe (same token idiom as capture_404)
+        token = "".join(random.choices(string.ascii_lowercase + string.digits,
+                                       k=18))
+        soup = self._probe(self._search_url(token))
+        if soup is not None and self._echoes(soup, token):
+            h["empty"] = self._take_empty(soup, cfg, token)
+        st = self.stats["harvest"]
+        st.update(used=True, terms=sorted(used_terms), cards=len(h["slots"]),
+                  pages_with_slots=len(h["slots"]), template=bool(h["tpl"]),
+                  empty_state=bool(h["empty"]),
+                  title_pattern=h["title"] is not None)
+        return h
+
+    # -- assembling the harvested page ---------------------------------------
+
+    def _build_from_harvest(self, soup, cfg: dict, h: dict) -> None:
+        path, term = cfg["path"], h["term"]
+        root = content_root(soup) or soup.body
+        container = h["container"]
+
+        # 1) content well: keep ONLY the results container. The paginator
+        #    is a sibling of it and is stale by definition (it links to
+        #    /page/2/?s=<probe term>).
+        for child in list(root.find_all(True, recursive=False)):
+            if child is container or container in child.descendants:
+                continue
+            classes = (c.lower() for c in (child.get("class") or ()))
+            has_query_link = any("s=" in (a.get("href") or "")
+                                 for a in child.find_all("a"))
+            if has_query_link or any(PAGER_CLASS_RE.fullmatch(c)
+                                     for c in classes):
+                child.decompose()
+        container["id"] = RESULTS_ID
+        if container.has_attr("data-cur-page"):
+            container["data-cur-page"] = "1"
+        container.clear()
+        p = soup.new_tag("p")
+        p["class"] = ["wpse-search-status"]
+        p.append("Suchergebnisse werden geladen \u2026" if cfg["de"]
+                 else "Loading search results \u2026")
+        container.append(p)
+
+        # 2) head hygiene (shared with the fallback builder)
+        self._clean_head(soup, cfg, path)
+
+        # 3) structural echo replacement -- NO blind string replace: the
+        #    probe term is a real word from our own corpus and appears in
+        #    the harvested excerpts as legitimate content
+        self._echo_marker_h1(soup, root, term, cfg)
+        self._echo_marker_breadcrumb(soup, term)
+        self._scrub_query(soup, term)
+
+        # 4) the theme's own search box, pointed at us
+        for form in soup.find_all("form"):
+            if form.find("input", attrs={"name": re.compile(r"^(?:s|q)$")}):
+                form["action"] = path
+                form["method"] = "get"
+                for a in form.find_all("a"):
+                    if not (a.get("href") or "").strip():
+                        a["href"] = path
+        for inp in soup.find_all("input"):
+            if (inp.get("name") or "") in ("s", "q"):
+                inp["value"] = ""
+        if soup.find("form") is None:
+            container.insert_before(self._own_form(cfg))
+
+        # 5) the image attributes postprocess_html can no longer add (it
+        #    ran before run_end); NOT our own hook -- that would inject
+        #    the ?s= redirect into the page it redirects to
+        for other in self.exp.plugins:
+            if other is self:
+                continue
+            try:
+                other.postprocess_soup(soup)
+            except Exception as exc:        # noqa: BLE001
+                self.exp.warnings.append(
+                    f"static search: {other.name}.postprocess_soup failed "
+                    f"on the results page ({exc.__class__.__name__})")
+
+    def _echo_marker_h1(self, soup, root, term: str, cfg: dict) -> None:
+        """Keep the theme's static prefix ('Suchergebnisse f\u00fcr: ') VERBATIM
+        -- that string is the whole point of harvesting -- and leave an
+        empty marker the renderer fills with the real query."""
+        h1 = next((c for c in soup.find_all("h1")
+                   if root is None or (c is not root
+                                       and root not in c.parents)), None)
+        if h1 is None:
+            return
+        span = next((s for s in h1.find_all("span")
+                     if s.get_text(strip=True) == term), None)
+        if span is not None:
+            span.clear()
+            span[f"data-{MARKER}"] = "term"
+            return
+        parts = split_echo(h1.get_text(), term)
+        if parts is None:
+            h1.clear()                       # unrecognized: generic heading
+            h1.append("Suchergebnisse" if cfg["de"] else "Search results")
+            return
+        self._retext(soup, h1, parts)
+
+    def _echo_marker_breadcrumb(self, soup, term: str) -> None:
+        for bc in soup.select('[itemtype*="BreadcrumbList"], ol.breadcrumbs, '
+                              'ul.breadcrumbs, .breadcrumbs'):
+            items = bc.find_all("li")
+            if not items:
+                continue
+            leaf = items[-1]
+            span = leaf.find("span", attrs={"itemprop": "name"}) or leaf
+            inner = next((s for s in span.find_all(True)
+                          if s.get_text(strip=True) == term), None)
+            if inner is not None:
+                inner.clear()
+                inner[f"data-{MARKER}"] = "term"
+                return
+            parts = split_echo(span.get_text(), term)
+            if parts is not None:            # keeps the surrounding quotes
+                self._retext(soup, span, parts)
+            return
+
+    def _retext(self, soup, el, parts) -> None:
+        mark = soup.new_tag("span")
+        mark[f"data-{MARKER}"] = "term"
+        el.clear()
+        if parts[0]:
+            el.append(NavigableString(parts[0]))
+        el.append(mark)
+        if parts[1]:
+            el.append(NavigableString(parts[1]))
+
+    def _scrub_query(self, node, term: str) -> None:
+        """Remove the probe query from inline analytics/config scripts
+        (`page_location`, `page_path`, pretty /search/<term>/ URLs). The
+        value becomes an EMPTY query -- exactly what a visitor arriving at
+        the results page without a term produces. Targeted patterns only:
+        the term is a real word from our own corpus and must survive
+        inside the harvested excerpts."""
+        spellings = {term, quote(term, safe=""), quote(term, safe="").lower(),
+                     quote(term, safe="+")}
+        pats = []
+        for sp in spellings:
+            e = re.escape(sp)
+            pats.append((re.compile(r"([?&](?:amp;)?s=)" + e + r"(?![\w%])"),
+                         r"\1"))
+            pats.append((re.compile(r"(/search/)" + e + r"/"), r"\1"))
+            pats.append((re.compile(r"(\\/search\\/)" + e + r"\\/"), r"\1"))
+        for script in node.find_all("script"):
+            if "ld+json" in (script.get("type") or "").lower():
+                continue                 # decomposed by _clean_head anyway
+            text = "".join(c for c in script.contents if isinstance(c, str))
+            if not text:
+                continue
+            new = text
+            for rx, repl in pats:
+                new = rx.sub(repl, new)
+            if new != text:
+                script.string = new
+
+    # -- assets only this page references ------------------------------------
+
+    def _scan_assets(self, node, base_path: str) -> list:
+        """Absolute internal ASSET urls a fragment/document references --
+        the subset of parse_and_save_html's candidate walk we need,
+        WITHOUT its side effects (its discovery would dump every remaining
+        ?s= URL into the reported skipped_query_urls and, with save_as
+        omitted, map '/?s=x' onto public/index.html)."""
+        exp = self.exp
+        base = f"{exp.scheme}://{exp.host}{base_path}"
+        out: list = []
+
+        def take(val, tag_name):
+            val = (val or "").strip()
+            if not val or val.startswith(("data:", "mailto:", "tel:",
+                                          "javascript:", "#")):
+                return
+            absolute, _ = exp._defrag(urljoin(base, val))
+            if not exp.is_internal(absolute):
+                return
+            absolute = exp.to_base_host(absolute)
+            if core.PAGE_SKIP_PATTERNS.search(urlsplit(absolute).path):
+                return
+            if exp.looks_like_asset(absolute) or tag_name in ("script",
+                                                              "link"):
+                out.append(absolute)
+
+        for tag in node.find_all(True):
+            if tag.name in ("a", "meta"):
+                continue                 # page links / SEO metadata
+            if tag.name == "link" and _rel_set(tag) & {
+                    "canonical", "alternate", "shortlink", "pingback"}:
+                continue
+            for attr in core.URL_ATTRS:
+                if tag.get(attr):
+                    take(tag[attr], tag.name)
+            for attr in core.SRCSET_ATTRS:
+                if tag.get(attr):
+                    for cand, _d in core.iter_srcset(tag[attr]):
+                        take(cand, "img")
+            for attr in core.CSS_URL_ATTRS + ("style",):
+                val = tag.get(attr)
+                if isinstance(val, str) and "url(" in val:
+                    for mm in core.CSS_URL_RE.finditer(val):
+                        take(mm.group(1), "style")
+            for attr in core.B64_URL_ATTRS:
+                dec = core.try_b64_url(tag.get(attr) or "")
+                if dec:
+                    take(dec, "img")
+        for style in node.find_all("style"):
+            css = style.string or ""
+            for mm in (list(core.CSS_URL_RE.finditer(css))
+                       + list(core.CSS_IMPORT_RE.finditer(css))):
+                take(mm.group(1), "style")
+        return out
+
+    def _download_assets(self) -> None:
+        """capture_404's mini-BFS: fetch what only this page references
+        (masonry.min.js, imagesloaded.min.js, the search template's own
+        CSS/JS bundle, card thumbnails) so verify_export stays green."""
+        exp = self.exp
+        before = len(exp.asset_urls_seen)
+        pending = [a for a in dict.fromkeys(self._assets)
+                   if a not in exp.asset_urls_seen]
+        for _ in range(3):
+            if not pending:
+                break
+            nxt: list = []
+            for a in pending:
+                if a in exp.asset_urls_seen:
+                    continue
+                exp.asset_urls_seen.add(a)
+                try:
+                    _, more = exp.process_asset(a)
+                except requests.RequestException:
+                    continue
+                nxt.extend(more)
+            pending = [a for a in nxt if a not in exp.asset_urls_seen]
+        self.stats["harvest"]["assets_downloaded"] = (
+            len(exp.asset_urls_seen) - before)
 
     # -- reporting -----------------------------------------------------------
     def summary_lines(self) -> list[str]:
@@ -1077,10 +1984,15 @@ class Search(Plugin):
         if not self.stats["page_written"]:
             return ["[warn] site search: results page NOT generated "
                     "-- see report.txt"]
+        h = self.stats["harvest"]
+        extra = (f", design harvested live: {h['probe_requests']} requests, "
+                 f"{h['pages_with_slots']}/{self.stats['pages_indexed']} "
+                 f"cards, {h['assets_downloaded']} assets"
+                 if h["used"] else ", built-in markup")
         return [f"[seo] site search: {self.stats['path']} "
                 f"({self.stats['pages_indexed']} pages indexed, "
                 f"{self.stats['index_bytes'] // 1024 or 1} KB index, "
-                f"{self.stats['forms_rewritten']} forms rewritten)"]
+                f"{self.stats['forms_rewritten']} forms rewritten{extra})"]
 
     def add_report(self, report: dict, txt_head: list,
                    txt_sections: list) -> None:

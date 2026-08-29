@@ -6,8 +6,10 @@ import shutil
 import threading
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, quote, urlsplit
 
 import pytest
+from bs4 import BeautifulSoup
 
 from test_pure import png_bytes
 
@@ -28,6 +30,12 @@ def _make_handler(root: Path):
 
         def do_GET(self):
             path = self.path.split("?", 1)[0]
+            query = parse_qs(urlsplit(self.path).query)
+            if path in ("/", "/page/2/") and query.get("s"):
+                # the WordPress search endpoint the search plugin harvests
+                # its results-page design from
+                self._search_results(query["s"][0], path == "/page/2/")
+                return
             if path in REDIRECTS and "?" not in self.path:
                 self.send_response(301)
                 self.send_header("Location", REDIRECTS[path])
@@ -106,6 +114,72 @@ def _make_handler(root: Path):
             self.path = "/" + path.lstrip("/")
             super().do_GET()
 
+        # -- the WordPress search endpoint -------------------------------
+        # Themed like a real theme: a grid container of card items with
+        # post meta, a paginator, and the query echoed in <title>, the
+        # page-title <h1> and the breadcrumb leaf -- everything the
+        # search plugin harvests its design from.
+        HITS = [("/", "Fixture Home", "admin", "2021-11-25T11:05:38+01:00",
+                 "25. November 2021", "Startseite mit Fassaden und "
+                 "Vollwärmeschutz."),
+                ("/ueber-uns/", "Über uns", "admin",
+                 "2017-10-05T17:47:25+02:00", "5. Oktober 2017",
+                 "Wir über uns: Vollwärmeschutz seit 1950.")]
+
+        def _search_results(self, term, page2):
+            origin = f"http://{self.headers.get('Host')}"
+            hits = [h for h in self.HITS
+                    if term.lower() in (h[1] + " " + h[5]).lower()]
+            cards = "".join(
+                f'<div class="wf-cell iso-item" data-post-id="{i + 11}" '
+                f'data-date="{iso}" data-name="{title}">'
+                f'<article class="post no-img post-{i + 11} page hentry">'
+                f'<div class="blog-content wf-td">'
+                f'<h3 class="entry-title"><a href="{origin}{href}" '
+                f'title="{title}" rel="bookmark">{title}</a></h3>'
+                f'<div class="entry-meta">'
+                f'<a class="author vcard" href="{origin}/author/{who}/" '
+                f'rel="author">Von <span class="fn">{who}</span></a>'
+                f'<a href="javascript:void(0);" class="data-link">'
+                f'<time class="entry-date" datetime="{iso}">{shown}</time>'
+                f'</a></div><p>{body}</p>'
+                f"</div></article></div>"
+                for i, (href, title, who, iso, shown, body)
+                in enumerate(hits))
+            q = quote(term)
+            body = (
+                f'<!doctype html><html lang="de"><head><meta charset="utf-8">'
+                f"<title>Du hast nach {term} gesucht - Fixture</title>"
+                f'<meta property="og:url" content="{origin}/?s={q}">'
+                f'<script src="{origin}/wp-includes/js/masonry.min.js">'
+                f"</script></head>"
+                f'<body class="search search-results layout-masonry">'
+                f'<div class="page-title-head hgroup">'
+                f"<h1>Suchergebnisse für: <span>{term}</span></h1></div>"
+                f'<div class="page-title-breadcrumbs"><ol class="breadcrumbs">'
+                f'<li><a href="{origin}/"><span itemprop="name">Start</span>'
+                f'</a></li><li class="current"><span itemprop="name">'
+                f'Ergebnisse für "{term}"</span></li></ol></div>'
+                f'<div class="content" id="content" role="main">'
+                + (f'<div class="wf-container iso-container" '
+                   f'data-padding="10px" data-cur-page="{2 if page2 else 1}" '
+                   f'data-columns="3">{cards}</div>'
+                   f'<div class="paginator"><a href="{origin}/page/2/?s={q}" '
+                   f'class="page-numbers next">→</a></div>'
+                   if hits else
+                   f'<article id="post-0" class="post no-results not-found">'
+                   f'<h1 class="entry-title">Nichts gefunden</h1>'
+                   f"<p>Leider konnten wir nichts finden.</p>"
+                   f'<form class="searchform" method="get" '
+                   f'action="{origin}/"><input name="s" type="text" '
+                   f'value="{term}"></form></article>')
+                + "</div></body></html>").encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
         def log_message(self, *a):
             pass
 
@@ -138,6 +212,11 @@ def export(mod, tmp_path_factory):
                        ("slide2.png", 400, 300)):
         (uploads / name).write_bytes(png_bytes(w, h))
     (uploads / "dokument.pdf").write_bytes(b"%PDF-1.4\n" + b"stream" * 500)
+    # referenced ONLY by the search-results template -- proves the search
+    # plugin pulls in assets the crawl itself never sees
+    wpi = site / "wp-includes" / "js"
+    wpi.mkdir(parents=True)
+    (wpi / "masonry.min.js").write_bytes(b"/* masonry */var Masonry=1;\n")
 
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -201,7 +280,7 @@ def test_static_search_exported(export):
     assert "noindex,follow" in html
     # index: real pages with their titles and text, filtered like the sitemap
     index = _json.loads((pub / "search-index.json").read_text("utf-8"))
-    assert index["v"] == 1 and index["lang"] == "de"
+    assert index["v"] == 2 and index["lang"] == "de"
     paths = [d[0] for d in index["docs"]]
     assert "/" in paths and "/ueber-uns/" in paths
     assert "/geheim/" not in paths                       # noindex
@@ -218,6 +297,36 @@ def test_static_search_exported(export):
     assert stats["page_written"] is True and stats["collision"] is None
     assert stats["path"] == "/suche/" and stats["pages_indexed"] >= 2
     assert stats["forms_rewritten"] >= 1
+
+
+def test_static_search_uses_the_live_design(export):
+    """The results page must be the THEME's search page, not our own
+    markup: harvested container, harvested card template, harvested
+    heading prefix, and the search-only asset pulled in behind it."""
+    pub = export["public"]
+    html = (pub / "suche" / "index.html").read_text(encoding="utf-8")
+    soup = BeautifulSoup(html, "html.parser")
+    stats = export["report"]["seo"]["search"]
+    assert stats["page_source"] == "live search page"
+    h = stats["harvest"]
+    assert h["used"] is True and h["template"] is True
+    assert h["probe_requests"] <= 12 and h["pages_with_slots"] >= 1
+    # the theme's own grid container carries the renderer's id
+    box = soup.find(id="wpse-search-results")
+    assert "iso-container" in (box.get("class") or [])
+    assert box["data-columns"] == "3"
+    assert soup.body["class"][:2] == ["search", "search-results"]
+    # the theme's static heading prefix survived verbatim
+    h1 = soup.select_one(".page-title-head h1")
+    assert h1.get_text().startswith("Suchergebnisse für:")
+    assert h1.find(attrs={"data-wpse-search": "term"}) is not None
+    assert soup.find(class_="paginator") is None          # stale
+    # the card template with its slots rides in the renderer config
+    script = soup.find("script", attrs={"data-wpse-search": "renderer"}).string
+    assert "wf-cell" in script and "%%U%%" in script and "%%A%%" in script
+    assert "Nichts gefunden" in script                    # empty state
+    # an asset ONLY the search template references was downloaded
+    assert (pub / "wp-includes" / "js" / "masonry.min.js").is_file()
 
 
 def test_wp_cruft_stripped(export):

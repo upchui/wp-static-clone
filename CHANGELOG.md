@@ -1,5 +1,44 @@
 # Changelog
 
+## 2.7.0 (2026-08-29)
+
+The static search-results page now looks like the live one.
+
+### Changed
+- **The results-page design is harvested from the live site** instead of
+  being invented. Up to `PROBE_MAX_REQUESTS` (12) `GET /?s=<term>`
+  probes at the end of the export yield the theme's own results
+  skeleton (container classes, `data-*` grid config, body classes and
+  the search-only scripts such as `masonry.js`/`imagesloaded.js`), its
+  result-card markup -- turned into a template with `%%X%%` slots -- the
+  per-page meta WordPress renders (author, date, excerpt) and the
+  theme's own "nothing found" block. Measured on a dt-the7 site: body
+  classes, container classes and `data-*`, stylesheets, scripts and the
+  page-title band are byte-identical to `/?s=`.
+  - The probe terms come from the site's own index: one rare word
+    (unique across pages) that also proves the endpoint really is a
+    WordPress search -- a site answering `/?s=x` with the homepage is
+    detected and the harvest abandoned -- then a greedy set cover of
+    broad terms, following the theme's own paginator links.
+  - The static heading keeps the theme's prefix verbatim
+    ("Suchergebnisse für: ") with the query filled in at runtime; same
+    for the breadcrumb leaf and the `<title>` pattern.
+  - Whenever the index fits (256 KB), it is inlined and the cards are
+    rendered while the document is still parsing, so the theme's own
+    grid/masonry code initializes over real cards instead of an empty
+    container.
+  - Harvested links that were never exported (author archives) keep
+    their markup but lose the dead `href`, and assets only the search
+    template references are downloaded, so verification stays green.
+  - `--no-search-harvest` keeps the probes off and falls back to the
+    2.6.0 behavior (exported 404 page + built-in markup); the same
+    ladder catches a dead, disabled or unthemed search endpoint.
+- Faithfulness over embellishment: the results list no longer prints a
+  "N Treffer" status line and no longer `<mark>`s the query inside
+  excerpts -- WordPress does neither. Matching is unchanged.
+- Search index schema `v2`: documents may carry a fifth element with
+  the harvested display slots.
+
 ## 2.6.0 (2026-08-29)
 
 The site search works statically.

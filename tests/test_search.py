@@ -1,8 +1,10 @@
 """Static site search plugin: extraction helpers, index, results page,
 form/JSON-LD/head wiring, collisions."""
 import json
+import re
 
 import pytest
+import requests
 from bs4 import BeautifulSoup
 
 
@@ -43,9 +45,84 @@ text-align:center">
 ORIGIN_PAGE = b"<html><body>Echte Seite der Website</body></html>"
 
 
+SEARCH_PAGE = """<!doctype html>
+<html lang="de"><head><meta charset="utf-8">
+<title>Du hast nach %(term)s gesucht - Huthansl</title>
+<meta property="og:url" content="https://example.at/?s=%(term)s">
+<script src="https://example.at/wp-includes/js/masonry.min.js"></script>
+</head><body class="search search-results layout-masonry">
+<div class="page-title-head hgroup"><h1>Suchergebnisse für: <span>%(term)s</span></h1></div>
+<div class="page-title-breadcrumbs"><ol class="breadcrumbs">
+<li><a href="https://example.at/"><span itemprop="name">Start</span></a></li>
+<li class="current"><span itemprop="name">Ergebnisse für "%(term)s"</span></li>
+</ol></div>
+<div class="content" id="content" role="main">%(body)s</div>
+<script>var cfg={"page_location":"https://example.at/?s=%(term)s"};</script>
+</body></html>"""
+
+CARD = """<div class="wf-cell iso-item" data-post-id="%(id)s" data-date="%(iso)s" data-name="%(title)s">
+<article class="post no-img post-%(id)s page hentry"><div class="blog-content wf-td">
+<h3 class="entry-title"><a href="https://example.at%(href)s" title="%(title)s" rel="bookmark">%(title)s</a></h3>
+<div class="entry-meta"><a class="author vcard" href="https://example.at/author/admin/" rel="author">Von <span class="fn">admin</span></a><a href="javascript:void(0);" title="11:05" class="data-link"><time class="entry-date" datetime="%(iso)s">%(shown)s</time></a></div><p>%(excerpt)s</p>
+</div></article></div>"""
+
+RESULTS_BODY = (
+    '<div class="wf-container iso-container" data-padding="10px" '
+    'data-cur-page="1" data-columns="3">'
+    + CARD % {"id": "11", "href": "/fassaden/", "title": "Fassaden",
+              "iso": "2021-11-25T11:05:38+01:00", "shown": "25. November 2021",
+              "excerpt": "Vollwärmeschutz für die Straße."}
+    + CARD % {"id": "12", "href": "/kontakt/", "title": "Kontakt",
+              "iso": "2017-10-05T17:47:25+02:00", "shown": "5. Oktober 2017",
+              "excerpt": "Rennweg 81, Brunn"}
+    + '</div><div class="paginator"><a href="https://example.at/page/2/?s=x" '
+      'class="page-numbers next">→</a></div>')
+
+EMPTY_BODY = ('<article id="post-0" class="post no-results not-found">'
+              '<h1 class="entry-title">Nichts gefunden</h1>'
+              '<p>Leider konnten wir nichts finden.</p>'
+              '<form class="searchform" method="get" '
+              'action="https://example.at/"><input name="s" value="x">'
+              '</form></article>')
+
+
+class _Resp:
+    """The fetch() response shape off_site_redirect() needs."""
+
+    def __init__(self, body: str, status=200, ctype="text/html"):
+        self.content = body.encode("utf-8")
+        self.status_code = status
+        self.ok = 200 <= status < 300
+        self.headers = {"Content-Type": ctype}
+        self.url = "https://example.at/"
+        self.is_redirect = self.is_permanent_redirect = False
+        self.history = []
+
+
+CORPUS = "Fassaden Vollwärmeschutz für die Straße Kontakt Rennweg 81 Brunn"
+
+
+def live_search():
+    """A fake origin that answers /?s=<term> like WordPress does: a themed
+    results page for terms its content actually contains, the theme's
+    'nothing found' block for everything else."""
+    def fetch(url, headers=None, **kw):
+        from urllib.parse import parse_qs, urlsplit
+        term = (parse_qs(urlsplit(url).query).get("s") or [""])[0]
+        body = (RESULTS_BODY if term and term.lower() in CORPUS.lower()
+                else EMPTY_BODY)
+        return _Resp(SEARCH_PAGE % {"term": term, "body": body})
+    return fetch
+
+
 @pytest.fixture
 def plug(mod, exporter):
     exporter.public_dir.mkdir(parents=True, exist_ok=True)
+
+    def no_network(url, *a, **kw):
+        raise AssertionError(f"unexpected network request: {url}")
+    exporter.fetch = no_network          # tests opt in via live_search()
+    exporter.cfg.search_harvest = False  # ... and via search_harvest
     return exporter.plugin("search")
 
 
@@ -306,7 +383,7 @@ def test_run_end_writes_index_with_sitemap_filter(mod, exporter, plug):
     plug.run_end()
     data = json.loads(
         (exporter.public_dir / "search-index.json").read_text("utf-8"))
-    assert data["v"] == 1 and data["lang"] == "de"
+    assert data["v"] == 2 and data["lang"] == "de"
     paths = [d[0] for d in data["docs"]]
     assert paths == ["/fassaden/", "/kontakt/"]
     assert "/geheim/" not in paths          # noindex
@@ -355,12 +432,14 @@ def test_run_end_generates_results_page_from_404(mod, exporter, plug):
     # both UI string sets ship; the config picks German at runtime, and no
     # origin host leaks into our script
     script = soup.find("script", attrs={"data-wpse-search": "renderer"}).string
-    assert "Treffer" in script and "results for" in script
+    assert "Keine Ergebnisse" in script and "No results for" in script
     assert '"de":true' in script.replace(" ", "")
     assert "example.at" not in script
     assert '"idx":"/search-index.json"' in script.replace(" ", "")
+    assert '"tpl":""' in script.replace(" ", "")     # no harvest here
     assert plug.stats["page_written"] is True
     assert plug.stats["page_source"] == "404.html"
+    assert plug.stats["harvest"]["used"] is False
     assert exporter.verify_missing == []
 
 
@@ -465,6 +544,153 @@ def test_mixed_languages_warn_and_pick_the_homepage(mod, exporter, plug):
             url)
     assert plug.settings()["path"] == "/search/"      # homepage wins the tie
     assert any("more than one language" in w for w in exporter.warnings)
+
+
+# -- harvesting the live results-page design ---------------------------------
+
+def test_probe_term_helpers(mod):
+    s = _mod(mod)
+    assert s.fold_word("Straße") == "strasse"
+    assert s.fold_word("ÜBER") == "uber"
+    assert s.doc_words("Fassaden, Vollwärmeschutz!") == {"fassaden",
+                                                        "vollwarmeschutz"}
+    assert s.word_forms("Vollwärmeschutz")["vollwarmeschutz"] == \
+        "Vollwärmeschutz"                       # probe uses the real spelling
+    # rare: unique across documents, longest wins
+    docs = [{"haus", "vollwarmeschutz"}, {"haus", "kontakt"}]
+    assert s.rare_term(docs, []) == "vollwarmeschutz"
+    assert s.rare_term([], ["Datenschutzerklärung"]) == "datenschutzerklarung"
+    assert s.rare_term([], []) == ""
+    # broad: single characters first, most uncovered documents win
+    texts = {"/a/": "aaa bbb", "/b/": "aaa ccc"}
+    assert s.broad_term(texts, {"/a/", "/b/"}, set()) == "a"
+    assert s.broad_term(texts, set(), set()) == ""
+
+
+def test_split_echo(mod):
+    s = _mod(mod).split_echo
+    assert s('Ergebnisse für "te"', "te") == ('Ergebnisse für "', '"')
+    assert s("Du hast nach e gesucht - X", "e") == \
+        ("Du hast nach e g", "sucht - X")        # rfind: caller uses a rare
+    assert s("nothing here", "zz") is None       # term for the <title>
+    assert s("", "x") is None
+
+
+def test_harvest_builds_template_and_slots(mod, exporter, plug):
+    exporter.fetch = live_search()
+    exporter.cfg.search_harvest = True
+    _prepare(mod, exporter, plug, with_404=False)
+    plug.run_end()
+    h = plug.stats["harvest"]
+    assert h["used"] is True and h["template"] is True
+    assert h["pages_with_slots"] == 2 and h["empty_state"] is True
+    assert h["title_pattern"] is True
+    assert h["probe_requests"] <= _mod(mod).PROBE_MAX_REQUESTS
+    assert plug.stats["page_source"] == "live search page"
+    # the index carries the harvested display slots
+    data = json.loads(
+        (exporter.public_dir / "search-index.json").read_text("utf-8"))
+    slots = {d[0]: (d[4] if len(d) > 4 else None) for d in data["docs"]}
+    assert slots["/fassaden/"]["a"] == "admin"
+    assert slots["/fassaden/"]["d"] == "25. November 2021"
+    assert slots["/fassaden/"]["i"] == "2021-11-25T11:05:38+01:00"
+    assert slots["/fassaden/"]["p"] == "11"
+    assert "Vollwärmeschutz" in slots["/fassaden/"]["e"]
+
+
+def test_harvested_page_keeps_the_theme_design(mod, exporter, plug):
+    exporter.fetch = live_search()
+    exporter.cfg.search_harvest = True
+    _prepare(mod, exporter, plug, with_404=False)
+    plug.run_end()
+    html = (exporter.public_dir / "suche" / "index.html").read_text("utf-8")
+    soup = BeautifulSoup(html, "html.parser")
+    # the theme's own grid container, tagged for the renderer, emptied
+    box = soup.find(id="wpse-search-results")
+    assert "iso-container" in (box.get("class") or [])
+    assert box["data-columns"] == "3" and box["data-cur-page"] == "1"
+    assert box.find("div", class_="wf-cell") is None
+    assert soup.body["class"][:2] == ["search", "search-results"]
+    # the static heading prefix survives; only the term became a marker
+    h1 = soup.select_one(".page-title-head h1")
+    assert h1.get_text().startswith("Suchergebnisse für:")
+    assert h1.find("span", attrs={"data-wpse-search": "term"}) is not None
+    crumb = soup.select("ol.breadcrumbs li")[-1]
+    assert 'Ergebnisse für "' in crumb.get_text()
+    assert crumb.find(attrs={"data-wpse-search": "term"}) is not None
+    # the stale paginator is gone and no probe term survives as a query
+    # value anywhere (an emptied "?s=" in an analytics blob is fine -- it
+    # is exactly what a visitor without a term produces)
+    assert soup.find(class_="paginator") is None
+    assert re.search(r"[?&]s=[^\"'&<\s]", html) is None
+    # the card template rides in the renderer config, with placeholders
+    script = soup.find("script", attrs={"data-wpse-search": "renderer"}).string
+    for token in ("%%U%%", "%%T%%", "%%X%%", "%%D%%", "%%A%%", "%%MB%%"):
+        assert token in script, token
+    assert "wf-cell" in script and "entry-title" in script
+    assert '"empty":"' in script.replace(" ", "")
+    assert "Nichts gefunden" in script            # harvested empty state
+    assert "example.at" not in script
+    # the search-only asset was queued for download
+    assert any("masonry.min.js" in a for a in plug._assets)
+
+
+def test_harvest_drops_dead_author_link(mod, exporter, plug):
+    exporter.fetch = live_search()
+    exporter.cfg.search_harvest = True
+    _prepare(mod, exporter, plug, with_404=False)
+    plug.run_end()
+    script = BeautifulSoup(
+        (exporter.public_dir / "suche" / "index.html").read_text("utf-8"),
+        "html.parser").find(
+            "script", attrs={"data-wpse-search": "renderer"}).string
+    # /author/admin/ was never exported: the anchor stays, the href goes
+    assert "author vcard" in script and "/author/admin/" not in script
+
+
+def test_soft_404_search_is_not_harvested(mod, exporter, plug):
+    """A site that answers /?s=x with the homepage must never be mistaken
+    for a search endpoint."""
+    home = ('<html lang="de"><head><title>Startseite</title></head><body>'
+            '<div id="content"><a href="https://example.at/fassaden/">A</a>'
+            '<a href="https://example.at/kontakt/">B</a></div></body></html>')
+    exporter.fetch = lambda url, *a, **kw: _Resp(home)
+    exporter.cfg.search_harvest = True
+    _prepare(mod, exporter, plug, with_404=True)
+    plug.run_end()
+    assert plug.stats["harvest"]["used"] is False
+    assert "does not echo the query" in plug.stats["harvest"]["reason"]
+    assert plug.stats["page_source"] == "404.html"      # fell back
+    assert plug.stats["harvest"]["probe_requests"] == 1  # gave up at once
+    assert any("could not harvest" in w for w in exporter.warnings)
+
+
+def test_harvest_failure_falls_back(mod, exporter, plug):
+    def boom(url, *a, **kw):
+        raise requests.RequestException("nope")
+    exporter.fetch = boom
+    exporter.cfg.search_harvest = True
+    _prepare(mod, exporter, plug, with_404=True)
+    plug.run_end()
+    assert plug.stats["harvest"]["used"] is False
+    assert plug.stats["page_source"] == "404.html"
+    assert (exporter.public_dir / "suche" / "index.html").is_file()
+
+
+def test_no_search_harvest_flag_makes_no_requests(mod, exporter, plug):
+    _prepare(mod, exporter, plug, with_404=True)   # fixture blocks network
+    plug.run_end()                                  # would raise on a fetch
+    assert plug.stats["harvest"]["probe_requests"] == 0
+    assert plug.stats["harvest"]["reason"] == "--no-search-harvest"
+    assert plug.stats["page_source"] == "404.html"
+
+
+def test_cli_no_search_harvest(mod, tmp_path):
+    cfg = mod.parse_args(["https://example.at", "-o", str(tmp_path)])
+    assert cfg.search_harvest is True
+    cfg = mod.parse_args(["https://example.at", "-o", str(tmp_path),
+                          "--no-search-harvest"])
+    assert cfg.search_harvest is False
 
 
 def test_disabled_by_flag_and_by_no_rewrite(mod, tmp_path):

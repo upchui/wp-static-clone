@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 TOOL_NAME = "wp-static-export"
-VERSION = "2.6.0"
+VERSION = "2.7.0"
 
 
 @dataclass
