@@ -4,9 +4,9 @@ Everything feature- or vendor-specific in wp-static-clone lives in this
 directory. The core (`wp-static-export.py`) provides the generic export
 pipeline — sitemap discovery, crawl, URL rewriting, verification, deploy
 files, report — plus a fixed set of **hook points** and **registries**
-that plugins attach to. The ten shipped plugins are ordinary users of
-this API; your own plugin is a first-class citizen the moment its file
-lands in this folder.
+that plugins attach to. The shipped plugins are ordinary users of this
+API; your own plugin is a first-class citizen the moment its file lands
+in this folder.
 
 What plugins do today (each line names a shipped example to read):
 
@@ -17,6 +17,7 @@ What plugins do today (each line names a shipped example to read):
 * claim non-HTML responses and materialize files — [`downloads.py`](downloads.py)
 * post-process the exported HTML tree after the crawl — [`image_optimize.py`](image_optimize.py)
 * recompress the exported image files in place — [`image_compress.py`](image_compress.py)
+* generate whole new pages and data files for the export — [`search.py`](search.py)
 * skip URLs, contribute 301 rules to the server configs, and add their
   own CLI flags, console summary lines and report sections — most of them
 
@@ -134,8 +135,12 @@ rewrites `/download/…/` links onto the materialized files *before*
 `image_optimize.postprocess_soup` resolves `img src` paths against the
 disk. Keep that in mind before renaming plugin files (renaming is the
 supported way to reorder). `run_end` also fires in load order; the
-shipped users touch disjoint file sets (raster images vs `.svg`), so no
-ordering dependency exists there.
+shipped users touch disjoint file sets (raster images, `.svg`, and the
+search page/index `search.py` generates), so no ordering dependency
+exists there. Note that a page a plugin generates in `run_end` has
+already missed `postprocess_soup` — `search.py` therefore clones a page
+that was postprocessed and serializes through `exp.serialize()`, which
+still runs `pre_serialize`/`post_serialize` (so minification applies).
 
 ## Registry reference
 
@@ -166,7 +171,7 @@ Hooks returning a value are filters; the rest are notifications.
 | `run_start()` | top of `run()`: environment validation / warnings | minify |
 | `skip_page_path(path) -> bool` [T] | URL normalization: `True` = this path is never a page | cloudflare (`/cdn-cgi/`), wordpress |
 | `skip_asset_candidate(url, tag_name, rel) -> bool` [T] | HTML discovery: `True` drops one asset candidate | wordpress (wlwmanifest targets) |
-| `pre_discover_soup(soup, page_url)` [T] | rewrite mode, BEFORE URL discovery and rewriting — mutations are seen by both | slider_revolution (slide hydration) |
+| `pre_discover_soup(soup, page_url)` [T] | rewrite mode, BEFORE URL discovery and rewriting — mutations are seen by both; the only hook with soup AND page URL | slider_revolution (slide hydration), search (index harvest) |
 | `expand_scan_text(work) -> str` [T] | pre-transform of JS/JSON text before the URL sweep | complianz (template placeholders) |
 | `scan_text_urls(work) -> (pages, assets)` [T] | derive URLs from runtime URL-construction patterns | slider_revolution |
 | `clean_soup(soup)` [T] | after core `strip_resource_hints()`, under the `cfg.rewrite` + `cfg.strip_wp_cruft` gate | wordpress, cloudflare, wordfence |
@@ -179,8 +184,8 @@ Hooks returning a value are filters; the rest are notifications.
 | `save_non_html_response(url, resp) -> bool` [T] | claim a non-HTML response on a page/extensionless URL; `True` = claimed, first claimant wins | downloads |
 | `filter_text_asset(url, kind, text) -> str` [T] | LAST transform of a rewritten CSS/JS asset before it is written | minify |
 | `wants_postprocess() -> bool` | gates the post-crawl read-modify-write pass over every exported page | image_optimize, downloads |
-| `postprocess_soup(soup) -> bool` | post-crawl transform per exported page; return `True` when changed | image_optimize, downloads |
-| `run_end()` | post-crawl finalization: whole-tree work over `public_dir`, after the HTML post-processing pass and before verification/report (main thread; spawn your own executor for parallelism) | image_compress, minify (SVG comments) |
+| `postprocess_soup(soup) -> bool` | post-crawl transform per exported page; return `True` when changed | image_optimize, downloads, search (form/JSON-LD rewiring) |
+| `run_end()` | post-crawl finalization: whole-tree work over `public_dir`, after the HTML post-processing pass and before verification/report (main thread; spawn your own executor for parallelism) | image_compress, minify (SVG comments), search (index + results page) |
 | `redirect_rules(seen_from) -> list` | extra `(from_path, to_ref)` 301 rules for nginx/Netlify/Apache configs; skip paths already in `seen_from`, filter unsafe characters yourself | downloads |
 | `summary_lines() -> list[str]` | console lines for the final summary | minify, mobile_check, downloads |
 | `add_report(report, txt_head, txt_sections)` | mutate `report.json` (dict), append `report.txt` head lines / `report_section()` blocks; runs before the JSON dump | all feature plugins |

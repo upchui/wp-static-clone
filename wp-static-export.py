@@ -3409,9 +3409,9 @@ esac
             else:
                 print("[verify] export is self-contained: all references "
                       "resolve locally, no unexpected absolute URLs")
-            print("[note] Not functional statically: form submissions, "
-                  "consent/analytics AJAX and site search "
-                  "(dynamic endpoints).")
+            print("[note] Not functional statically: form submissions and "
+                  "consent/analytics AJAX (dynamic endpoints). Site search "
+                  "is exported separately -- see the [seo] line above.")
             print("[note] External hosts (font/analytics/CDN domains) stay "
                   "linked and are never downloaded; "
                   "wp-admin/xmlrpc are never requested.")

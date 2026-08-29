@@ -1,5 +1,45 @@
 # Changelog
 
+## 2.6.0 (2026-08-29)
+
+The site search works statically.
+
+### Added
+- **Search plugin** (`plugins/search.py`, on by default): WordPress
+  answers `/?s=term` dynamically, and every static host this tool
+  generates configs for silently returns the *homepage* for that URL
+  instead -- a wrong success nobody notices. The export now carries its
+  own search:
+  - `/search-index.json`, built from the pages the crawl already parsed
+    (title, meta description, main-content text with site chrome
+    pruned), filtered exactly like the generated sitemap (no noindex,
+    no redirect stubs, no link-only attachment pages).
+  - A themed results page at `/suche/` (German sites) or `/search/`,
+    cloned from the export's own 404 page so it inherits the theme CSS,
+    marked `noindex,follow` like WordPress marks search results, and
+    given its own search form when the template has none.
+  - Every search form's `action` and the Yoast JSON-LD `SearchAction`
+    point at that page; a ~190-byte script at the top of every
+    `<head>` sends any surviving `?s=`/`?q=` URL there before first
+    paint (bookmarks, external links, forms we did not recognize).
+  - Matching is case- and diacritics-insensitive (`strasse` finds
+    `Straße`, `ss` and `ß` are interchangeable), terms are ANDed like
+    WordPress does, results carry a snippet with the term in `<mark>`,
+    and the UI speaks German or English following the site language.
+    No JS library, no extra asset, everything escaped.
+  - `--no-search`, `--search-path PATH`, `--search-max-chars N`;
+    results under `seo.search` in the report.
+  - If the origin site already serves the search path or
+    `/search-index.json`, origin content wins: the feature stands down
+    entirely (nothing wired, nothing written) with a warning naming
+    `--search-path`.
+- The export must be served over HTTP for the search to work -- the
+  index cannot be fetched from a `file://` page.
+
+### Changed
+- The closing "not functional statically" note no longer lists site
+  search.
+
 ## 2.5.0 (2026-08-29)
 
 ### Added

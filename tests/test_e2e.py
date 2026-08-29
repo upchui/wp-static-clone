@@ -188,6 +188,38 @@ def test_resource_hints_stripped(export):
     assert "fonts.gstatic.com" in html
 
 
+def test_static_search_exported(export):
+    import json as _json
+    pub = export["public"]
+    # results page at the German path (the fixture declares lang="de")
+    page = pub / "suche" / "index.html"
+    assert page.is_file()
+    html = page.read_text(encoding="utf-8")
+    assert 'id="wpse-search-results"' in html
+    assert 'data-wpse-search="renderer"' in html
+    assert 'data-wpse-search="redirect"' not in html     # no redirect loop
+    assert "noindex,follow" in html
+    # index: real pages with their titles and text, filtered like the sitemap
+    index = _json.loads((pub / "search-index.json").read_text("utf-8"))
+    assert index["v"] == 1 and index["lang"] == "de"
+    paths = [d[0] for d in index["docs"]]
+    assert "/" in paths and "/ueber-uns/" in paths
+    assert "/geheim/" not in paths                       # noindex
+    corpus = " ".join(d[3] for d in index["docs"])
+    assert "Vollwärmeschutz" in corpus
+    # every page's form points at the results page, every page can redirect
+    home = (pub / "index.html").read_text(encoding="utf-8")
+    assert 'action="/suche/"' in home
+    assert 'data-wpse-search="redirect"' in home
+    assert "location.replace" in home
+    # search results are not indexable content
+    assert "/suche/" not in (pub / "sitemap.xml").read_text(encoding="utf-8")
+    stats = export["report"]["seo"]["search"]
+    assert stats["page_written"] is True and stats["collision"] is None
+    assert stats["path"] == "/suche/" and stats["pages_indexed"] >= 2
+    assert stats["forms_rewritten"] >= 1
+
+
 def test_wp_cruft_stripped(export):
     html = (export["public"] / "index.html").read_text(encoding="utf-8")
     for gone in ("generator", "shortlink", "EditURI", "wlwmanifest", "oembed",
