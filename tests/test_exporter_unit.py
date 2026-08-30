@@ -228,6 +228,12 @@ def test_index_exclusion_reasons(mod, exporter):
     # itself, so "the origin declared it" proves nothing
     assert ex(_page(mod, "https://example.at/logo/", source="sitemap",
                     artifact="phpthumb-cache")) == "phpthumb-cache"
+    # an empty term archive is excluded from the SEARCH too -- unlike
+    # noindex, which the search deliberately ignores
+    empty = _page(mod, "https://example.at/thema/leer/",
+                  artifact="empty-archive")
+    assert ex(empty) == "empty-archive"
+    assert ex(empty, "search") == "empty-archive"
 
 
 def test_generated_sitemap_excludes_artifacts(mod, exporter):

@@ -232,6 +232,88 @@ def test_artifact_detection_tolerates_odd_input(mod, tmp_path):
     assert rec2.artifact == ""
 
 
+# -- v2.13.0: empty term archives --------------------------------------------
+
+# verbatim from www.integra-vd.at/wpa-stats-type/android/ -- a taxonomy a
+# plugin registered for its own bookkeeping, on a post type that is not
+# publicly queryable, so every term archive renders "Nothing found"
+EMPTY_ARCHIVE_CLASSES = (
+    "archive tax-wpa-stats-type term-android term-56 wp-embed-responsive "
+    "wp-theme-dt-the7 wp-child-theme-dt-the7-child the7-core-ver-2.7.13")
+FULL_ARCHIVE_CLASSES = ("archive category category-news category-12 "
+                        "wp-embed-responsive wp-theme-dt-the7")
+# WordPress core's own content-none.php, as dt-the7 renders it
+NO_RESULTS_BLOCK = (
+    '<article class="post no-results not-found" id="post-0">'
+    '<h1 class="entry-title">Nichts gefunden</h1>'
+    '<p>Es scheint, dass wir nicht finden k&ouml;nnen, was Sie suchen.</p>'
+    '</article>')
+
+
+def test_empty_term_archives_flagged(mod, tmp_path):
+    """An archive whose loop came back empty: Yoast still says
+    index,follow, so nothing else keeps it out of sitemap.xml or the
+    search -- and six of them made up more than half of one real site's
+    sitemap."""
+    e = mod.Exporter(mod.Config(base_url="https://example.at",
+                                out_dir=tmp_path / "o"))
+    wp = e.plugin("wordpress")
+    rec = _rec(mod)
+    wp.page_saved("https://example.at/wpa-stats-type/android/",
+                  _resp(EMPTY_ARCHIVE_CLASSES, NO_RESULTS_BLOCK), rec)
+    assert rec.artifact == "empty-archive"
+    assert wp.stats["empty_archives"] == 1
+    # ... and it is kept out of BOTH listings, while staying on disk
+    assert e.index_exclusion(rec) == "empty-archive"
+    assert e.index_exclusion(rec, "search") == "empty-archive"
+
+
+def test_archives_with_entries_are_left_alone(mod, tmp_path):
+    e = mod.Exporter(mod.Config(base_url="https://example.at",
+                                out_dir=tmp_path / "o"))
+    wp = e.plugin("wordpress")
+    entries = ('<article class="post post-12 hentry"><h2>Ein Beitrag</h2>'
+               "</article>")
+    for classes, body in (
+            # an archive that found something
+            (FULL_ARCHIVE_CLASSES, entries),
+            # a normal page carrying a search widget's empty-state markup
+            (PAGE_CLASSES, NO_RESULTS_BLOCK),
+            # our own generated results page -- never an artifact
+            ("search search-results", NO_RESULTS_BLOCK),
+            # the words in running text, not in a class attribute
+            (EMPTY_ARCHIVE_CLASSES,
+             "<p>Die Klassen no-results not-found kommen von "
+             "content-none.php.</p>"),
+            # a class that merely CONTAINS the tokens
+            (EMPTY_ARCHIVE_CLASSES,
+             '<div class="wpa-no-results wpa-not-found">x</div>')):
+        rec = _rec(mod)
+        wp.page_saved("https://example.at/x/", _resp(classes, body), rec)
+        assert rec.artifact == "", (classes, body[:40])
+    assert wp.stats["empty_archives"] == 0
+
+
+def test_list_empty_archives_opt_out(mod, tmp_path):
+    cfg = mod.parse_args(["https://example.at", "-o", str(tmp_path)])
+    assert cfg.list_empty_archives is False
+    cfg = mod.parse_args(["https://example.at", "-o", str(tmp_path),
+                          "--list-empty-archives"])
+    assert cfg.list_empty_archives is True
+    e = mod.Exporter(cfg)
+    rec = _rec(mod)
+    e.plugin("wordpress").page_saved(
+        "https://example.at/wpa-stats-type/android/",
+        _resp(EMPTY_ARCHIVE_CLASSES, NO_RESULTS_BLOCK), rec)
+    assert rec.artifact == ""                       # opted out
+    assert e.index_exclusion(rec) == ""             # so it stays listed
+    # the attachment opt-out is separate: it must NOT switch this one off
+    rec2 = _rec(mod)
+    e.plugin("wordpress").page_saved("https://example.at/logo/",
+                                     _resp(ARTIFACT_CLASSES), rec2)
+    assert rec2.artifact == "wp-attachment"
+
+
 def test_list_attachment_pages_opt_out(mod, tmp_path):
     cfg = mod.parse_args(["https://example.at", "-o", str(tmp_path)])
     assert cfg.list_attachment_pages is False

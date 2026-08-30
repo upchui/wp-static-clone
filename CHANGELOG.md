@@ -1,5 +1,36 @@
 # Changelog
 
+## 2.13.0 (2026-08-30)
+
+### Added
+- **Empty term archives are recognized as artifact pages.** A plugin that
+  registers a taxonomy for its own bookkeeping — statistics, import
+  batches — on a post type that is not publicly queryable leaves one term
+  archive per term whose loop returns nothing. The page is WordPress'
+  "Nothing found" template and Yoast still declares it `index, follow`,
+  so neither the `noindex` filter nor "the origin sitemap declared it"
+  keeps it out. On one real site six such archives made up **more than
+  half of the generated `sitemap.xml`** (6 of 11 URLs) and 6 of 15
+  documents in the search index.
+
+  Detected from two WordPress *core* signals, not from theme class names:
+  `body_class()` marks every `is_archive()` page with `archive`, and
+  core's own `content-none.php` renders `class="no-results not-found"`.
+  Only both together count, class attributes are compared as whole
+  tokens, and the check runs on the response bytes the artifact
+  classifier already reads (so it works under `--no-rewrite` too).
+  Deliberately excluded: `blog` (on a site whose front page is the blog
+  that class sits on the homepage) and `search` (our own results page
+  carries it).
+
+  Such pages are still **exported** — a stray link must not 404 — but
+  kept out of `sitemap.xml` and the site search, like attachment and
+  image-cache pages. `report.json` counts them under
+  `seo.artifact_pages.empty_archives`.
+- **`--list-empty-archives`** lists them anyway, for a site where an
+  archive that happens to be empty is still meant to be advertised. It is
+  separate from `--list-attachment-pages`; neither switches the other off.
+
 ## 2.12.1 (2026-08-30)
 
 ### Fixed

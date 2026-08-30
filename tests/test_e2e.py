@@ -445,12 +445,28 @@ def test_artifact_pages_excluded_but_exported(export):
     assert (pub / "partner" / "logo" / "index.html").is_file()
     xml = (pub / "sitemap.xml").read_text(encoding="utf-8")
     assert "/partner/logo/" not in xml
-    assert export["report"]["sitemap"]["excluded_artifacts"] == 1
+    assert export["report"]["sitemap"]["excluded_artifacts"] == 2
     index = json.loads((pub / "search-index.json").read_text("utf-8"))
     assert "/partner/logo/" not in [d[0] for d in index["docs"]]
     stats = export["report"]["seo"]["artifact_pages"]
     assert stats["attachment_pages"] == 1 and stats["listed"] is False
     # keeping it on disk is what keeps verification green
+    assert export["report"]["verification"]["missing_local_files"] == []
+
+
+def test_empty_term_archive_excluded_but_exported(export):
+    """A taxonomy archive whose loop is empty: the origin's own sitemap
+    declares it and Yoast says index,follow, so only the "Nothing found"
+    template itself gives it away."""
+    pub = export["public"]
+    assert (pub / "thema" / "leer" / "index.html").is_file()
+    xml = (pub / "sitemap.xml").read_text(encoding="utf-8")
+    assert "/thema/leer/" not in xml
+    index = json.loads((pub / "search-index.json").read_text("utf-8"))
+    assert "/thema/leer/" not in [d[0] for d in index["docs"]]
+    stats = export["report"]["seo"]["artifact_pages"]
+    assert stats["empty_archives"] == 1
+    assert stats["empty_archives_listed"] is False
     assert export["report"]["verification"]["missing_local_files"] == []
 
 
