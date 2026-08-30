@@ -66,17 +66,25 @@ CARD = """<div class="wf-cell iso-item" data-post-id="%(id)s" data-date="%(iso)s
 <div class="entry-meta"><a class="author vcard" href="https://example.at/author/admin/" rel="author">Von <span class="fn">admin</span></a><a href="javascript:void(0);" title="11:05" class="data-link"><time class="entry-date" datetime="%(iso)s">%(shown)s</time></a></div><p>%(excerpt)s</p>
 </div></article></div>"""
 
-RESULTS_BODY = (
-    '<div class="wf-container iso-container" data-padding="10px" '
-    'data-cur-page="1" data-columns="3">'
-    + CARD % {"id": "11", "href": "/fassaden/", "title": "Fassaden",
-              "iso": "2021-11-25T11:05:38+01:00", "shown": "25. November 2021",
-              "excerpt": "Vollwärmeschutz für die Straße."}
-    + CARD % {"id": "12", "href": "/kontakt/", "title": "Kontakt",
-              "iso": "2017-10-05T17:47:25+02:00", "shown": "5. Oktober 2017",
-              "excerpt": "Rennweg 81, Brunn"}
-    + '</div><div class="paginator"><a href="https://example.at/page/2/?s=x" '
-      'class="page-numbers next">→</a></div>')
+CARDS = {
+    "/fassaden/": CARD % {"id": "11", "href": "/fassaden/",
+                          "title": "Fassaden",
+                          "iso": "2021-11-25T11:05:38+01:00",
+                          "shown": "25. November 2021",
+                          "excerpt": "Vollwärmeschutz für die Straße."},
+    "/kontakt/": CARD % {"id": "12", "href": "/kontakt/", "title": "Kontakt",
+                         "iso": "2017-10-05T17:47:25+02:00",
+                         "shown": "5. Oktober 2017",
+                         "excerpt": "Rennweg 81, Brunn"},
+}
+
+# the theme's result loop plus the paginator that is stale by definition
+LOOP = ('<div class="wf-container iso-container" data-padding="10px" '
+        'data-cur-page="1" data-columns="3">%s</div>'
+        '<div class="paginator"><a href="https://example.at/page/2/?s=x" '
+        'class="page-numbers next">→</a></div>')
+
+RESULTS_BODY = LOOP % "".join(CARDS.values())
 
 EMPTY_BODY = ('<article id="post-0" class="post no-results not-found">'
               '<h1 class="entry-title">Nichts gefunden</h1>'
@@ -111,6 +119,30 @@ def live_search():
         term = (parse_qs(urlsplit(url).query).get("s") or [""])[0]
         body = (RESULTS_BODY if term and term.lower() in CORPUS.lower()
                 else EMPTY_BODY)
+        return _Resp(SEARCH_PAGE % {"term": term, "body": body})
+    return fetch
+
+
+# what each page would match a LIKE '%term%' on -- enough to make the fake
+# origin answer different terms with different numbers of cards, which is
+# where card and container stop being distinguishable
+PAGE_WORDS = {
+    "/fassaden/": "fassaden wärmeschutzfassaden vollwärmeschutz straße",
+    "/kontakt/": "kontakt rennweg brunn",
+}
+
+
+def live_search_matching(pages=None):
+    """A fake origin that really matches: the RARE probe term (>= 6 chars by
+    construction) hits exactly one page, the short broad terms hit several.
+    `pages` restricts the origin to a subset -- a site whose search can
+    never return more than one result."""
+    def fetch(url, headers=None, **kw):
+        from urllib.parse import parse_qs, urlsplit
+        term = (parse_qs(urlsplit(url).query).get("s") or [""])[0].lower()
+        hits = [p for p, words in PAGE_WORDS.items()
+                if term and term in words and (pages is None or p in pages)]
+        body = LOOP % "".join(CARDS[p] for p in hits) if hits else EMPTY_BODY
         return _Resp(SEARCH_PAGE % {"term": term, "body": body})
     return fetch
 
@@ -626,6 +658,50 @@ def test_harvest_builds_template_and_slots(mod, exporter, plug):
     assert slots["/fassaden/"]["i"] == "2021-11-25T11:05:38+01:00"
     assert slots["/fassaden/"]["p"] == "11"
     assert "Vollwärmeschutz" in slots["/fassaden/"]["e"]
+
+
+def test_a_lone_first_response_does_not_decide_the_card_shape(
+        mod, exporter, plug):
+    """The rare probe term matches exactly ONE page -- the case huthansl.at
+    hits on every export. Card and loop container are indistinguishable
+    there, and WordPress' post_class() marks sit on the <article> INSIDE
+    the theme's grid cell: guessing from them made a single grid CELL the
+    results container, so every result was rendered into one cell of the
+    masonry. The shape has to come from a response that repeated
+    something."""
+    exporter.fetch = live_search_matching()
+    exporter.cfg.search_harvest = True
+    _prepare(mod, exporter, plug, with_404=False)
+    plug.run_end()
+    soup = BeautifulSoup(
+        (exporter.public_dir / "search" / "index.html").read_text("utf-8"),
+        "html.parser")
+    box = soup.find(id="wpse-search-results")
+    assert "wf-container" in (box.get("class") or []), box.get("class")
+    assert box.get("data-columns") == "3"          # the loop ...
+    assert box.get("data-post-id") is None         # ... not one of its cells
+    # and the template keeps the grid cell that the entry lives in
+    script = soup.find("script", attrs={"data-wpse-search": "renderer"}).string
+    assert "wf-cell" in script and "%%P%%" in script
+    data = json.loads(
+        (exporter.public_dir / "search-index.json").read_text("utf-8"))
+    slots = {d[0]: (d[4] if len(d) > 4 else None) for d in data["docs"]}
+    assert slots["/fassaden/"]["p"] == "11"
+    assert "post-id" in plug.stats["harvest"]["slots"]
+
+
+def test_a_search_that_never_repeats_still_yields_a_card(mod, exporter, plug):
+    """The last resort has to stay alive: a site whose search can never
+    return two results offers no repetition to measure, and there
+    post_class() is the best evidence there is."""
+    exporter.fetch = live_search_matching(pages={"/fassaden/"})
+    exporter.cfg.search_harvest = True
+    _prepare(mod, exporter, plug, with_404=False)
+    plug.run_end()
+    h = plug.stats["harvest"]
+    assert h["used"] is True and h["template"] is True
+    assert h["pages_with_slots"] == 1
+    assert any("only ONE live result card" in w for w in exporter.warnings)
 
 
 def test_harvested_page_keeps_the_theme_design(mod, exporter, plug):

@@ -225,7 +225,11 @@ def test_a_single_card_says_so_instead_of_pretending(mod, plug):
     soup = BeautifulSoup(f'<div id="content">{the7_list(POSTS[0])}</div>',
                          "html.parser")
     paths = {POSTS[0]["href"]}
-    _c, items = s.Search._find_results(soup.find(id="content"), paths)
+    root = soup.find(id="content")
+    # a lone result is NOT guessed at while anything else might still show a
+    # real loop -- only the harvest's last attempt passes lone=True
+    assert s.Search._find_results(root, paths) == (None, [])
+    _c, items = s.Search._find_results(root, paths, lone=True)
     assert len(items) == 1                       # via WordPress' post_class()
     h = s.new_harvest()
     plug._take_cards(h, items, paths)

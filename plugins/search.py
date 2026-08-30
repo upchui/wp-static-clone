@@ -84,6 +84,7 @@ MARKER = "wpse-search"                  # data attribute on our injected tags
 PROBE_MAX_REQUESTS = 12      # HARD ceiling on live /?s= requests per export
 PROBE_MAX_PAGES = 8          # paginator follow depth per term (loop guard)
 PROBE_MAX_ITEMS = 200        # sanity cap on cards taken from one response
+PROBE_MAX_HELD = 3           # responses kept for a second, laxer attempt
 # How many live cards are held against each other to tell the theme's own
 # markup from the post's values. Two suffice in principle; a few more make
 # the verdict safer (two posts CAN share an author, four rarely do).
@@ -1800,14 +1801,21 @@ class Search(Plugin):
                 p.rewrite_soup(soup)
 
     @staticmethod
-    def _find_results(root, paths: set, sig=None):
+    def _find_results(root, paths: set, sig=None, lone=False):
         """(container, items) of the theme's result loop.
 
         With a known item signature: match it directly. Without one: the
         DEEPEST element at least TWO of whose direct children contain a
-        link to an indexed page -- theme-agnostic. A one-result response
-        cannot be recognized by repetition at all; there WordPress' own
-        post_class() marks are the fallback."""
+        link to an indexed page -- theme-agnostic.
+
+        A response with a SINGLE result carries no repetition to recognize,
+        and card and container are then structurally indistinguishable.
+        `lone` allows the last resort for it -- WordPress' own post_class()
+        marks -- which the harvest only turns on once no response at all
+        has shown a real loop. Guessing early is worse than not guessing:
+        those marks sit on the entry, and a theme that wraps entries in
+        grid cells (the7) would lose the cell and render every result into
+        one of them."""
         if sig is not None:
             name, classes = sig
             found = [t for t in root.find_all(name)
@@ -1844,6 +1852,8 @@ class Search(Plugin):
             if best is None or depth > best[0]:
                 best = (depth, anc, kids)
         if best is None:
+            if not lone:
+                return None, []
             item = next((el for el in (_post_element(a, root) for a in hits)
                          if el is not None), None)
             if item is None or item.parent is None:
@@ -2207,16 +2217,22 @@ class Search(Plugin):
             for folded, original in word_forms(text).items():
                 forms.setdefault(folded, original)
 
-        def consume(soup, term):
+        def consume(soup, term, lone=False):
             """Localize, then take container + cards out of one response."""
             self._prepare_soup(soup)
             root = content_root(soup) or soup.body
             if root is None:
                 return False
-            container, items = self._find_results(root, set(paths), h["sig"])
+            container, items = self._find_results(root, set(paths), h["sig"],
+                                                  lone=lone)
             if container is None:
                 return False
-            if h["sig"] is None:
+            # A signature is only worth learning from a response that
+            # REPEATED something: one card proves nothing about the shape of
+            # the loop, and a signature taken from it would be applied to
+            # every later response -- which is how a one-result probe once
+            # turned the7's grid cell into the results container.
+            if h["sig"] is None and len(items) > 1:
                 # only what ALL cards of this response share: a signature
                 # carrying post_class()' per-post marks ("post-1575") or a
                 # theme's odd/even alternation would match exactly the one
@@ -2278,13 +2294,25 @@ class Search(Plugin):
                     break
                 nxt = self._next_probe_url(soup, term, seen)
                 gained = consume(soup, term)
-                for held, t in pending:              # sig may exist now
-                    consume(held, t)
-                pending = []
+                if not gained and h["sig"] is None:
+                    if len(pending) < PROBE_MAX_HELD:
+                        pending.append((soup, term))
+                else:
+                    for held, t in pending:          # sig may exist now
+                        consume(held, t)
+                    pending = []
                 if not gained:
                     break                            # nothing new here
                 url = nxt
             fruitless = 0 if len(h["slots"]) > before else fruitless + 1
+        if h["soup"] is None:
+            # No response repeated anything: a search that only ever answers
+            # with a single result. NOW the post_class() guess is the best
+            # there is -- and it can no longer overrule real evidence,
+            # because there is none.
+            for held, t in pending:
+                if consume(held, t, lone=True):
+                    break
         if h["soup"] is None:
             self._harvest_stop("no results container found")
             return None

@@ -1,5 +1,27 @@
 # Changelog
 
+## 2.12.1 (2026-08-30)
+
+### Fixed
+- **A one-result probe response could decide the shape of every card**
+  (regression in 2.12.0). The harvest opens with a deliberately rare
+  term, and on a small site that term matches exactly one page. 2.12.0
+  taught the new `post_class()` fallback to read a card out of such a
+  response — but `post-<id>`/`hentry` sit on the `<article>`, which on
+  themes that wrap entries in grid cells (dt-the7) is one level *below*
+  the item. The signature learned from it then matched `<article>` in
+  every later response, so the results container became a single grid
+  **cell**: every result was rendered into one cell of the masonry, and
+  the cell's `data-post-id`/`data-date`/`data-name` were lost from the
+  template. Two rules now prevent it: a card signature is only learned
+  from a response that actually **repeated** something, and the
+  `post_class()` fallback is a genuine last resort — it runs only after
+  no response at all has shown a real loop, which is exactly the case it
+  was built for (a search that can never return two results).
+- The live regression check that missed this compared the `<article>`
+  inside each grid cell — the one part that stayed correct. It now
+  compares the loop container and each card *including* its wrapper.
+
 ## 2.12.0 (2026-08-30)
 
 The static search now *reads* a theme's result card instead of guessing
