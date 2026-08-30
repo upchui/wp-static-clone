@@ -164,6 +164,142 @@ def _docs():
             for path, title, date, desc, text in CORPUS]
 
 
+# -- v2.15.2: the grid has to be told about the cards ------------------------
+# The index arrives over the network, so the cards can land after the theme's
+# own grid init has run over an empty container. dt-the7 initializes Isotope
+# with `resize: false` and listens to its own `debouncedresize`, and a single
+# layout pass in the same task as the innerHTML measures nodes whose styles
+# and images are not settled -- everything then reports size 0 and lands on
+# one spot. This harness records what the renderer asks the grid to do.
+LAYOUT_HARNESS = r"""
+const docs = DOCS, calls = [], handlers = { doc: {}, win: {} };
+const on = (bag) => (ev, fn) => { (bag[ev] = bag[ev] || []).push(fn); };
+const fire = (bag, ev) => (bag[ev] || []).forEach((f) => f());
+
+function XHR() {}
+XHR.prototype.open = function () {};
+XHR.prototype.send = function () {
+  this.readyState = 4;
+  this.status = 200;
+  this.responseText = JSON.stringify({ v: 3, docs: docs });
+  this.onreadystatechange();
+};
+
+let html = "";
+const box = { get innerHTML() { return html; }, set innerHTML(v) { html = v; },
+              set outerHTML(v) { html = v; } };
+const doc = { readyState: READYSTATE, title: "",
+  getElementById: (i) => (i === "wpse-search-results" ? box : null),
+  querySelectorAll: () => [], createTextNode: (t) => ({ t }),
+  addEventListener: on(handlers.doc),
+  get body() { return { className: "search search-results" }; } };
+
+const INSTANCES = INSTANCES_JSON;
+function jq() {
+  const api = {
+    trigger: (ev) => { calls.push("trigger:" + ev); return api; },
+    imagesLoaded: (cb) => { calls.push("imagesLoaded"); cb(); return api; }
+  };
+  for (const n of ["isotope", "masonry", "packery"]) {
+    api[n] = (cmd) => { calls.push(n + ":" + cmd); return api; };
+  }
+  return api;
+}
+jq.fn = ENGINES_JSON;
+jq.data = (el, name) => (INSTANCES[name] ? {} : undefined);
+
+const win = {
+  jQuery: HAS_JQUERY ? jq : undefined,
+  addEventListener: on(handlers.win),
+  setTimeout: (fn) => { calls.push("deferred"); fn(); },
+  Event: function (name) { this.type = name; },
+  dispatchEvent: (ev) => { calls.push("dispatch:" + ev.type); }
+};
+const location = { search: "?s=maler", pathname: "/search/" };
+RENDERER(doc, location, XHR, win);
+calls.push("|dom-ready|");
+doc.readyState = "interactive";
+fire(handlers.doc, "DOMContentLoaded");
+calls.push("|load|");
+doc.readyState = "complete";
+fire(handlers.win, "load");
+console.log(JSON.stringify(
+  { calls: calls, cards: (html.match(/data-wpse-path/g) || []).length }));
+"""
+
+
+def _layout(mod, tmp_path, engines, instances, ready="loading", jquery=True):
+    s = mod.PLUGIN_MODULES["search"]
+    rjsmin = __import__("rjsmin")
+    cfg = {"de": True, "idx": "/search-index.json", "max": 50, "snip": 180,
+           "sfx": "", "cls": "post", "lang": "",
+           "tpl": '<div data-wpse-path="%%U%%">%%T%%</div>', "nb": 0,
+           "empty": "<p>nix</p>", "tt": None}
+    js = (s.RENDERER_JS.replace("__RESULTS_ID__", s.RESULTS_ID)
+          .replace("__MARKER__", s.MARKER)
+          .replace("__CFG__", s.js_literal(cfg)))
+    js = rjsmin.jsmin(js, keep_bang_comments=False)   # as it ships
+    script = (LAYOUT_HARNESS
+              .replace("DOCS", json.dumps(_docs(), ensure_ascii=False))
+              .replace("INSTANCES_JSON", json.dumps(instances))
+              .replace("ENGINES_JSON", json.dumps(engines))
+              .replace("READYSTATE", json.dumps(ready))
+              .replace("HAS_JQUERY", "true" if jquery else "false")
+              .replace("RENDERER",
+                       "new Function('document','location',"
+                       "'XMLHttpRequest','window'," + json.dumps(js) + ")"))
+    f = tmp_path / "layout.js"
+    f.write_text(script, encoding="utf-8")
+    res = subprocess.run(["node", str(f)], capture_output=True, text=True,
+                         timeout=60)
+    assert res.returncode == 0, res.stderr
+    return json.loads(res.stdout)
+
+
+def test_the_grid_is_told_to_measure_the_new_cards(mod, tmp_path):
+    got = _layout(mod, tmp_path, {"isotope": 1}, {"isotope": 1})
+    assert got["cards"] > 1
+    calls = got["calls"]
+    assert "isotope:reloadItems" in calls and "isotope:layout" in calls
+    # themes that switch Isotope's own resize off listen to this instead
+    assert "trigger:debouncedresize" in calls
+
+
+def test_the_layout_is_redone_when_the_measurement_can_have_changed(mod,
+                                                                    tmp_path):
+    """One pass, in the same task as the innerHTML, measures cards whose
+    styles and images are not settled -- and puts them all on one spot.
+    There has to be another pass after DOM-ready and after load."""
+    calls = _layout(mod, tmp_path, {"isotope": 1}, {"isotope": 1})["calls"]
+    assert "deferred" in calls                   # a fresh task
+    after_ready = calls[calls.index("|dom-ready|"):]
+    after_load = calls[calls.index("|load|"):]
+    assert "isotope:layout" in after_ready, calls
+    assert "isotope:layout" in after_load, calls
+
+
+def test_masonry_grids_are_supported_too(mod, tmp_path):
+    """WordPress bundles masonry.min.js and plenty of themes use it
+    directly -- an Isotope-only handshake leaves those broken."""
+    calls = _layout(mod, tmp_path, {"masonry": 1}, {"masonry": 1})["calls"]
+    assert "masonry:reloadItems" in calls and "masonry:layout" in calls
+    assert not any(c.startswith("isotope:") for c in calls)
+
+
+def test_the_engine_is_only_used_when_it_owns_this_container(mod, tmp_path):
+    """jQuery has the plugin, but no grid was initialized here: calling it
+    would create one with our defaults instead of the theme's."""
+    calls = _layout(mod, tmp_path, {"isotope": 1, "masonry": 1}, {})["calls"]
+    assert not any(":reloadItems" in c for c in calls)
+    assert "trigger:debouncedresize" in calls    # the theme still gets a nudge
+
+
+def test_layout_survives_without_jquery(mod, tmp_path):
+    got = _layout(mod, tmp_path, {}, {}, ready="complete", jquery=False)
+    assert got["cards"] > 1                      # results still rendered
+    assert "dispatch:resize" in got["calls"]
+
+
 def test_ranking_matches_the_live_wordpress_order(mod, tmp_path):
     got = _run(mod, tmp_path, _docs(), sorted(LIVE_ORDER))
     for query, expected in sorted(LIVE_ORDER.items()):

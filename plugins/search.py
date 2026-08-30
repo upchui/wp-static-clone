@@ -819,18 +819,29 @@ RENDERER_JS = r'''
   function message(text) {
     swap('<p class="wpse-search-status">' + text + "</p>");
   }
+  var GRIDS = ["isotope", "masonry", "packery"];
   function relayout(el) {
-    // The index arrives over the network, so the cards land AFTER the
-    // theme's own DOM-ready grid init has run over an empty container.
-    // Tell the grid to pick them up.
-    if (document.readyState === "loading") { return; }
-    var $ = window.jQuery;
-    try {
-      if ($ && $.fn && $.fn.isotope && $.data(el, "isotope")) {
-        $(el).isotope("reloadItems").isotope("layout");
-        return;
+    // The index arrives over the network, so the cards can land AFTER the
+    // theme's own grid init has run over an empty container. Tell the grid
+    // to measure them -- whichever grid it is. Idempotent by design: this
+    // runs again at every point where the measurement can have changed.
+    var $ = window.jQuery, i, name;
+    if ($ && $.fn && $.data) {
+      for (i = 0; i < GRIDS.length; i++) {
+        name = GRIDS[i];
+        try {
+          if ($.fn[name] && $.data(el, name)) {
+            $(el)[name]("reloadItems")[name]("layout");
+            break;
+          }
+        } catch (e) { /* not this engine, or it refused */ }
       }
-    } catch (e) { /* no isotope grid on this theme */ }
+      try {
+        // themes that initialize their grid with resize:false (dt-the7
+        // does) listen to their own debounced event instead
+        $(window).trigger("debouncedresize");
+      } catch (e1) { /* no jQuery event system */ }
+    }
     try {
       var ev;
       if (typeof window.Event === "function") { ev = new window.Event("resize"); }
@@ -838,8 +849,33 @@ RENDERER_JS = r'''
         ev = document.createEvent("Event");
         ev.initEvent("resize", true, false);
       }
-      window.dispatchEvent(ev);          // debounced-resize grid handlers
+      window.dispatchEvent(ev);          // plain resize handlers
     } catch (e2) { /* ancient browser: nothing more we can do */ }
+  }
+  function settle(el) {
+    // ONE layout pass, in the same task as the innerHTML that created the
+    // cards, measures nodes whose styles, fonts and thumbnails may not be
+    // settled -- everything then reports size 0 and lands on one spot. So
+    // lay out again wherever that can have changed.
+    relayout(el);
+    try { window.setTimeout(function () { relayout(el); }, 0); } catch (e) {}
+    if (!window.addEventListener) { return; }
+    if (document.readyState === "loading") {
+      document.addEventListener("DOMContentLoaded", function () {
+        relayout(el);                    // the theme's grid exists now
+      });
+    }
+    window.addEventListener("load", function () {
+      relayout(el);                      // images and fonts are final
+    });
+    try {
+      var $ = window.jQuery;
+      var il = window.imagesLoaded
+            || ($ && $.fn && $.fn.imagesLoaded && function (n, cb) {
+                 $(n).imagesLoaded(cb);
+               });
+      if (il) { il(el, function () { relayout(el); }); }
+    } catch (e3) { /* imagesLoaded not this theme's */ }
   }
   function run(docs, q) {
     var sentence = fold(String(q).replace(/^\s+|\s+$/g, ""));
@@ -873,7 +909,7 @@ RENDERER_JS = r'''
     var el = box();
     if (!el) { return; }
     el.innerHTML = html;
-    relayout(el);
+    settle(el);
   }
   function echo(q) {                     // page title band + breadcrumb
     var n = document.querySelectorAll("[data-__MARKER__=term]"), i;

@@ -1,5 +1,37 @@
 # Changelog
 
+## 2.15.2 (2026-08-30)
+
+### Fixed
+- **Result cards sometimes rendered on top of each other.** Since 2.15.0
+  the index is fetched, so the cards can land after the theme's grid has
+  initialized over an empty container, and the renderer has to tell the
+  grid about them. Four things kept that from working, all confirmed
+  against the exported theme code:
+
+  - `relayout()` began with `if (document.readyState === "loading")
+    return;`. A small local index usually arrives *while the document is
+    still parsing*, so the function did **nothing at all**, and there was
+    no second attempt.
+  - It only knew Isotope, although WordPress bundles `masonry.min.js` and
+    plenty of themes use `$.fn.masonry` directly.
+  - Its fallback dispatched a `resize` event — provably useless on
+    dt-the7, which initializes Isotope with `resize: false` and listens
+    to its own `debouncedresize`.
+  - The single layout pass ran in the same task as the `innerHTML` that
+    created the cards, measuring nodes whose styles, fonts and thumbnails
+    were not settled. Everything then reports size 0 and lands on one
+    spot — exactly the symptom.
+
+  The layout call is now engine-aware (Isotope, Masonry, Packery, plus
+  `debouncedresize` and a plain `resize` as last resorts) and runs at
+  every point where the measurement can have changed: immediately, in a
+  fresh task, on DOM-ready, on `load`, and via `imagesLoaded` when the
+  theme provides it. Every pass is idempotent, and the grid is only
+  driven when it actually owns the container — calling the plugin on an
+  uninitialized one would create a grid with our defaults instead of the
+  theme's.
+
 ## 2.15.1 (2026-08-30)
 
 ### Fixed
