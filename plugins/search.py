@@ -32,9 +32,9 @@ Three pieces:
    theme keeps its excerpt -- the per-page values WordPress renders
    (author, date, excerpt) and the theme's own
    "nothing found" block. The static page ships the theme's own
-   container and, whenever the index fits, renders into it while the
-   document is still parsing, so the theme's grid/masonry code
-   initializes over real cards exactly as it does live. When the
+   container and renders into it once `/search-index.json` -- always a
+   separate, cacheable file -- has arrived, then tells the theme's
+   grid/masonry code to lay the new cards out. When the
    origin's search cannot be harvested (disabled, dead,
    --no-search-harvest) the page falls back to cloning the exported
    404.html, then the homepage, then minimal built-in markup. It is
@@ -98,11 +98,6 @@ SLOT_NAMES = {"U": "url", "T": "title", "X": "excerpt", "D": "date",
               "I": "date-iso", "A": "author", "P": "post-id", "C": "classes"}
 # template token -> the index key its per-card value is stored under
 VALUE_SLOTS = {"X": "e", "D": "d", "I": "i", "A": "a"}
-# index size up to which the docs are inlined into the results page: doing
-# so makes the renderer run BEFORE DOMContentLoaded, so the theme's own
-# grid/masonry code initializes over real cards (an XHR always loses that
-# race and leaves the cards unpositioned -- see relayout())
-INLINE_MAX_BYTES = 256 * 1024
 # words usable as probe terms: letters only, no digits/underscore
 WORD_RE = re.compile(r"[^\W\d_]{2,32}", re.UNICODE)
 # a link that already starts a search: /?s=term, /page/?q=term
@@ -825,9 +820,9 @@ RENDERER_JS = r'''
     swap('<p class="wpse-search-status">' + text + "</p>");
   }
   function relayout(el) {
-    // Only needed on the XHR path: with an inlined index this code runs
-    // while the document is still parsing, so the theme's own DOM-ready
-    // grid init sees the finished cards and nothing has to be redone.
+    // The index arrives over the network, so the cards land AFTER the
+    // theme's own DOM-ready grid init has run over an empty container.
+    // Tell the grid to pick them up.
     if (document.readyState === "loading") { return; }
     var $ = window.jQuery;
     try {
@@ -896,8 +891,10 @@ RENDERER_JS = r'''
   function render() {
     var q = param("s") || param("q");
     echo(q);
-    // no early return for an empty query: WordPress lists everything
-    if (C.docs) { run(C.docs, q); return; }
+    // no early return for an empty query: WordPress lists everything.
+    // The index is ALWAYS a separate file -- one download the browser
+    // caches across searches and across pages, instead of a copy baked
+    // into every results page.
     var x = new XMLHttpRequest();
     x.open("GET", C.idx, true);
     x.onreadystatechange = function () {
@@ -910,7 +907,7 @@ RENDERER_JS = r'''
     };
     x.send();
   }
-  render();                              // synchronous: before DOM-ready
+  render();                              // fires the request immediately
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", function () {
       prefill(param("s") || param("q"));  // footer forms exist only now
@@ -1010,7 +1007,7 @@ class Search(Plugin):
             "enabled": True, "path": "", "lang": "", "ui_language": "",
             "index_path": INDEX_PATH, "pages_indexed": 0,
             "site_has_search": False, "search_entry": "",
-            "pages_without_text": 0, "index_bytes": 0, "index_inlined": False,
+            "pages_without_text": 0, "index_bytes": 0,
             "page_written": False, "page_source": "", "forms_rewritten": 0,
             "pages_wired": 0, "jsonld_search_actions_fixed": 0,
             "collision": None, "pages": {},   # language -> {path, source}
@@ -1418,18 +1415,16 @@ class Search(Plugin):
             self.stats["harvest"]["reason"] = "no usable probe response"
         # 2) index -- one file for every language, each document tagged
         #    with its own so a results page can filter to its language
-        docs, data = self._build_index(cfg, harvests)
-        self._write_index(data)
+        self._write_index(self._build_index(cfg, harvests))
         # 3) one results page per language, 4) their exclusive assets
         for lang, lcfg in cfg["langs"].items():
             if lcfg["collision"]:
                 continue
             self._path_hint = lcfg["path"]
-            self._write_results_page(lcfg, harvests.get(lang), docs,
-                                     len(data))
+            self._write_results_page(lcfg, harvests.get(lang))
         self._download_assets()
 
-    def _build_index(self, cfg: dict, harvests: dict) -> tuple:
+    def _build_index(self, cfg: dict, harvests: dict) -> bytes:
         docs = []
         empty = 0
         # every language's harvested card slots, plus which language each
@@ -1489,7 +1484,7 @@ class Search(Plugin):
         self.stats["pages_indexed"] = len(docs)
         self.stats["pages_without_text"] = empty
         self.stats["index_bytes"] = len(data)
-        return docs, data
+        return data
 
     def _write_index(self, data: bytes) -> None:
         target = self.exp.local_path_for(
@@ -1505,8 +1500,7 @@ class Search(Plugin):
                 f"{len(data) // 1024} KB -- every visitor downloads it on "
                 f"the first search; consider --search-max-chars")
 
-    def _write_results_page(self, cfg: dict, harvest, docs,
-                            index_bytes: int) -> None:
+    def _write_results_page(self, cfg: dict, harvest) -> None:
         path = cfg["path"]
         target = self.exp.local_path_for(
             f"{self.exp.scheme}://{self.exp.host}{path}", is_page=True)
@@ -1518,7 +1512,7 @@ class Search(Plugin):
         else:                               # 404.html -> homepage -> minimal
             soup, source = self._clone_skeleton(cfg)
             self._build_results_page(soup, cfg)
-        self._inject_renderer(soup, cfg, harvest, docs, index_bytes)
+        self._inject_renderer(soup, cfg, harvest)
         self._assets.extend(self._scan_assets(soup, path))
         data = self.exp.serialize(soup)     # minify & co. apply for free
         if self.exp.write_bytes(target, data) is None:
@@ -1726,13 +1720,10 @@ class Search(Plugin):
             t.string = self._page_title(cfg)
             head.append(t)
 
-    def _inject_renderer(self, soup, cfg, harvest, docs,
-                         index_bytes: int) -> None:
+    def _inject_renderer(self, soup, cfg, harvest) -> None:
         h = harvest or {}
         snips = [len(s["e"]) for s in (h.get("slots") or {}).values()
                  if s.get("e")]
-        inline = index_bytes <= INLINE_MAX_BYTES
-        self.stats["index_inlined"] = inline
         conf = {"de": bool(cfg["de"]), "lang": cfg.get("lang") or "",
                 "idx": INDEX_PATH, "max": 50,
                 "snip": max(180, min(600, max(snips))) if snips else 300,
@@ -1740,11 +1731,6 @@ class Search(Plugin):
                 "nb": len(h.get("blocks") or ()),
                 "cls": h.get("cls") or "", "empty": h.get("empty") or "",
                 "tt": list(h["title"]) if h.get("title") else None}
-        if inline:
-            # the whole point: rendering then happens while the document
-            # is still parsing, so the theme's own footer scripts
-            # initialize their grid over finished cards
-            conf["docs"] = docs
         script = soup.new_tag("script")
         script["data-" + MARKER] = "renderer"
         script.string = (RENDERER_JS

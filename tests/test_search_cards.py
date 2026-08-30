@@ -272,7 +272,17 @@ def test_a_value_we_cannot_name_still_gets_its_own_slot(mod, plug, tmp_path):
 # -- the round trip ----------------------------------------------------------
 
 HARNESS = r"""
+const docs = DOCS;
 let html = "";
+// the index is ALWAYS fetched -- stand in for the network
+function XHR() {}
+XHR.prototype.open = function () {};
+XHR.prototype.send = function () {
+  this.readyState = 4;
+  this.status = 200;
+  this.responseText = JSON.stringify({ v: 3, docs: docs });
+  this.onreadystatechange();
+};
 const box = { get innerHTML() { return html; }, set innerHTML(v) { html = v; },
               set outerHTML(v) { html = v; } };
 const doc = { readyState: "complete", title: "",
@@ -282,7 +292,7 @@ const doc = { readyState: "complete", title: "",
   get body() { return { className: "search search-results" }; } };
 const location = { search: "?s=" + encodeURIComponent(QUERY),
                    pathname: "/search/" };
-RENDERER(doc, location, function () {}, {});
+RENDERER(doc, location, XHR, {});
 console.log(html);
 """
 
@@ -293,12 +303,13 @@ def _render(mod, tmp_path, h, docs, query) -> str:
     rjsmin = __import__("rjsmin")
     cfg = {"de": True, "idx": "/search-index.json", "max": 50, "snip": 400,
            "sfx": "", "lang": "", "cls": h["cls"], "tpl": h["tpl"],
-           "nb": len(h["blocks"]), "empty": "", "tt": None, "docs": docs}
+           "nb": len(h["blocks"]), "empty": "", "tt": None}
     js = (s.RENDERER_JS.replace("__RESULTS_ID__", s.RESULTS_ID)
           .replace("__MARKER__", s.MARKER)
           .replace("__CFG__", s.js_literal(cfg)))
     js = rjsmin.jsmin(js, keep_bang_comments=False)
     script = (HARNESS
+              .replace("DOCS", json.dumps(docs, ensure_ascii=False))
               .replace("QUERY", json.dumps(query))
               .replace("RENDERER",
                        "new Function('document','location',"

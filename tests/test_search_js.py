@@ -105,6 +105,15 @@ LIVE_ORDER = {
 
 HARNESS = r"""
 const docs = DOCS, queries = QUERIES, out = {};
+// the index is ALWAYS fetched -- stand in for the network
+function XHR() {}
+XHR.prototype.open = function () {};
+XHR.prototype.send = function () {
+  this.readyState = 4;
+  this.status = 200;
+  this.responseText = JSON.stringify({ v: 3, docs: docs });
+  this.onreadystatechange();
+};
 for (const q of queries) {
   let html = "", replaced = null;
   const box = { get innerHTML() { return html; }, set innerHTML(v) { html = v; },
@@ -115,7 +124,7 @@ for (const q of queries) {
     addEventListener: () => {},
     get body() { return { className: "search search-results" }; } };
   const location = { search: "?s=" + encodeURIComponent(q), pathname: "/search/" };
-  RENDERER(doc, location, function () {}, {});
+  RENDERER(doc, location, XHR, {});
   out[q] = [...html.matchAll(/data-wpse-path="([^"]*)"/g)].map(m => m[1]);
   if (replaced) { out[q] = []; }
 }
@@ -130,7 +139,7 @@ def _run(mod, tmp_path, docs, queries, lang=""):
            "sfx": " - Huthansl", "cls": "post", "lang": lang,
            # a template whose only job here is to expose the ORDER
            "tpl": '<div data-wpse-path="%%U%%">%%T%%</div>', "nb": 0,
-           "empty": "<p>nix</p>", "tt": None, "docs": docs}
+           "empty": "<p>nix</p>", "tt": None}
     js = (s.RENDERER_JS.replace("__RESULTS_ID__", s.RESULTS_ID)
           .replace("__MARKER__", s.MARKER)
           .replace("__CFG__", s.js_literal(cfg)))

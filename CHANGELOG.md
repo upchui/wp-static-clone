@@ -1,5 +1,23 @@
 # Changelog
 
+## 2.15.0 (2026-08-30)
+
+### Changed
+- **`/search-index.json` is always loaded as its own file.** Until now an
+  index of up to 256 KB was also inlined into every results page. It is
+  now only ever fetched: one request the browser caches across searches
+  and across pages, and a results page that carries no copy of the index
+  (85 KB instead of 105 KB on the reference site). The inlining path,
+  its size threshold and the `index_inlined` report field are gone.
+
+  Trade-off, stated plainly: the cards now arrive *after* the theme's
+  grid code has initialized, so the renderer has to tell the grid to pick
+  them up — Isotope `reloadItems`/`layout`, else a `resize` event. That
+  path already existed for indexes above the old threshold and is
+  unchanged. A results page opened straight from disk (`file://`) can no
+  longer render, since the fetch is blocked there; serving the export
+  over HTTP was already documented as required.
+
 ## 2.14.0 (2026-08-30)
 
 ### Changed
