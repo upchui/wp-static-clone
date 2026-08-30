@@ -116,7 +116,9 @@ Many WordPress origins force HTTPS and answer an HTTP request carrying the real 
 
 ## What cannot work statically
 
-Form submissions (e.g. WPForms), consent/analytics AJAX and WordPress search need a server and do not work in the static mirror. URLs with query strings (`?p=123`, `?s=…`, `?lang=…`) are dropped from the export (listed in the report), and RSS/Atom feeds are intentionally excluded.
+Form submissions (e.g. WPForms) and consent/analytics AJAX need a server and do not work in the static mirror. URLs with query strings (`?p=123`, `?s=…`, `?lang=…`) are dropped from the export (listed in the report), and RSS/Atom feeds are intentionally excluded.
+
+The one dynamic feature that *is* replaced rather than lost is **WordPress' site search** — rebuilt client-side in the theme's own design, see [Site search](#site-search).
 
 ---
 
@@ -128,7 +130,7 @@ The export is SEO-complete out of the box:
 - **One canonical URL per page** — the generated nginx config 301s `/page` → `/page/` (matching the exported structure) and serves the redirects observed on the origin as real 301s (`redirects.inc`), visitor query strings included; old origin sitemap URLs 301 onto the generated `/sitemap.xml`. Redirect stubs carry `noindex`; `/404.html` answers 404 instead of an indexable 200. On Netlify and Apache the trailing-slash canonicalization comes from the platform itself (Pretty URLs / `DirectorySlash`, both on by default).
 - **WordPress cruft removed** — generator meta, wp-json/oEmbed/feed discovery, EditURI/RSD, wlwmanifest, pingback, `?p=` shortlinks, the Cloudflare Insights beacon (which only produces CORS errors off Cloudflare), the Wordfence Live-Traffic beacon (which fires pointless `/?wordfence_lh=…` visitor requests against the static host) and `dns-prefetch`/internal `preconnect` resource hints (which trigger browser Local-Network-Access prompts when they point at internal hosts) are stripped. `canonical`, `hreflang`, `og:*`/`twitter:*` and JSON-LD stay. Disable with `--no-strip-wp-cruft`.
 - **Image optimization** — `loading="lazy"` + `decoding="async"` on images (except each page's first image and plugin-lazyloaded ones) and `width`/`height` attributes read straight from the local PNG/JPEG/GIF/WebP headers (CLS). Disable with `--no-optimize-images`.
-- **Working site search, in the theme's own design and order** — WordPress answers `/?s=term` dynamically, and every static host silently returns the *homepage* for it instead. The exporter builds a search index from the crawled pages (`/search-index.json`) and generates a results page at `/search/`. **Its design is harvested from the live site**: a handful of `GET /?s=…` probes (at most 12) yield the theme's own results skeleton, its result-card markup — turned into a template — the per-page meta WordPress renders (author, date, excerpt) and the theme's own "nothing found" block, so the static results page is indistinguishable from the live one, masonry grids included. **The card is read by comparison, not by class names**: several live cards are walked position by position, whatever two of them render identically is the theme's own markup and stays verbatim (a "Mehr Info" button, an icon, the word before the author), and whatever differs becomes a per-result value — so a theme that keeps its excerpt in a `div`, adds a second link to the post or shows something this tool has no name for is reproduced anyway instead of degrading to a list of links. `report.txt` names the card parts that were recognized and how many live cards the verdict was measured on. **Ranking is WordPress' own** (`WP_Query::parse_search_order`): a title-match bucket first, `post_date` descending inside it — measured against the live site, the static order is identical. The theme's search forms and the JSON-LD `SearchAction` are pointed at the page, and a tiny `<head>` script sends any surviving `?s=` URL there before first paint. Matching is diacritics- and case-insensitive (`strasse` finds `Straße`); no JS library, everything escaped, `noindex,follow` like WordPress. Disable with `--no-search`, keep the probes off with `--no-search-harvest` (built-in markup instead), override the path with `--search-path`, cap the index with `--search-max-chars`. The export must be served over HTTP (the index cannot be fetched from `file://`).
+- **Working site search, in the theme's own design and order** — WordPress answers `/?s=term` dynamically, and every static host silently returns the *homepage* for it instead. The exporter indexes the crawled pages (`/search-index.json`), generates a results page at `/search/` **whose design is harvested from the live site**, and points every search form, the JSON-LD `SearchAction` and any surviving `?s=` URL at it. The result order is WordPress' own. Details below: [Site search](#site-search). Disable with `--no-search`.
 - **Image recompression** — every exported PNG/JPEG/GIF/WebP is re-encoded and replaced only when significantly smaller: PNG/static-GIF losslessly (incl. exact palette reduction, verified pixel-identical), JPEG at quality 85 (progressive, EXIF orientation baked in, ICC profile kept, other metadata dropped), lossless WebP repacked; animated images untouched. Disable with `--no-compress-images`, tune with `--image-quality N`.
 - **Minification** — every exported HTML page, CSS and JS file (incl. `*.min.*`) plus inline styles/scripts (incl. `type="module"`) and `style` attributes is minified, with **all comments removed**: license banners, IE conditional comments and conditional-compilation relics, CSS hack pairs, legacy `<!-- ... //-->` comment-hiding wrappers, even HTML comments inside `<pre>` (they never render). JSON-LD, template/data script blocks and `<textarea>` content stay untouched; comment-lookalike *string literals* in plugin JS (e.g. SR7 WebGL shader placeholders) are functional code and remain. Disable with `--no-minify`.
 - **Slider Revolution 7 works statically** — SR7 lazy-loads later slides from `/wp-json/…` at runtime, which freezes the slider on slide 1 in a static mirror. The exporter fetches each slider's full object once at export time and embeds the missing slide layers into the page (the runtime's own cache check then makes zero requests), downloading the later-slide images along the way. Disable with `--no-sr7-hydrate`.
@@ -148,6 +150,29 @@ For non-Docker nginx, check the module with `nginx -V 2>&1 | grep -o with-http_s
 ### Staging deployments
 
 `--staging` keeps a preview mirror out of every index — `robots.txt` `Disallow: /`, an `X-Robots-Tag: noindex, nofollow` header in the nginx/Apache configs (assets included) and a `noindex` robots meta injected into every page (rewrite mode) — so it never competes with the live site as duplicate content.
+
+### Site search
+
+WordPress answers `/?s=term` from the database. A static host cannot — and worse, nginx `try_files $uri $uri/ =404`, Netlify and Apache `DirectoryIndex` all answer such a URL with the **homepage and HTTP 200**: a wrong success nobody notices. The exporter replaces the mechanism client-side without changing what the visitor does — type into the theme's own search box, press Enter, land on a themed results page.
+
+**The index** is built during the crawl: every page contributes `{path, title, meta description, main-content text}` from the soup the core already parsed, so it costs no extra request. It runs through the same "is this a real page" classifier as the generated sitemap — no error pages, no redirect stubs, no attachment/cache artifacts, nothing that declares another URL canonical — with one deliberate difference: `noindex` and "the origin sitemap did not list it" are instructions to *search engines*, and WordPress' own site search returns such pages, so the exported search does too. The result is written to `/search-index.json`. Up to 256 KB it is also inlined into the results page, so the cards exist *before* the theme's own grid/masonry code initializes — an XHR always loses that race and leaves the cards unpositioned.
+
+**The design is harvested from the live site.** At most 12 `GET /?s=…` probes (split across languages, `--no-search-harvest` turns them off) yield the theme's own results skeleton, its "nothing found" block, its `<title>` pattern and its result card.
+
+**The card is read by comparison, not by class names.** No list of theme class names survives the next theme, so the card is measured instead: several live cards are walked position by position, and
+
+- what two cards render **identically** is the theme's own markup and is kept verbatim — a "Mehr Info" button, an icon, the word before the author;
+- what **differs** is the post's own value and becomes a slot filled per result;
+- a value with no name — a category badge, a per-post tooltip — gets a numbered slot of its own instead of being frozen on the one card it was harvested from or dropped;
+- a part only *some* cards have — a thumbnail — becomes a block the renderer cuts for the results that lack it.
+
+A theme that keeps its excerpt in a `div` instead of a `<p>`, adds a second link to the post, or shows something this tool has no name for is therefore reproduced anyway, instead of degrading to a bare list of links. `report.txt` names the card parts that were recognized and how many live cards the verdict was measured on — the place to look when a static card seems thinner than the live one.
+
+**Ranking is WordPress' own** (`WP_Query::parse_search_order`): a title-match bucket first, `post_date` descending inside it, an empty query listing everything the way `LIKE '%%'` does. Measured against a live site, the static order is identical. Matching is diacritics- and case-insensitive (`strasse` finds `Straße`).
+
+**Wiring**: every search form gets `action="/search/"` — the `name="s"` input stays, so URLs keep the WordPress shape `/search/?s=term` — the Yoast JSON-LD `SearchAction` `urlTemplate` is pointed at the same path, and a script of under 200 bytes at the top of `<head>` redirects any surviving `?s=`/`?q=` URL (bookmarks, external links, forms this tool did not recognize) before first paint. The page is `noindex,follow`, exactly as WordPress noindexes search results. No JS library and no runtime dependency beyond the index itself; everything is escaped.
+
+When the origin's search cannot be harvested (disabled, dead, `--no-search-harvest`), the results page falls back to cloning the exported `404.html`, then the homepage, then built-in markup — the search keeps working either way. `--search-path` renames the page, `--search-max-chars` caps the per-page text in the index. The export must be served over HTTP: the index cannot be fetched from `file://`.
 
 ### Multilingual sites
 
@@ -249,6 +274,7 @@ Every run writes `report.txt` (human-readable) and `report.json` (machine-readab
 - observed redirects,
 - SEO signals (noindex, canonical mismatches, missing titles/meta descriptions),
 - referenced external hosts (linked, not downloaded),
+- what the site search made of the live design — which parts of the result card were recognized and how many live cards that verdict was measured on,
 - the verification result (missing local files, unexpected absolute references).
 
 If the verification section is empty, the mirror is self-contained.
