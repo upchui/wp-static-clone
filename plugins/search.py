@@ -105,6 +105,8 @@ VALUE_SLOTS = {"X": "e", "D": "d", "I": "i", "A": "a"}
 INLINE_MAX_BYTES = 256 * 1024
 # words usable as probe terms: letters only, no digits/underscore
 WORD_RE = re.compile(r"[^\W\d_]{2,32}", re.UNICODE)
+# a link that already starts a search: /?s=term, /page/?q=term
+SEARCH_QUERY_RE = re.compile(r"[?&](?:s|q)=")
 # pagination blocks to drop from the harvested content well (second net;
 # the primary rule is "contains a link that still carries ?s=")
 PAGER_CLASS_RE = re.compile(
@@ -937,7 +939,8 @@ MINIMAL_PAGE = (
 class Search(Plugin):
     name = "search"
     config_fields = {"search": True, "search_path": "",
-                     "search_max_chars": 2000, "search_harvest": True}
+                     "search_max_chars": 2000, "search_harvest": True,
+                     "force_search": False}
 
     # -- CLI -----------------------------------------------------------------
     @classmethod
@@ -960,6 +963,14 @@ class Search(Plugin):
                  "lower it for very large sites, 0 indexes titles and "
                  "meta descriptions only)")
         group.add_argument(
+            "--force-search", action="store_true",
+            help="generate the results page even when no page of the site "
+                 "offers a search (default: a site with no search box and "
+                 "no '?s=' link gets no results page, no index and no "
+                 "probes -- nothing would lead there). Use it when the "
+                 "theme builds its search box in JavaScript, or when you "
+                 "link the path yourself")
+        group.add_argument(
             "--no-search-harvest", dest="search_harvest",
             action="store_false",
             help="do not probe the live '/?s=' endpoint for the results-"
@@ -981,6 +992,7 @@ class Search(Plugin):
         cfg.search_path = args.search_path
         cfg.search_max_chars = args.search_max_chars
         cfg.search_harvest = args.search_harvest
+        cfg.force_search = args.force_search
 
     # -- per-run state -------------------------------------------------------
     def __init__(self, exporter):
@@ -992,9 +1004,12 @@ class Search(Plugin):
         self._probe_budget = PROBE_MAX_REQUESTS
         self._assets: list = []          # absolute asset URLs of our page
         self._path_hint = "/"            # base for resolving harvested refs
+        # does the SITE offer a search at all? Set from the crawl threads
+        self._search_entry = ""          # where the first one was found
         self.stats = {
             "enabled": True, "path": "", "lang": "", "ui_language": "",
             "index_path": INDEX_PATH, "pages_indexed": 0,
+            "site_has_search": False, "search_entry": "",
             "pages_without_text": 0, "index_bytes": 0, "index_inlined": False,
             "page_written": False, "page_source": "", "forms_rewritten": 0,
             "pages_wired": 0, "jsonld_search_actions_fixed": 0,
@@ -1048,6 +1063,7 @@ class Search(Plugin):
             entry = {"desc": desc, "text": text, "lang": lang.strip(),
                      "site": site, "date": page_date(soup),
                      "whole_body": well is None and bool(text)}
+            entry_point = self._search_entry_point(soup, page_url)
         except Exception as exc:            # noqa: BLE001
             # a crash here would abort process_page and lose the whole
             # page from the export -- never worth it for a search index
@@ -1057,6 +1073,34 @@ class Search(Plugin):
             return
         with self.exp.stats_lock:
             self.docs[page_url] = entry
+            if entry_point and not self._search_entry:
+                self._search_entry = entry_point
+
+    def _search_entry_point(self, soup, page_url: str) -> str:
+        """How this page lets a visitor START a search, "" when it does
+        not: the theme's own search box, or a link that already carries a
+        `?s=` query (a "Suche" menu item pointing straight at /?s=).
+
+        A results page nothing leads to is dead weight -- see run_end()."""
+        if self._search_forms(soup):
+            return f"search form on {urlsplit(page_url).path or '/'}"
+        for a in soup.find_all("a", href=True):
+            href = (a.get("href") or "").strip()
+            if not SEARCH_QUERY_RE.search(href):
+                continue
+            # a link to SOMEONE ELSE's search (google.com/search?q=) says
+            # nothing about this site
+            try:
+                target = urljoin(page_url, href)
+            except ValueError:
+                continue
+            if self.exp.is_internal(target):
+                return f"?s= link on {urlsplit(page_url).path or '/'}"
+        return ""
+
+    @property
+    def site_offers_search(self) -> bool:
+        return bool(self.exp.cfg.force_search or self._search_entry)
 
     # -- phase 2: decide (once, after the crawl) -----------------------------
     def settings(self) -> dict:
@@ -1225,11 +1269,11 @@ class Search(Plugin):
         The hook gets no URL, so a page's language comes from its own
         <html lang> -- that is what decides WHICH results page its search
         box, its JSON-LD SearchAction and its ?s= redirect point at."""
-        if not self.enabled:
-            return False
+        if not self.enabled or not self.site_offers_search:
+            return False        # no results page will exist -- wire nothing
         cfg = self._lang_settings_for(soup)
         if cfg["collision"]:
-            return False        # no results page will exist -- wire nothing
+            return False
         path = cfg["path"]
         changed = self._wire_forms(soup, path)
         changed |= self._wire_jsonld(soup, path)
@@ -1329,6 +1373,14 @@ class Search(Plugin):
     def run_end(self) -> None:
         if not self.enabled:
             self.stats["enabled"] = False
+            return
+        self.stats["site_has_search"] = bool(self._search_entry)
+        self.stats["search_entry"] = self._search_entry
+        if not self.site_offers_search:
+            # Not one page of this site offers a way INTO a search: no
+            # search box, no ?s= link. A results page, an index nobody
+            # downloads, the probes it costs and the ?s= redirect on every
+            # page would all be litter (--force-search overrides).
             return
         cfg = self.settings()
         self.stats["path"] = cfg["path"]
@@ -2573,6 +2625,11 @@ class Search(Plugin):
                     + ("(--no-search)" if self.exp.cfg.rewrite
                        else "(--no-rewrite)")
                     + " -- the theme's search box stays broken statically"]
+        if not self.stats["site_has_search"] and not self.exp.cfg.force_search:
+            return ["[note] site search NOT exported -- no page of this site "
+                    "offers one (no search box, no '?s=' link), so nothing "
+                    "would lead to a results page (--force-search builds it "
+                    "anyway)"]
         if not self.stats["page_written"]:
             return ["[warn] site search: results page NOT generated "
                     "-- see report.txt"]

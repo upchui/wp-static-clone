@@ -419,6 +419,100 @@ def _prepare(mod, exporter, plug, with_404=True):
             exporter.serialize(soup))
 
 
+# -- v2.14.0: a site with no way into a search gets no results page ----------
+
+# the same theme, after the search box was taken out of the menu -- the
+# real state of huthansl.at
+NO_SEARCH_PAGE = PAGE.replace(
+    PAGE[PAGE.index('<form role="search"'):PAGE.index("</form>") + 7], "")
+
+
+def _prepare_pages(mod, exporter, plug, pages: dict):
+    """Feed the crawl hook a whole site, one {path: html} at a time."""
+    exporter.sitemap_discovery_ok = True
+    exporter.pages = [_page(mod, f"https://example.at{p}", title=f"T {p}")
+                      for p in pages]
+    for path, html in pages.items():
+        plug.pre_discover_soup(BeautifulSoup(html, "html.parser"),
+                               f"https://example.at{path}")
+
+
+def test_no_search_box_no_results_page(mod, exporter, plug):
+    """huthansl.at after the search was removed from the menu: no form, no
+    ?s= link. A results page, an index and the probes to build them would
+    all be litter -- and the `plug` fixture's fetch raises on any request,
+    so a probe would fail this test loudly."""
+    _prepare_pages(mod, exporter, plug, {"/fassaden/": NO_SEARCH_PAGE})
+    plug.run_end()
+    assert plug.stats["site_has_search"] is False
+    assert plug.stats["search_entry"] == ""
+    assert not (exporter.public_dir / "search").exists()
+    assert not (exporter.public_dir / "search-index.json").exists()
+    assert plug.stats["page_written"] is False
+    assert exporter.warnings == []               # a decision, not a problem
+    assert any("no page of this site offers one" in line
+               for line in plug.summary_lines())
+
+
+def test_without_a_search_nothing_is_wired(mod, exporter, plug):
+    _prepare_pages(mod, exporter, plug, {"/fassaden/": NO_SEARCH_PAGE})
+    plug.run_end()
+    soup = BeautifulSoup(NO_SEARCH_PAGE, "html.parser")
+    before = str(soup)
+    assert plug.postprocess_soup(soup) is False
+    assert str(soup) == before                   # JSON-LD included
+    assert soup.find("script", attrs={"data-wpse-search": "redirect"}) is None
+
+
+def test_a_search_link_counts_as_an_entry_point(mod, exporter, plug):
+    """Some themes hang a "Suche" menu item straight on /?s= with no form
+    of their own -- that is a way in and must count."""
+    linked = NO_SEARCH_PAGE.replace(
+        "<body class=\"page\">",
+        '<body class="page"><a href="https://example.at/?s=">Suche</a>')
+    _prepare_pages(mod, exporter, plug, {"/fassaden/": linked})
+    assert plug.site_offers_search is True
+    plug.run_end()
+    assert plug.stats["site_has_search"] is True
+    assert "?s= link" in plug.stats["search_entry"]
+
+
+def test_a_foreign_search_link_does_not_count(mod, exporter, plug):
+    ext = NO_SEARCH_PAGE.replace(
+        "<body class=\"page\">",
+        '<body class="page">'
+        '<a href="https://www.google.com/search?q=huthansl">Google</a>')
+    _prepare_pages(mod, exporter, plug, {"/fassaden/": ext})
+    plug.run_end()
+    assert plug.stats["site_has_search"] is False
+
+
+def test_a_search_box_only_on_the_404_page_does_not_count(mod, exporter,
+                                                          plug):
+    """The theme's 404 template offers a search box as a consolation. That
+    is not a search entry point of the SITE -- and it is exactly what
+    huthansl.at still has."""
+    _prepare_pages(mod, exporter, plug, {"/fassaden/": NO_SEARCH_PAGE})
+    plug.pre_discover_soup(BeautifulSoup(PAGE, "html.parser"),
+                           "https://example.at/404.html")
+    plug.run_end()
+    assert plug.stats["site_has_search"] is False
+
+
+def test_force_search_builds_it_anyway(mod, exporter, plug, tmp_path):
+    cfg = mod.parse_args(["https://example.at", "-o", str(tmp_path / "o"),
+                          "--force-search", "--no-search-harvest"])
+    assert cfg.force_search is True
+    exp = mod.Exporter(cfg)
+    exp.public_dir.mkdir(parents=True, exist_ok=True)
+    p = exp.plugin("search")
+    _prepare_pages(mod, exp, p, {"/fassaden/": NO_SEARCH_PAGE})
+    p.run_end()
+    assert p.stats["site_has_search"] is False    # still says the truth ...
+    assert (exp.public_dir / "search" / "index.html").is_file()
+    assert (exp.public_dir / "search-index.json").is_file()
+
+
 def test_run_end_writes_index_with_sitemap_filter(mod, exporter, plug):
     _prepare(mod, exporter, plug)
     plug.run_end()

@@ -1,5 +1,33 @@
 # Changelog
 
+## 2.14.0 (2026-08-30)
+
+### Changed
+- **A site with no search gets no results page.** If not one exported page
+  offers a way *into* a search — no search box, no internal `?s=`/`?q=`
+  link — the results page, `/search-index.json`, the live probes it costs
+  and the `?s=` redirect script on every page are all skipped. Nothing
+  would lead there. On the reference site, whose search box was taken out
+  of the menu, that is one page, one 19 KB index, 5 live requests and 42
+  card assets that are no longer produced, plus a redirect script gone
+  from 47 pages.
+
+  The entry point is looked for with the plugin's existing generic form
+  detector (`role="search"` or an `<input name="s|q">`) plus internal
+  links carrying a search query — an external `google.com/search?q=…`
+  does not count. The theme's **404 template does not count either**: its
+  search box is a consolation prize, not an entry point of the site (and
+  it is exactly what the reference site still has).
+
+  The JSON-LD `SearchAction` is left untouched in that case, as it is
+  under `--no-search` — repointing it at a page that will not exist
+  would be worse.
+- **`--force-search`** builds the page regardless, for a theme that
+  creates its search box in JavaScript or when you link the path
+  yourself.
+- The closing note no longer points at an `[seo] site search` line that
+  may not be there.
+
 ## 2.13.0 (2026-08-30)
 
 ### Added

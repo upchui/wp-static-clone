@@ -157,6 +157,8 @@ WordPress answers `/?s=term` from the database. A static host cannot — and wor
 
 **The index** is built during the crawl: every page contributes `{path, title, meta description, main-content text}` from the soup the core already parsed, so it costs no extra request. It runs through the same "is this a real page" classifier as the generated sitemap — no error pages, no redirect stubs, no attachment/cache artifacts, nothing that declares another URL canonical — with one deliberate difference: `noindex` and "the origin sitemap did not list it" are instructions to *search engines*, and WordPress' own site search returns such pages, so the exported search does too. The result is written to `/search-index.json`. Up to 256 KB it is also inlined into the results page, so the cards exist *before* the theme's own grid/masonry code initializes — an XHR always loses that race and leaves the cards unpositioned.
 
+**A site with no search gets none.** If not one exported page offers a way *into* a search — no search box, no `?s=` link — the results page, the index, the probes and the `?s=` redirect are all skipped: nothing would lead there. The theme's 404 template deliberately does not count; its search box is a consolation prize, not an entry point. `--force-search` builds the page anyway (for a theme that creates its search box in JavaScript, or when you link the path yourself).
+
 **The design is harvested from the live site.** At most 12 `GET /?s=…` probes (split across languages, `--no-search-harvest` turns them off) yield the theme's own results skeleton, its "nothing found" block, its `<title>` pattern and its result card.
 
 **The card is read by comparison, not by class names.** No list of theme class names survives the next theme, so the card is measured instead: several live cards are walked position by position, and
@@ -216,6 +218,7 @@ Finally: a site that picks the language from a **cookie or `Accept-Language`** r
 | `--no-optimize-images` | skip `loading=lazy` / `width`/`height` injection |
 | `--no-search` | skip the exported site search (index, results page, form rewiring) |
 | `--no-search-harvest` | do not probe the live `/?s=` endpoint for the results-page design |
+| `--force-search` | build the results page even when the site offers no search box and no `?s=` link |
 | `--search-path PATH` | path of the results page (default `/search/`) |
 | `--search-max-chars N` | per-page text cap in the search index (default 2000) |
 | `--no-compress-images` | skip the in-place image recompression |

@@ -3722,7 +3722,8 @@ esac
                       "resolve locally, no unexpected absolute URLs")
             print("[note] Not functional statically: form submissions and "
                   "consent/analytics AJAX (dynamic endpoints). Site search "
-                  "is exported separately -- see the [seo] line above.")
+                  "has its own line above -- it is exported whenever the "
+                  "site offers one.")
             print("[note] External hosts (font/analytics/CDN domains) stay "
                   "linked and are never downloaded; "
                   "wp-admin/xmlrpc are never requested.")
