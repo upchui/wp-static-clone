@@ -1,5 +1,66 @@
 # Changelog
 
+## 2.12.0 (2026-08-30)
+
+The static search now *reads* a theme's result card instead of guessing
+at it. Which part of a card holds the excerpt, the date or a "read more"
+button is no longer a list of class names in this repo — it is measured
+from the live cards themselves.
+
+### Changed
+- **Card slots are found by comparing live cards, not by matching
+  selectors.** Up to six cards of one response are walked position by
+  position: what two cards render *identically* is the theme's own
+  markup and is kept verbatim (a button label, the word before the
+  author, an icon); what *differs* is the post's own value and becomes a
+  slot filled per result. A position we can also name — the post link,
+  the title, the date, the author, the excerpt — always becomes a slot,
+  even when this handful of cards happens to agree on it. Everything
+  else that varies gets a numbered slot of its own, so a value with no
+  name is still rendered per post instead of being frozen on the card it
+  was harvested from. Index schema `v3` (slots gained `v` and `o`).
+- **The excerpt is found wherever the theme keeps it.** The old rule was
+  "the last `<p>` in the card", which silently produced a bare list of
+  title links on any theme that uses a `div` — `div.entry-summary`
+  (parldigi.ch) and `div.entry-excerpt` (the7's `articles-list`
+  shortcode) both do. It is now the longest per-post text the card
+  shows, confirmed against the page's own indexed text.
+- **`report.txt` says which parts of the live card were recognized**
+  (`Site search: parts of the live result card recognized`, also
+  `seo.search.harvest.slots`), and how many live cards the verdict was
+  measured on. A card layout that had to be guessed from a single live
+  result now warns instead of quietly rendering less.
+
+### Fixed
+- **A second link to the same post kept the first card's URL.** Themes
+  that render a "Mehr Info"/"Read more" button next to the title (the7's
+  `articles-list`) sent *every* result to whichever post the template
+  was harvested from. Every link to the card's own post is now a slot.
+- **The card signature carried per-post classes.** It was taken from one
+  card verbatim, so a theme whose entries carry `post-1575` or an
+  odd/even alternation matched only the single card it came from and
+  every later probe response was silently discarded. The signature is
+  now what all cards of a response share.
+- **A result loop directly inside the content well was not found.**
+  `_find_results` only looked at descendants, so themes without a
+  wrapper around the loop (Twenty Twenty-One and its children) fell
+  through to the built-in markup.
+- **A card containing two links to its own post looked like a
+  two-result loop**, which made the reader mistake the inside of one
+  card for the loop. Children now have to point at *different* posts.
+- **A card wrapped entirely in one `<a>` looked linkless**, because
+  bs4's `find_all` never returns the node itself.
+- **A single-result response is recognized** through WordPress' own
+  `post_class()` marks (`post-<id>`/`hentry`) instead of being given up
+  on as ambiguous.
+- The per-post tooltip on a date link (`title="17:42"`) was deleted from
+  the template; it is kept per post now.
+- More content wells are recognized (`.site-main`, `.page-content`,
+  Elementor, Divi, Beaver Builder). Pages where none is found are
+  counted and warned about: their whole `<body>` goes into the index, so
+  menu and footer text can make them match searches the live site
+  answers with nothing.
+
 ## 2.11.0 (2026-08-30)
 
 Multilingual step 2: the language-shaped output is now actually per
@@ -21,8 +82,8 @@ language. (Step 1 in 2.10.0 stopped the silent failures.)
   WPML filter the live search. The probe budget is split across the
   languages, so a multilingual export costs no more live requests than a
   monolingual one, and each language's probe terms come from its own
-  corpus. Index schema `v3`. A collision on one language's path now
-  stands down only that language.
+  corpus. A collision on one language's path now stands down only that
+  language.
 - **One themed `404.html` per language subtree** (`/404.html`,
   `/fr/404.html`), with matching `error_page` blocks in the generated
   nginx config (including a nested asset block, since a `^~` prefix

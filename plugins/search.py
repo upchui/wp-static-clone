@@ -27,8 +27,10 @@ Three pieces:
    `GET <prefix>?s=<term>` probes (the PROBE_MAX_REQUESTS budget is
    split across the languages, all inside
    run_end) give us the theme's own results skeleton, its result-card
-   markup -- turned into a template with `%%X%%` slots -- the per-page
-   meta WordPress renders (author, date, excerpt) and the theme's own
+   markup -- turned into a template with `%%X%%` slots by COMPARING
+   several live cards, so no class name in this file decides where a
+   theme keeps its excerpt -- the per-page values WordPress renders
+   (author, date, excerpt) and the theme's own
    "nothing found" block. The static page ships the theme's own
    container and, whenever the index fits, renders into it while the
    document is still parsing, so the theme's grid/masonry code
@@ -74,7 +76,7 @@ import wp_static_export as core          # registries are rebound at load
 from wp_static_export import Plugin, canon_path
 
 INDEX_PATH = "/search-index.json"
-SCHEMA_VERSION = 2                       # docs gained a 5th slot element
+SCHEMA_VERSION = 3                       # slots gained "v" (extra) and "o"
 RESULTS_ID = "wpse-search-results"
 MARKER = "wpse-search"                  # data attribute on our injected tags
 
@@ -82,6 +84,19 @@ MARKER = "wpse-search"                  # data attribute on our injected tags
 PROBE_MAX_REQUESTS = 12      # HARD ceiling on live /?s= requests per export
 PROBE_MAX_PAGES = 8          # paginator follow depth per term (loop guard)
 PROBE_MAX_ITEMS = 200        # sanity cap on cards taken from one response
+# How many live cards are held against each other to tell the theme's own
+# markup from the post's values. Two suffice in principle; a few more make
+# the verdict safer (two posts CAN share an author, four rarely do).
+TEMPLATE_SAMPLES = 6
+# a variable text this long is an excerpt even when it is not found in our
+# extracted page text (a hand-written post_excerpt need not be)
+EXCERPT_SURE_CHARS = 60
+EXCERPT_MIN_CHARS = 30
+# what the report calls the card parts we recognized
+SLOT_NAMES = {"U": "url", "T": "title", "X": "excerpt", "D": "date",
+              "I": "date-iso", "A": "author", "P": "post-id", "C": "classes"}
+# template token -> the index key its per-card value is stored under
+VALUE_SLOTS = {"X": "e", "D": "d", "I": "i", "A": "a"}
 # index size up to which the docs are inlined into the results page: doing
 # so makes the renderer run BEFORE DOMContentLoaded, so the theme's own
 # grid/masonry code initializes over real cards (an XHR always loses that
@@ -101,7 +116,9 @@ PAGER_CLASS_RE = re.compile(
 # theme that has both means them to be the same element.
 CONTENT_SELECTORS = ("main", "[role=main]", "#content", "#primary", "article",
                      ".entry-content", ".post-content", ".wpb-content-wrapper",
-                     ".site-content")
+                     ".site-content", ".site-main", ".page-content",
+                     ".elementor-section-wrap", ".et_builder_inner_content",
+                     ".fl-builder-content")
 # tags whose text is never page content
 DROP_TAGS = frozenset((
     "script", "style", "noscript", "template", "svg", "canvas", "nav",
@@ -438,6 +455,142 @@ def _wrap(el, before: str, after: str) -> None:
     el.insert_after(NavigableString(after))
 
 
+# -- result-card anatomy -----------------------------------------------------
+# Which parts of a themed result card carry the post's values is NOT decided
+# by a list of class names here -- no such list survives the next theme. It
+# is measured: several live cards are walked position by position, and what
+# two cards render identically is the theme's own markup (the "read more"
+# label, the word before the author, an icon), while what differs is the
+# post's own value and becomes a slot.
+
+def _attr_value(el, name: str) -> str:
+    """One attribute as a plain string -- bs4 hands the multi-valued ones
+    (class, rel) back as a list."""
+    v = el.get(name)
+    if isinstance(v, (list, tuple)):
+        return " ".join(str(x) for x in v)
+    return "" if v is None else str(v)
+
+
+def card_walk(item, skip_ids=frozenset()):
+    """Every position in a result card that can carry a per-post value.
+
+    The address counts siblings PER TAG NAME, so a card without a thumbnail
+    does not shift the address of everything that follows -- which is what
+    makes two differently furnished cards comparable position by position.
+
+    Yields (key, kind, node, aux):
+        key, "el",   element, None     -- the element itself (presence)
+        key, "attr", element, name     -- one attribute
+        key, "text", element, string   -- one non-blank text node
+    """
+    def walk(el, path):
+        yield path, "el", el, None
+        for name in sorted(el.attrs):
+            yield f"{path}@{name}", "attr", el, name
+        counts: dict = {}
+        idx = 0
+        for child in el.contents:
+            if isinstance(child, SPECIAL_STRINGS):
+                continue                 # comments never reach the export
+            if isinstance(child, NavigableString):
+                if child.strip():
+                    yield f"{path}#{idx}", "text", el, child
+                    idx += 1
+                continue
+            if not isinstance(child, Tag) or id(child) in skip_ids:
+                continue
+            n = counts.get(child.name, 0)
+            counts[child.name] = n + 1
+            yield from walk(child, f"{path}/{child.name}{n}")
+
+    yield from walk(item, item.name)
+
+
+def card_dump(item, skip_ids=frozenset()) -> tuple:
+    """(element paths, {key: value}) -- the small comparable shadow kept for
+    EVERY result card, where holding on to the parsed subtree would not
+    scale to a few hundred pages."""
+    els, vals = set(), {}
+    for key, kind, node, aux in card_walk(item, skip_ids):
+        if kind == "el":
+            els.add(key)
+        elif kind == "attr":
+            vals[key] = _attr_value(node, aux)
+        else:
+            vals[key] = WS_RE.sub(" ", str(aux)).strip()
+    return els, vals
+
+
+def new_harvest() -> dict:
+    """The accumulator one language's harvest fills: the response the
+    static page is cloned from, the cards' comparable shadows, and the
+    template plus slot layout derived from them at the end."""
+    return {"soup": None, "term": "", "sig": None, "container": None,
+            "tpl": "", "cls": "", "slots": {}, "empty": "", "title": None,
+            "dumps": {}, "samples": [], "blocks": [], "vkeys": [],
+            "sem": {}, "measured": False}
+
+
+POST_ID_CLASS_RE = re.compile(r"post-\d+")
+# WordPress' own post_class() puts these on every entry of the loop, in
+# core, whatever the theme wraps around it
+POST_CLASS_RE = re.compile(r"post-\d+|hentry")
+
+
+def _links(node) -> list:
+    """Every <a href> in a subtree, THE NODE ITSELF INCLUDED -- find_all
+    only ever looks at descendants, and a theme that wraps its whole card
+    in one link would otherwise look linkless."""
+    own = [node] if node.name == "a" and node.has_attr("href") else []
+    return own + node.find_all("a", href=True)
+
+
+def _first_path(node, paths: set) -> str:
+    """The indexed page this subtree is about -- the same link _take_cards
+    keys the card on."""
+    for a in _links(node):
+        p = _href_path(a)
+        if p in paths:
+            return p
+    return ""
+
+
+def _post_element(node, root):
+    """The nearest ancestor of a result link carrying post_class()' marks
+    -- the entry element itself, for a response with a single result where
+    there is no repetition to recognize."""
+    while node is not None and node is not root:
+        for cls in (node.get("class") or ()):
+            if POST_CLASS_RE.fullmatch(str(cls).strip().lower()):
+                return node
+        node = node.parent
+    return None
+
+
+def _under(key: str, path: str) -> bool:
+    """True when `key` addresses `path` itself or anything inside it."""
+    return key == path or key.startswith((path + "/", path + "@", path + "#"))
+
+
+def diff_cards(dumps: list) -> tuple:
+    """(variable keys, optional element paths) over two or more cards."""
+    all_els = set().union(*(d[0] for d in dumps))
+    optional = all_els - set.intersection(*(set(d[0]) for d in dumps))
+    # dropping an element takes its subtree along, so only the outermost
+    # element of a missing chain needs a cut block of its own
+    blocks = {p for p in optional
+              if not any(q != p and _under(p, q) for q in optional)}
+    variable = set()
+    for key in set().union(*(set(d[1]) for d in dumps)):
+        seen = {d[1][key] for d in dumps if key in d[1]}
+        if len(seen) > 1 or any(key not in d[1] for d in dumps):
+            variable.add(key)
+    # a value inside an optional element is not variable, it is absent
+    return ({k for k in variable if not any(_under(k, b) for b in blocks)},
+            blocks)
+
+
 DATE_META = ("article:published_time", "article:modified_time")
 DATE_JSONLD = re.compile(r'"datePublished"\s*:\s*"([^"]{4,40})"')
 # the renderer compares dates as strings, so only an ISO-ish value sorts
@@ -513,7 +666,7 @@ RENDERER_JS = r'''
   // WordPress matches with LIKE '%term%' -- plain substrings, no word
   // boundaries, so there is nothing to weigh
   var SPLIT = /[^0-9A-Za-z\u00c0-\u024f\u0370-\u1fff\u3040-\uffff]+/;
-  var TOK = /%%([A-Z])%%/g;
+  var TOK = /%%([A-Z])(\d*)%%/g;
 
   function esc(s) {
     return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;")
@@ -600,19 +753,49 @@ RENDERER_JS = r'''
     return keep ? t.slice(0, i) + t.slice(i + a.length, j) + t.slice(j + b.length)
                 : t.slice(0, i) + t.slice(j + b.length);
   }
+  function slot(k, n, v, xs) {
+    if (k === "V") { return esc(xs[+n] || ""); }
+    return v[k] === undefined ? "" : v[k];
+  }
+  function filled(part, v, xs) {
+    // dropped only when every value it would show is empty: a block of
+    // pure theme markup (the "Mehr Info" button) has nothing to fill in
+    // and always stays
+    var re = /%%([A-Z])(\d*)%%/g, m, any = false;
+    while ((m = re.exec(part))) {
+      if (m[1] === "B" || m[1] === "E") { continue; }
+      any = true;
+      if (slot(m[1], m[2], v, xs)) { return true; }
+    }
+    return !any;
+  }
+  function optional(t, o, v, xs) {       // the theme's own optional parts
+    var i, a, b, p, q, keep;
+    for (i = 0; i < C.nb; i++) {
+      a = "%%B" + i + "%%";
+      b = "%%E" + i + "%%";
+      p = t.indexOf(a);
+      q = t.indexOf(b);
+      if (p < 0 || q < 0 || q < p) { continue; }   // an outer block took it
+      // "o" says what THIS post's own live card had at all; a block whose
+      // every value is empty goes either way
+      keep = (!o || i >= o.length || o.charAt(i) === "1")
+             && filled(t.slice(p + a.length, q), v, xs);
+      t = keep ? t.slice(0, p) + t.slice(p + a.length, q) + t.slice(q + b.length)
+               : t.slice(0, p) + t.slice(q + b.length);
+    }
+    return t;
+  }
   function card(d) {                     // harvested theme card
-    var s = d[4] || {}, t = C.tpl;
+    var s = d[4] || {}, t = C.tpl, xs = s.v || [];
     var body = s.e || clip(d[3] || d[2] || "", C.snip);
-    t = cut(t, "%%QB%%", "%%QE%%", !!s.m);
-    t = cut(t, "%%AB%%", "%%AE%%", !!s.a);
-    t = cut(t, "%%TB%%", "%%TE%%", !!s.d);
-    t = cut(t, "%%MB%%", "%%ME%%", !!(s.a || s.d));
-    t = cut(t, "%%XB%%", "%%XE%%", !!body);
     var v = { U: esc(d[0]), T: esc(s.t || d[1] || d[0]), X: esc(body),
               D: esc(s.d || ""), I: esc(s.i || ""), A: esc(s.a || ""),
               P: esc(s.p || ""), C: esc(s.c || C.cls || ""), M: s.m || "" };
-    return t.replace(TOK, function (mm, k) {
-      return v[k] === undefined ? "" : v[k];
+    t = cut(t, "%%QB%%", "%%QE%%", !!s.m);
+    t = optional(t, s.o, v, xs);
+    return t.replace(TOK, function (mm, k, n) {
+      return slot(k, n, v, xs);
     });
   }
   function plain(d) {                    // no harvest: built-in markup
@@ -818,7 +1001,11 @@ class Search(Plugin):
             "harvest": {"used": False, "reason": "", "probe_requests": 0,
                         "terms": [], "cards": 0, "pages_with_slots": 0,
                         "template": False, "empty_state": False,
-                        "title_pattern": False, "assets_downloaded": 0},
+                        "title_pattern": False, "assets_downloaded": 0,
+                        # which parts of the live card we recognized, and
+                        # how many cards the verdict was measured on
+                        "slots": [], "cards_compared": 0, "extra_slots": 0},
+            "body_text_fallback": 0,
         }
 
     @property
@@ -852,12 +1039,14 @@ class Search(Plugin):
             if dmeta is not None:
                 desc = unicodedata.normalize(
                     "NFC", WS_RE.sub(" ", dmeta.get("content") or "").strip())
-            root = content_root(soup) or soup.body
+            well = content_root(soup)
+            root = well or soup.body
             limit = max(0, int(self.exp.cfg.search_max_chars))
             text = (extract_text(root, limit)
                     if (root is not None and limit) else "")
             entry = {"desc": desc, "text": text, "lang": lang.strip(),
-                     "site": site, "date": page_date(soup)}
+                     "site": site, "date": page_date(soup),
+                     "whole_body": well is None and bool(text)}
         except Exception as exc:            # noqa: BLE001
             # a crash here would abort process_page and lose the whole
             # page from the export -- never worth it for a search index
@@ -1213,6 +1402,11 @@ class Search(Plugin):
                 continue
             if not text:
                 empty += 1                  # counted, still indexed
+            if entry.get("whole_body"):
+                # no recognizable content well: menu and footer text went
+                # into this page's index entry and can produce hits the
+                # live search never returns
+                self.stats["body_text_fallback"] += 1
             doc = [path, title, desc, text]
             slot = dict(slots.get(path) or {})
             if not ISO_DATE_RE.match(slot.get("i") or ""):
@@ -1229,6 +1423,13 @@ class Search(Plugin):
             if slot:
                 doc.append(slot)            # docs without slots stay 4 long
             docs.append(doc)
+        if self.stats["body_text_fallback"]:
+            self.exp.warnings.append(
+                f"static search: {self.stats['body_text_fallback']} of "
+                f"{len(docs)} indexed pages have no recognizable main "
+                f"content element, so their whole <body> was indexed -- "
+                f"navigation and footer text can make them match searches "
+                f"the live site answers with nothing")
         payload = {"v": SCHEMA_VERSION, "lang": cfg["lang"], "docs": docs}
         data = json.dumps(payload, ensure_ascii=False,
                           separators=(",", ":")).encode("utf-8")
@@ -1483,6 +1684,7 @@ class Search(Plugin):
                 "idx": INDEX_PATH, "max": 50,
                 "snip": max(180, min(600, max(snips))) if snips else 300,
                 "sfx": cfg["suffix"], "tpl": h.get("tpl") or "",
+                "nb": len(h.get("blocks") or ()),
                 "cls": h.get("cls") or "", "empty": h.get("empty") or "",
                 "tt": list(h["title"]) if h.get("title") else None}
         if inline:
@@ -1604,9 +1806,8 @@ class Search(Plugin):
         With a known item signature: match it directly. Without one: the
         DEEPEST element at least TWO of whose direct children contain a
         link to an indexed page -- theme-agnostic. A one-result response
-        is genuinely ambiguous (the whole ancestor chain scores 1), which
-        is why the signature is learned from a broad probe and applied to
-        the held-back responses afterwards."""
+        cannot be recognized by repetition at all; there WordPress' own
+        post_class() marks are the fallback."""
         if sig is not None:
             name, classes = sig
             found = [t for t in root.find_all(name)
@@ -1626,34 +1827,55 @@ class Search(Plugin):
                 anc_ids.add(id(node))
                 node = node.parent
         best = None
-        for anc in root.find_all(True):
+        # `root` itself is a candidate: plenty of themes (Twenty Twenty-One
+        # and every child of it) put the loop straight into the content
+        # well, with no wrapper of its own to find
+        for anc in [root, *root.find_all(True)]:
             kids = [c for c in anc.find_all(True, recursive=False)
                     if id(c) in anc_ids]
-            if len(kids) < 2:
+            # children pointing at DIFFERENT posts: a result loop does, the
+            # inside of one card does not. Without that distinction a card
+            # holding a second link to its own post (a "Mehr Info" button
+            # next to the title) looks exactly like a two-result loop.
+            if len(kids) < 2 or len({_first_path(c, paths)
+                                     for c in kids}) < 2:
                 continue
             depth = len(list(anc.parents))
             if best is None or depth > best[0]:
                 best = (depth, anc, kids)
         if best is None:
-            return None, []
+            item = next((el for el in (_post_element(a, root) for a in hits)
+                         if el is not None), None)
+            if item is None or item.parent is None:
+                return None, []
+            return item.parent, [item]
         return best[1], best[2][:PROBE_MAX_ITEMS]
 
     def _take_cards(self, h: dict, items: list, paths: set) -> int:
-        """Per-card slot values; builds the ONE template from the first
-        usable card. Returns how many NEW pages got slots."""
+        """Per-card values plus the comparable shadow of every card. The
+        template itself is built once the harvest is over, when several
+        cards can be held against each other. Returns how many NEW pages
+        got a card."""
         gained = 0
         for item in items:
-            link = next((a for a in item.find_all("a", href=True)
-                         if _href_path(a) in paths), None)
-            if link is None:
+            links = _links(item)
+            idx = next((i for i, a in enumerate(links)
+                        if _href_path(a) in paths), None)
+            if idx is None:
                 continue
+            link = links[idx]
             path = _href_path(link)
             if path in h["slots"]:
                 continue
-            h["slots"][path] = self._slot_values(item, link)
+            media = self._media_block(item, link)
+            skip = {id(media)} if media is not None else frozenset()
+            h["dumps"][path] = card_dump(item, skip)
+            h["slots"][path] = self._slot_values(item, link, media)
+            if len(h["samples"]) < TEMPLATE_SAMPLES:
+                # a DEEP copy (bs4 __copy__): the live card is still needed
+                # by the response it came from
+                h["samples"].append((path, copy.copy(item), idx))
             gained += 1
-            if not h["tpl"]:
-                h["tpl"], h["cls"] = self._build_template(item, link)
         return gained
 
     @staticmethod
@@ -1669,108 +1891,241 @@ class Search(Plugin):
             node = node.parent
         return node
 
-    @staticmethod
-    def _meta_block(item, link, time_el, author_el):
-        node = time_el if time_el is not None else author_el
-        if node is None:
-            return None
-        while (node.parent is not None and node.parent is not item
-               and link not in node.parent.descendants):
-            node = node.parent
-        return node
-
-    def _slot_values(self, item, link) -> dict:
-        """Generic, NOT tied to dt-the7 class names: title = the <a> whose
-        localized href is an indexed path, excerpt = the last <p>, date =
-        <time datetime>, author = .author/.vcard/[rel=author]/.fn."""
+    def _slot_values(self, item, link, media) -> dict:
+        """The card values that cannot come from comparing cards: the post
+        title (WordPress ranks on it), the ids the theme keys its own
+        markup on, and the thumbnail block, whose assets have to be
+        downloaded rather than described."""
         d = {"t": link.get_text(" ", strip=True)}
-        tm = item.find("time")
-        if tm is not None:
-            iso = (tm.get("datetime") or "").strip()
-            if iso:
-                d["i"] = iso
-            txt = tm.get_text(" ", strip=True)
-            if txt:
-                d["d"] = txt
-        au = item.select_one(".author, .vcard, [rel=author], .fn")
-        if au is not None:
-            name = (au.select_one(".fn") or au).get_text(" ", strip=True)
-            if name:
-                d["a"] = name
-        ps = item.find_all("p")
-        if ps:
-            # PLAIN TEXT, escaped at render time: an excerpt is prose, and
-            # shipping origin HTML through innerHTML buys nothing visible
-            txt = ps[-1].get_text(" ", strip=True)
-            if txt:
-                d["e"] = txt
         pid = (item.get("data-post-id") or "").strip()
         if pid:
             d["p"] = pid
         art = item.find("article") or item
-        cls = " ".join(art.get("class") or ())
+        cls = _attr_value(art, "class")
         if cls:
             d["c"] = cls
-        media = self._media_block(item, link)
         if media is not None:
             self._drop_dead_hrefs(media)
             self._assets.extend(self._scan_assets(media, self._path_hint))
             d["m"] = str(media)
         return d
 
-    def _build_template(self, item, link) -> tuple:
-        """The card with every variable value replaced by a %%X%% token
-        and every optional element bracketed by a %%?B%%/%%?E%% pair the
-        renderer can cut out. Built from a DEEP COPY: the live item stays
-        intact for its own slot extraction."""
-        href = link.get("href")
-        tpl = copy.copy(item)
-        link = next(a for a in tpl.find_all("a", href=True)
-                    if a.get("href") == href)
-        for attr, tok in (("data-post-id", "%%P%%"), ("data-date", "%%I%%"),
-                          ("data-name", "%%T%%")):
-            if tpl.has_attr(attr):
-                tpl[attr] = tok
+    @staticmethod
+    def _pick_excerpt(texts, variable, sem, vals, page_text: str) -> str:
+        """The longest variable text the card shows that nothing else has
+        claimed -- an excerpt, wherever the theme keeps it. `<p>` was only
+        ever the most common case, never the rule: div.entry-summary,
+        div.post-entry-content and a bare text node are all in the wild.
+
+        A short candidate has to prove itself by turning up in the page's
+        own text, which a meta line ("3 Kommentare") does not."""
+        folded = fold_word(page_text or "")
+        best, best_len = "", 0
+        for key in texts:
+            if key in sem or (variable is not None and key not in variable):
+                continue
+            v = vals.get(key, "")
+            if len(v) < EXCERPT_MIN_CHARS or len(v) <= best_len:
+                continue
+            if len(v) < EXCERPT_SURE_CHARS:
+                probe = fold_word(v[:24])
+                if not probe or probe not in folded:
+                    continue
+            best, best_len = key, len(v)
+        return best
+
+    def _make_template(self, sample, variable, block_set, vals,
+                       page_text: str) -> dict:
+        """The card with every VARIABLE value replaced by a token and every
+        element not all cards have bracketed by a cut pair the renderer can
+        drop. Everything else -- the "Mehr Info" label, the icons, the
+        wrappers -- survives verbatim, which is the whole point.
+
+        `variable` None means "nothing was measured": with a single live
+        card there is no diff, so only the positions we can name
+        semantically become slots and the rest of the card stays fixed."""
+        _path, tpl, lidx = sample
+        measured = variable is not None
+        tlink = _links(tpl)[lidx]
+        media = self._media_block(tpl, tlink)
+        skip = {id(media)} if media is not None else frozenset()
+        walk = list(card_walk(tpl, skip))
+        el_key, attr_key, texts = {}, {}, {}
+        for key, kind, node, aux in walk:
+            if kind == "el":
+                el_key[id(node)] = key
+            elif kind == "attr":
+                attr_key[(id(node), aux)] = key
+            else:
+                texts[key] = node
+
+        sem: dict = {}
+
+        def mark(key, tok, markup=False):
+            """A position we can NAME is a per-post value by definition and
+            becomes a slot even when this handful of cards happens to agree
+            on it (two posts can share a date; every later one would then
+            inherit it). Only positions that are pure markup -- the entry's
+            css classes, its post id -- have to earn their slot by varying.
+            """
+            if key is None or (markup and measured and key not in variable):
+                return
+            sem.setdefault(key, tok)
+
+        def inside(node, host) -> bool:
+            return node is host or host in node.parents
+
+        def mark_text(host, tok, only: str | None = None):
+            for key, node in texts.items():
+                if inside(node, host) and (only is None
+                                           or vals.get(key, "") == only):
+                    mark(key, tok)
+
+        # 1) every link to THIS post -- the title AND the theme's own "read
+        #    more" button, whose href would otherwise stay frozen on the
+        #    first harvested card and send every result to the same page
+        path = _href_path(tlink)
+        for a in tpl.find_all("a", href=True):
+            if _href_path(a) == path:
+                mark(attr_key.get((id(a), "href")), "U")
+                mark(attr_key.get((id(a), "title")), "T")
+        mark_text(tlink, "T", WS_RE.sub(" ", tlink.get_text(" ", strip=True)))
+        # 2) what the theme hangs on the card element itself
         art = tpl.find("article") or tpl
-        cls = " ".join(art.get("class") or ())
-        if cls:
-            art["class"] = "%%C%%"
-        link["href"] = "%%U%%"
-        if link.has_attr("title"):
-            link["title"] = "%%T%%"
-        _set_text(link, "%%T%%")
+        mark(attr_key.get((id(tpl), "data-name")), "T")
+        mark(attr_key.get((id(tpl), "data-date")), "I")
+        mark(attr_key.get((id(tpl), "data-post-id")), "P", markup=True)
+        mark(attr_key.get((id(art), "class")), "C", markup=True)
+        # 3) the post date and its author
         tm = tpl.find("time")
         if tm is not None:
-            if tm.has_attr("datetime"):
-                tm["datetime"] = "%%I%%"
-            _set_text(tm, "%%D%%")
+            mark(attr_key.get((id(tm), "datetime")), "I")
+            mark_text(tm, "D")
         au = tpl.select_one(".author, .vcard, [rel=author], .fn")
         if au is not None:
-            _set_text(au.select_one(".fn") or au, "%%A%%")
-        ps = tpl.find_all("p")
-        ex = ps[-1] if ps else None
-        if ex is not None:
-            _set_text(ex, "%%X%%")
-        media = self._media_block(tpl, link)
-        mb = self._meta_block(tpl, link, tm, au)
+            mark_text(au.select_one(".fn") or au, "A")
+        # 4) the excerpt: whatever is left and long enough
+        xkey = self._pick_excerpt(texts, variable, sem, vals, page_text)
+        if xkey:
+            sem[xkey] = "X"
+
+        # 5) everything else that varies keeps its own numbered slot, so a
+        #    value we cannot name is still rendered per post instead of
+        #    being frozen on the sample card or silently dropped
+        vkeys = [k for k, kind, _n, _a in walk
+                 if kind != "el" and k not in sem
+                 and measured and k in variable]
+        tokens = dict(sem)
+        for i, key in enumerate(vkeys):
+            tokens[key] = f"V{i}"
+        for key, kind, node, aux in walk:
+            tok = tokens.get(key)
+            if tok is None or kind == "el":
+                continue
+            if kind == "attr":
+                node[aux] = f"%%{tok}%%"
+            else:
+                aux.replace_with(NavigableString(f"%%{tok}%%"))
+
         self._drop_dead_hrefs(tpl)          # /author/admin/ & co.
-        if ex is not None:
-            _wrap(ex, "%%XB%%", "%%XE%%")
-        tanchor = (tm.parent if (tm is not None and tm.parent is not mb
-                                 and tm.parent is not tpl) else tm)
-        if tanchor is not None and tanchor is not mb:
-            if tanchor.has_attr("title"):
-                del tanchor["title"]        # per-post tooltip ("11:05")
-            _wrap(tanchor, "%%TB%%", "%%TE%%")
-        if au is not None and au is not mb:
-            _wrap(au, "%%AB%%", "%%AE%%")
-        if mb is not None:
-            _wrap(mb, "%%MB%%", "%%ME%%")
+        # An element whose whole point is one per-post value has to stay
+        # droppable: a page the live search never returned would otherwise
+        # render "von " with no name behind it, or an empty date box. The
+        # theme's own wrapper around them goes too -- an empty div.entry-meta
+        # is just as wrong, only harder to see.
+        value_ids = set()
+        for el in (au, tm, texts.get(xkey)):
+            while el is not None and el is not tpl:
+                value_ids.add(id(el))
+                if (el.parent is None or el.parent is tpl
+                        or tlink is el.parent or tlink in el.parent.descendants):
+                    break               # the next step up holds the title
+                el = el.parent
+        blocks: list = []
+        for key, kind, node, _aux in walk:
+            if kind != "el" or node is tpl:
+                continue
+            if key not in block_set and id(node) not in value_ids:
+                continue
+            _wrap(node, f"%%B{len(blocks)}%%", f"%%E{len(blocks)}%%")
+            blocks.append(key)
         if media is not None:
             media.replace_with(NavigableString("%%QB%%%%M%%%%QE%%"))
+        cls = vals.get(attr_key.get((id(art), "class")) or "", "")
         generic = " ".join(c for c in cls.split()
                            if not re.fullmatch(r"post-\d+", c))
-        return str(tpl), generic
+        return {"tpl": str(tpl), "cls": generic, "blocks": blocks,
+                "vkeys": vkeys, "sem": sem, "measured": measured}
+
+    @staticmethod
+    def _slot_extras(dump, sem: dict, vkeys: list, blocks: list) -> dict:
+        """One card's values for the slots the template actually has."""
+        els, vals = dump
+        out: dict = {}
+        for key, tok in sem.items():
+            name = VALUE_SLOTS.get(tok)
+            v = vals.get(key, "")
+            if name is None or not v:
+                continue
+            # the renderer sorts on "i" as a STRING, so an ISO value beats
+            # a localized one wherever a theme offers both
+            if not out.get(name) or (tok == "I"
+                                     and not ISO_DATE_RE.match(out[name])
+                                     and ISO_DATE_RE.match(v)):
+                out[name] = v
+        if vkeys:
+            extra = [vals.get(k, "") for k in vkeys]
+            while extra and not extra[-1]:
+                extra.pop()
+            if extra:
+                out["v"] = extra
+        if blocks:
+            seen = "".join("1" if b in els else "0" for b in blocks)
+            if "0" in seen:
+                out["o"] = seen
+        return out
+
+    def _finish_template(self, h: dict, texts: dict) -> None:
+        """Turn the harvested cards into ONE template plus the values each
+        card fills it with. With two or more cards the split between theme
+        markup and post value is MEASURED; with a single card there is
+        nothing to compare and the semantic guesses stand in -- which the
+        report says out loud instead of leaving it to a screenshot."""
+        if not h["samples"]:
+            return
+        dumps = [h["dumps"][p] for p, _t, _i in h["samples"] if p in h["dumps"]]
+        if len(dumps) >= 2:
+            variable, block_set = diff_cards(dumps)
+        else:
+            variable, block_set = None, set()
+        sample = h["samples"][0]
+        built = self._make_template(sample, variable, block_set,
+                                    dumps[0][1] if dumps else {},
+                                    texts.get(sample[0], ""))
+        h.update(built)
+        for path, dump in h["dumps"].items():
+            h["slots"].setdefault(path, {}).update(
+                self._slot_extras(dump, built["sem"], built["vkeys"],
+                                  built["blocks"]))
+        found = set(built["sem"].values())
+        for tok, name in (("C", "c"), ("P", "p")):
+            if tok not in found:                 # dead weight in the index
+                for slot in h["slots"].values():
+                    slot.pop(name, None)
+        st = self.stats["harvest"]
+        st["cards_compared"] = max(st["cards_compared"], len(dumps))
+        st["extra_slots"] = max(st["extra_slots"], len(built["vkeys"]))
+        names = {SLOT_NAMES[t] for t in found if t in SLOT_NAMES}
+        if "%%M%%" in built["tpl"]:
+            names.add("media")
+        st["slots"] = sorted(set(st["slots"]) | names)
+        if not built["measured"]:
+            self.exp.warnings.append(
+                "static search: only ONE live result card to go by -- the "
+                "static cards reproduce its layout from the usual "
+                "title/date/author/excerpt guesses instead of from a "
+                "measured comparison, so a value the theme shows in an "
+                "unusual place may be missing")
 
     def _drop_dead_hrefs(self, node) -> None:
         """Every root-relative href in HARVESTED markup that does not
@@ -1844,8 +2199,7 @@ class Search(Plugin):
         if not paths:
             self._harvest_stop("no indexable pages")
             return None
-        h = {"soup": None, "term": "", "sig": None, "container": None,
-             "tpl": "", "cls": "", "slots": {}, "empty": "", "title": None}
+        h = new_harvest()
         pending = []                     # responses seen before the sig
         used_terms: set = set()
         forms: dict = {}                 # folded token -> original spelling
@@ -1863,8 +2217,17 @@ class Search(Plugin):
             if container is None:
                 return False
             if h["sig"] is None:
-                h["sig"] = (items[0].name,
-                            frozenset(items[0].get("class") or ()))
+                # only what ALL cards of this response share: a signature
+                # carrying post_class()' per-post marks ("post-1575") or a
+                # theme's odd/even alternation would match exactly the one
+                # card it was taken from and lose every later response
+                common = frozenset.intersection(
+                    *(frozenset(t.get("class") or ()) for t in items))
+                common = frozenset(c for c in common
+                                   if not POST_ID_CLASS_RE.fullmatch(c))
+                # an empty signature would match every element of that tag
+                # name, so keep looking structurally instead
+                h["sig"] = (items[0].name, common) if common else None
             gained = self._take_cards(h, items, set(paths))
             if h["soup"] is None:
                 h["soup"], h["term"], h["container"] = soup, term, container
@@ -1931,6 +2294,8 @@ class Search(Plugin):
         soup = self._probe(self._search_url(token, prefix))
         if soup is not None and self._echoes(soup, token):
             h["empty"] = self._take_empty(soup, cfg, token)
+        # 4) NOW the cards can be compared with each other
+        self._finish_template(h, texts)
         # accumulate: on a multilingual site this runs once per language
         st = self.stats["harvest"]
         st["used"] = True
@@ -2204,6 +2569,20 @@ class Search(Plugin):
                 f"lang {self.stats['ui_language']})")
         else:
             txt_head.append("Site search:     not exported")
+        h = self.stats["harvest"]
+        if h["used"]:
+            # what the live cards turned out to be made of: the one place a
+            # card part that was NOT recognized becomes visible without
+            # opening the exported page and comparing it by eye
+            how = (f"measured across {h['cards_compared']} live cards"
+                   if h["cards_compared"] > 1
+                   else "GUESSED -- only one live card to compare")
+            extra = (f" (+{h['extra_slots']} further per-post values)"
+                     if h["extra_slots"] else "")
+            txt_sections.append(core.report_section(
+                "Site search: parts of the live result card recognized",
+                [f"{', '.join(h['slots']) or 'title only'}{extra} "
+                 f"-- {how}"]))
 
 
 PLUGIN = Search

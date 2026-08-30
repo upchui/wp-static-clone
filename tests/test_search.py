@@ -392,7 +392,7 @@ def test_run_end_writes_index_with_sitemap_filter(mod, exporter, plug):
     plug.run_end()
     data = json.loads(
         (exporter.public_dir / "search-index.json").read_text("utf-8"))
-    assert data["v"] == 2 and data["lang"] == "de"
+    assert data["v"] == 3 and data["lang"] == "de"
     paths = [d[0] for d in data["docs"]]
     # noindex and link-only pages ARE searchable: both are instructions to
     # search ENGINES, and WordPress' own site search returns such pages
@@ -655,7 +655,7 @@ def test_harvested_page_keeps_the_theme_design(mod, exporter, plug):
     assert re.search(r"[?&]s=[^\"'&<\s]", html) is None
     # the card template rides in the renderer config, with placeholders
     script = soup.find("script", attrs={"data-wpse-search": "renderer"}).string
-    for token in ("%%U%%", "%%T%%", "%%X%%", "%%D%%", "%%A%%", "%%MB%%"):
+    for token in ("%%U%%", "%%T%%", "%%X%%", "%%D%%", "%%A%%", "%%B0%%"):
         assert token in script, token
     assert "wf-cell" in script and "entry-title" in script
     assert '"empty":"' in script.replace(" ", "")

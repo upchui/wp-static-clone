@@ -129,7 +129,7 @@ def _run(mod, tmp_path, docs, queries, lang=""):
     cfg = {"de": True, "idx": "/search-index.json", "max": 50, "snip": 180,
            "sfx": " - Huthansl", "cls": "post", "lang": lang,
            # a template whose only job here is to expose the ORDER
-           "tpl": '<div data-wpse-path="%%U%%">%%T%%</div>',
+           "tpl": '<div data-wpse-path="%%U%%">%%T%%</div>', "nb": 0,
            "empty": "<p>nix</p>", "tt": None, "docs": docs}
     js = (s.RENDERER_JS.replace("__RESULTS_ID__", s.RESULTS_ID)
           .replace("__MARKER__", s.MARKER)

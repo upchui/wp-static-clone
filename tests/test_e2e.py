@@ -325,7 +325,7 @@ def test_static_search_exported(export):
     assert "noindex,follow" in html
     # index: real pages with their titles and text, filtered like the sitemap
     index = _json.loads((pub / "search-index.json").read_text("utf-8"))
-    assert index["v"] == 2 and index["lang"] == "de"
+    assert index["v"] == 3 and index["lang"] == "de"
     paths = [d[0] for d in index["docs"]]
     assert "/" in paths and "/ueber-uns/" in paths
     # noindex keeps a page out of the SITEMAP but not out of the site
