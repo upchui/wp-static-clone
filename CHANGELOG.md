@@ -1,5 +1,33 @@
 # Changelog
 
+## 2.15.3 (2026-08-30)
+
+### Fixed
+- **Isotope needs `arrange`, not `layout`** — 2.15.2 hardened *when* the
+  grid is told about the cards but used the wrong command, so the cards
+  still stacked. Read out of the Isotope/Outlayer bundled in the theme:
+
+  ```js
+  reloadItems      = function(){ this.items = this._itemize(children) }
+  Isotope._layout  = function(){ … layoutItems(this.filteredItems) … }
+  Isotope.arrange  = function(t){ … this.filteredItems = _filter(this.items) … }
+  Outlayer.layout  = function(){ … layoutItems(this.items) … }
+  ```
+
+  `reloadItems()` refreshes `items` only. Isotope's `layout()` lays out
+  `filteredItems`, still empty from the theme's init over an empty
+  container — so every card got Isotope's `position: absolute` from item
+  creation and no position at all, with the container left at
+  `height: 0px`. `arrange()` is the one call that re-runs the filter, and
+  it keeps the theme's own filter because passing no options leaves them
+  untouched. Masonry and Packery inherit Outlayer's `layout()`, which
+  uses `items`, so they keep `reloadItems` + `layout`.
+- The renderer tests asserted **method names**, which is why they passed
+  on the wrong call. They now drive fake grids that reproduce the real
+  `items`/`filteredItems` semantics and assert that every rendered card
+  ends up positioned — including after DOM-ready and after `load`, each
+  starting from "nothing is positioned any more".
+
 ## 2.15.2 (2026-08-30)
 
 ### Fixed

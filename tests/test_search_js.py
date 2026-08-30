@@ -194,19 +194,52 @@ const doc = { readyState: READYSTATE, title: "",
   addEventListener: on(handlers.doc),
   get body() { return { className: "search search-results" }; } };
 
-const INSTANCES = INSTANCES_JSON;
-function jq() {
+// The grids reproduce the REAL semantics of the code the themes ship, taken
+// verbatim from the Isotope/Outlayer bundled in dt-the7's main.min.js:
+//
+//   reloadItems = function(){ this.items = this._itemize(children) }
+//   Isotope._layout = function(){ ... layoutItems(this.filteredItems) ... }
+//   Isotope.arrange = function(t){ ... this.filteredItems = _filter(items) ... }
+//   Outlayer.layout = function(){ ... layoutItems(this.items) ... }
+//
+// so `reloadItems` + `layout` positions NOTHING on Isotope: it lays out the
+// stale filteredItems, empty since the theme initialized over an empty
+// container. Asserting on method names cannot see that -- assert on what
+// ends up positioned.
+function grid(engine) {
+  return {
+    engine: engine, items: 0, filteredItems: 0, positioned: 0,
+    reloadItems: function () { this.items = cardCount(); },
+    layout: function () {
+      this.positioned = engine === "isotope" ? this.filteredItems : this.items;
+    },
+    arrange: function () {
+      this.filteredItems = this.items;
+      this.positioned = this.filteredItems;
+    }
+  };
+}
+const INSTANCES = {};
+for (const name of Object.keys(INSTANCES_JSON)) { INSTANCES[name] = grid(name); }
+const cardCount = () => (html.match(/data-wpse-path/g) || []).length;
+
+function jq(target) {
   const api = {
     trigger: (ev) => { calls.push("trigger:" + ev); return api; },
     imagesLoaded: (cb) => { calls.push("imagesLoaded"); cb(); return api; }
   };
   for (const n of ["isotope", "masonry", "packery"]) {
-    api[n] = (cmd) => { calls.push(n + ":" + cmd); return api; };
+    api[n] = (cmd) => {
+      calls.push(n + ":" + cmd);
+      const inst = INSTANCES[n];
+      if (inst && typeof inst[cmd] === "function") { inst[cmd](); }
+      return api;
+    };
   }
   return api;
 }
 jq.fn = ENGINES_JSON;
-jq.data = (el, name) => (INSTANCES[name] ? {} : undefined);
+jq.data = (el, name) => INSTANCES[name];
 
 const win = {
   jQuery: HAS_JQUERY ? jq : undefined,
@@ -215,16 +248,35 @@ const win = {
   Event: function (name) { this.type = name; },
   dispatchEvent: (ev) => { calls.push("dispatch:" + ev.type); }
 };
+// what each grid has positioned right now, and how to make it stale again
+const snapshot = () => {
+  const out = {};
+  for (const n of Object.keys(INSTANCES)) { out[n] = INSTANCES[n].positioned; }
+  return out;
+};
+const stale = () => {
+  for (const n of Object.keys(INSTANCES)) {
+    INSTANCES[n].positioned = 0;
+    INSTANCES[n].filteredItems = 0;
+  }
+};
+
 const location = { search: "?s=maler", pathname: "/search/" };
 RENDERER(doc, location, XHR, win);
+const laid = snapshot();
 calls.push("|dom-ready|");
+stale();                       // as if the first pass had measured nothing
 doc.readyState = "interactive";
 fire(handlers.doc, "DOMContentLoaded");
+const laidAfterReady = snapshot();
 calls.push("|load|");
+stale();                       // images changed the heights again
 doc.readyState = "complete";
 fire(handlers.win, "load");
-console.log(JSON.stringify(
-  { calls: calls, cards: (html.match(/data-wpse-path/g) || []).length }));
+const laidAfterLoad = snapshot();
+console.log(JSON.stringify({ calls: calls, cards: cardCount(), laid: laid,
+                             afterReady: laidAfterReady,
+                             afterLoad: laidAfterLoad }));
 """
 
 
@@ -256,13 +308,24 @@ def _layout(mod, tmp_path, engines, instances, ready="loading", jquery=True):
     return json.loads(res.stdout)
 
 
-def test_the_grid_is_told_to_measure_the_new_cards(mod, tmp_path):
+def test_every_card_ends_up_positioned_by_isotope(mod, tmp_path):
+    """The one that matters: not which method was called, but whether the
+    cards were laid out. `reloadItems` + `layout` refreshes Isotope's
+    `items` and then lays out its `filteredItems` -- still empty from the
+    theme's init over an empty container. Result: every card carries
+    `position: absolute` and no position at all, container height 0."""
     got = _layout(mod, tmp_path, {"isotope": 1}, {"isotope": 1})
     assert got["cards"] > 1
-    calls = got["calls"]
-    assert "isotope:reloadItems" in calls and "isotope:layout" in calls
+    assert got["laid"]["isotope"] == got["cards"], got["calls"]
     # themes that switch Isotope's own resize off listen to this instead
-    assert "trigger:debouncedresize" in calls
+    assert "trigger:debouncedresize" in got["calls"]
+
+
+def test_every_card_ends_up_positioned_by_masonry(mod, tmp_path):
+    """Outlayer's layout() uses `items`, so masonry needs the OTHER call --
+    the distinction between the engines is not cosmetic."""
+    got = _layout(mod, tmp_path, {"masonry": 1}, {"masonry": 1})
+    assert got["laid"]["masonry"] == got["cards"], got["calls"]
 
 
 def test_the_layout_is_redone_when_the_measurement_can_have_changed(mod,
@@ -270,12 +333,12 @@ def test_the_layout_is_redone_when_the_measurement_can_have_changed(mod,
     """One pass, in the same task as the innerHTML, measures cards whose
     styles and images are not settled -- and puts them all on one spot.
     There has to be another pass after DOM-ready and after load."""
-    calls = _layout(mod, tmp_path, {"isotope": 1}, {"isotope": 1})["calls"]
-    assert "deferred" in calls                   # a fresh task
-    after_ready = calls[calls.index("|dom-ready|"):]
-    after_load = calls[calls.index("|load|"):]
-    assert "isotope:layout" in after_ready, calls
-    assert "isotope:layout" in after_load, calls
+    got = _layout(mod, tmp_path, {"isotope": 1}, {"isotope": 1})
+    assert "deferred" in got["calls"]            # a fresh task
+    # each of these starts from "nothing is positioned any more" -- so the
+    # count can only come back up if that pass really laid the cards out
+    assert got["afterReady"]["isotope"] == got["cards"], got["calls"]
+    assert got["afterLoad"]["isotope"] == got["cards"], got["calls"]
 
 
 def test_masonry_grids_are_supported_too(mod, tmp_path):

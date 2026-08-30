@@ -819,7 +819,16 @@ RENDERER_JS = r'''
   function message(text) {
     swap('<p class="wpse-search-status">' + text + "</p>");
   }
-  var GRIDS = ["isotope", "masonry", "packery"];
+  // [plugin, command to run after reloadItems]. NOT the same command for
+  // all of them: Isotope's layout() lays out its `filteredItems`, and
+  // reloadItems() only refreshes `items` -- so on a grid the theme
+  // initialized over an EMPTY container, layout() positions nothing and
+  // leaves every card with a bare "position: absolute". arrange() is what
+  // re-runs the filter (and keeps the theme's own filter, since passing no
+  // options leaves them untouched). Masonry/Packery inherit Outlayer's
+  // layout(), which uses `items` -- there reloadItems + layout is right.
+  var GRIDS = [["isotope", "arrange"], ["masonry", "layout"],
+               ["packery", "layout"]];
   function relayout(el) {
     // The index arrives over the network, so the cards can land AFTER the
     // theme's own grid init has run over an empty container. Tell the grid
@@ -828,10 +837,10 @@ RENDERER_JS = r'''
     var $ = window.jQuery, i, name;
     if ($ && $.fn && $.data) {
       for (i = 0; i < GRIDS.length; i++) {
-        name = GRIDS[i];
+        name = GRIDS[i][0];
         try {
           if ($.fn[name] && $.data(el, name)) {
-            $(el)[name]("reloadItems")[name]("layout");
+            $(el)[name]("reloadItems")[name](GRIDS[i][1]);
             break;
           }
         } catch (e) { /* not this engine, or it refused */ }
