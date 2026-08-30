@@ -487,16 +487,29 @@ def test_a_foreign_search_link_does_not_count(mod, exporter, plug):
     assert plug.stats["site_has_search"] is False
 
 
-def test_a_search_box_only_on_the_404_page_does_not_count(mod, exporter,
-                                                          plug):
-    """The theme's 404 template offers a search box as a consolation. That
-    is not a search entry point of the SITE -- and it is exactly what
-    huthansl.at still has."""
-    _prepare_pages(mod, exporter, plug, {"/fassaden/": NO_SEARCH_PAGE})
-    plug.pre_discover_soup(BeautifulSoup(PAGE, "html.parser"),
-                           "https://example.at/404.html")
-    plug.run_end()
-    assert plug.stats["site_has_search"] is False
+def test_a_search_box_on_the_404_page_counts(mod, exporter, plug, tmp_path):
+    """Many themes put a search box in their 404 template, and it is a
+    real one a visitor can use -- exactly what huthansl.at has left. Left
+    unwired it submits to '/?s=term', which every static host answers with
+    the homepage: the silent wrong success this whole plugin exists to
+    prevent."""
+    cfg = mod.parse_args(["https://example.at", "-o", str(tmp_path / "o"),
+                          "--no-search-harvest"])
+    exp = mod.Exporter(cfg)
+    exp.public_dir.mkdir(parents=True, exist_ok=True)
+    p = exp.plugin("search")
+    _prepare_pages(mod, exp, p, {"/fassaden/": NO_SEARCH_PAGE})
+    p.pre_discover_soup(BeautifulSoup(PAGE, "html.parser"),
+                        "https://example.at/404.html")
+    p.run_end()
+    assert p.stats["site_has_search"] is True
+    assert p.stats["search_entry"] == "search form on /404.html"
+    assert (exp.public_dir / "search" / "index.html").is_file()
+    data = json.loads(
+        (exp.public_dir / "search-index.json").read_text("utf-8"))
+    paths = [d[0] for d in data["docs"]]
+    assert paths == ["/fassaden/"]              # the 404 page is not content
+    assert "/404.html" not in paths
 
 
 def test_force_search_builds_it_anyway(mod, exporter, plug, tmp_path):

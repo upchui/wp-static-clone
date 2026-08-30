@@ -1,5 +1,23 @@
 # Changelog
 
+## 2.15.1 (2026-08-30)
+
+### Fixed
+- **A search box on the 404 page counts as a search entry point** (hole in
+  the rule added in 2.14.0). Ruling it out was wrong: many themes put a
+  search box in their 404 template, and it is a real one a visitor can
+  use. On the reference site it is the *only* one left, and 2.14.0 shipped
+  it as `<form action="/">` — submitting it lands on `/?s=term`, which
+  every static host answers with the homepage. That silent wrong success
+  is precisely what this plugin exists to prevent.
+
+  `pre_discover_soup()` skipped `/404.html` outright; that skip had two
+  jobs and only one was right. The 404 page is still kept out of the
+  search index (it is not content), but it is now asked whether it offers
+  a search. `capture_404()` runs it through that hook as the first
+  post-crawl step, so the answer is known before anything is wired.
+  `seo.search.search_entry` names where the entry point was found.
+
 ## 2.15.0 (2026-08-30)
 
 ### Changed
@@ -33,9 +51,7 @@
   The entry point is looked for with the plugin's existing generic form
   detector (`role="search"` or an `<input name="s|q">`) plus internal
   links carrying a search query — an external `google.com/search?q=…`
-  does not count. The theme's **404 template does not count either**: its
-  search box is a consolation prize, not an entry point of the site (and
-  it is exactly what the reference site still has).
+  does not count. The theme's **404 template does** — see 2.15.1.
 
   The JSON-LD `SearchAction` is left untouched in that case, as it is
   under `--no-search` — repointing it at a page that will not exist

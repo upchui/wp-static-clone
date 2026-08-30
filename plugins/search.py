@@ -1035,8 +1035,23 @@ class Search(Plugin):
     # -- phase 1: collect ----------------------------------------------------
     def pre_discover_soup(self, soup, page_url: str) -> None:
         """Harvest the index payload from the soup the core just parsed --
-        read-only: the crawl still has to discover URLs in this tree."""
-        if not self.enabled or page_url.endswith("/404.html"):
+        read-only: the crawl still has to discover URLs in this tree.
+
+        The 404 page is NOT indexed (it is not content), but it is still
+        asked whether it offers a search: many themes put a search box in
+        their 404 template, and that box is a real one a visitor can use.
+        capture_404() runs it through here as the first post-crawl step,
+        well before anything is wired or written."""
+        if not self.enabled:
+            return
+        if page_url.endswith("/404.html"):
+            try:
+                found = self._search_entry_point(soup, page_url)
+            except Exception:               # noqa: BLE001 -- never abort
+                return                      # the 404 capture over this
+            with self.exp.stats_lock:
+                if found and not self._search_entry:
+                    self._search_entry = found
             return
         try:
             html = soup.find("html")
