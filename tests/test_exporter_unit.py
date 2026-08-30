@@ -1299,3 +1299,81 @@ def test_page_lang_recorded_from_html_tag(mod, exporter):
         b'<!doctype html><html lang="en-US"><head><title>T</title></head>'
         b"<body>x</body></html>", rec)
     assert rec.lang == "en-US"
+
+
+# -- v2.11.0: language layout, hreflang, per-language 404 -------------------
+
+def test_language_prefixes_layouts(mod, tmp_path):
+    def prefixes(pages):
+        e = mod.Exporter(mod.Config(base_url="https://x.at",
+                                    out_dir=tmp_path / "o"))
+        e.pages = [_page(mod, f"https://x.at{p}", lang=lang)
+                   for p, lang in pages]
+        return e, e.language_prefixes()
+    # default language at the root, the other one prefixed
+    _e, got = prefixes([("/", "de-DE"), ("/kontakt/", "de"),
+                        ("/en/", "en-US"), ("/en/contact/", "en")])
+    assert got == {"de": "/", "en": "/en/"}
+    # every language prefixed
+    _e, got = prefixes([("/de/", "de"), ("/de/x/", "de"),
+                        ("/fr/", "fr"), ("/fr/y/", "fr")])
+    assert got == {"de": "/de/", "fr": "/fr/"}
+    # Polylang leaving the segment unrewritten: two segments deep
+    _e, got = prefixes([("/", "en"), ("/about/", "en"),
+                        ("/language/de/", "de"), ("/language/de/x/", "de")])
+    assert got == {"en": "/", "de": "/language/de/"}
+    # a prefix that is not a language code still works when unambiguous
+    _e, got = prefixes([("/deutsch/", "de"), ("/deutsch/x/", "de"),
+                        ("/english/", "en"), ("/english/y/", "en")])
+    assert got == {"de": "/deutsch/", "en": "/english/"}
+    # one language: nothing to derive
+    _e, got = prefixes([("/", "de"), ("/x/", "de")])
+    assert got == {}
+    # two languages sharing the root: refuse and say so
+    e, got = prefixes([("/", "de"), ("/x/", "de"), ("/y/", "en"),
+                       ("/z/", "en")])
+    assert got == {}
+    assert any("no clean one-language-per-path layout" in w
+               for w in e.warnings)
+
+
+def test_alternates_recorded_and_emitted(mod, exporter):
+    exporter.public_dir.mkdir(parents=True, exist_ok=True)
+    exporter.sitemap_discovery_ok = True
+    page = (b'<html lang="de"><head><title>T</title>'
+            b'<link rel="alternate" hreflang="de" href="https://example.at/">'
+            b'<link rel="alternate" hreflang="en"'
+            b' href="https://example.at/en/">'
+            b'<link rel="alternate" hreflang="fr"'
+            b' href="https://example.at/geheim/">'
+            b'<link rel="alternate" type="application/rss+xml"'
+            b' href="https://example.at/feed/">'
+            b'<link rel="alternate" hreflang="xx"'
+            b' href="https://other.tld/x/"></head><body>x</body></html>')
+    rec = mod.PageRecord(url="https://example.at/", source="sitemap",
+                         content_type="text/html", status=200)
+    exporter.parse_and_save_html("https://example.at/", page, rec)
+    # only internal hreflang links, feeds and foreign hosts ignored
+    assert rec.alternates == {"de": "https://example.at/",
+                              "en": "https://example.at/en/",
+                              "fr": "https://example.at/geheim/"}
+    exporter.pages = [rec,
+                      _page(mod, "https://example.at/en/", lang="en"),
+                      _page(mod, "https://example.at/geheim/", noindex=True)]
+    exporter.write_generated_sitemap()
+    xml = (exporter.public_dir / "sitemap.xml").read_text()
+    assert 'xmlns:xhtml="http://www.w3.org/1999/xhtml"' in xml
+    assert ('<xhtml:link rel="alternate" hreflang="en" '
+            'href="https://example.at/en/"/>') in xml
+    # the noindexed page is not in the sitemap, so it is no alternate either
+    assert "/geheim/" not in xml
+    assert exporter.generated_sitemap["hreflang_annotated_urls"] == 1
+
+
+def test_sitemap_has_no_xhtml_namespace_without_alternates(mod, exporter):
+    exporter.public_dir.mkdir(parents=True, exist_ok=True)
+    exporter.pages = [_page(mod, "https://example.at/")]
+    exporter.write_generated_sitemap()
+    xml = (exporter.public_dir / "sitemap.xml").read_text()
+    assert "xhtml" not in xml
+    assert exporter.generated_sitemap["hreflang_annotated_urls"] == 0

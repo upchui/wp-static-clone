@@ -220,6 +220,11 @@ MEDIA_EXTENSIONS = {
 # The core fragments are the tool's identity (never talk to WP admin/API
 # endpoints); plugins contribute vendor fragments via
 # page_skip_pattern_fragments and load_plugins() recompiles the regex.
+# a URL segment that reads like a language code ("de", "en", "pt-br"):
+# what a multilingual WordPress puts in front of a translated page
+LANG_SEGMENT_RE = re.compile(r"[a-z]{2,3}(?:-[a-z0-9]{2,8})?",
+                             re.IGNORECASE)
+
 PAGE_SKIP_FRAGMENTS = (
     r"/wp-admin(/|$)", r"/wp-login\.php", r"/wp-json(/|$)", r"/xmlrpc\.php",
     r"/wp-signup\.php", r"/wp-activate\.php", r"/wp-trackback\.php",
@@ -924,6 +929,7 @@ class Exporter:
         # onto it (one output tree, first write wins -- see run summary)
         self.negotiated_pages: list[str] = []
         self.folded_hosts: dict[str, int] = {}
+        self.error_pages: list[str] = []      # captured 404s, one per language
         # spellings of the SAME endpoint we crawl through -- folding these
         # onto the main host is the whole point of --host, not a hazard
         self._alias_norms = {self.base_norm, self.connect_norm,
@@ -1045,6 +1051,60 @@ class Exporter:
             if primary:
                 counts[primary] = counts.get(primary, 0) + 1
         return dict(sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])))
+
+    def language_prefixes(self) -> dict:
+        """Primary language subtag -> its URL path prefix, for a site that
+        puts one language per path ('/de/', '/en/' -- the Polylang and
+        WPML default). The default language, whose pages sit at the root,
+        maps to '/'.
+
+        Empty when the layout cannot be read that way: no <html lang>, a
+        single language, two languages sharing a prefix, or more than one
+        language at the root. Callers then treat the site as
+        single-language, which is what the exporter did before."""
+        paths: dict = {}
+        for p in self.pages:
+            if p.error or p.is_stub or not p.lang:
+                continue
+            primary = p.lang.replace("_", "-").split("-")[0].lower()
+            if primary:
+                path = urlsplit(p.save_url or p.url).path or "/"
+                paths.setdefault(primary, []).append(path)
+        if len(paths) < 2:
+            return {}
+
+        def common_prefix(urls: list, depth: int) -> str:
+            """The first `depth` path segments, if EVERY page shares them."""
+            heads = {tuple(u.strip("/").split("/")[:depth]) for u in urls}
+            if len(heads) != 1:
+                return ""
+            head = next(iter(heads))
+            if len(head) < depth or not all(head):
+                return ""
+            return "/" + "/".join(head) + "/"
+
+        def pick(urls: list) -> str:
+            # prefer the shallowest shared prefix whose last segment reads
+            # like a language code -- that also catches Polylang leaving
+            # the segment unrewritten as '/language/de/'
+            for depth in (1, 2):
+                pre = common_prefix(urls, depth)
+                if pre and LANG_SEGMENT_RE.fullmatch(pre.strip("/")
+                                                     .split("/")[-1]):
+                    return pre
+            return common_prefix(urls, 1) or "/"
+
+        prefixes = {lang: pick(urls) for lang, urls in paths.items()}
+        roots = [lang for lang, pre in prefixes.items() if pre == "/"]
+        if len(set(prefixes.values())) != len(prefixes) or len(roots) > 1:
+            self.warnings.append(
+                f"the site has more than one language "
+                f"({', '.join(sorted(paths))}) but no clean one-language-"
+                f"per-path layout could be derived from the URLs -- "
+                f"language-aware output (search, 404) stays single-language")
+            return {}
+        return dict(sorted(prefixes.items(), key=lambda kv: (kv[1] != "/",
+                                                             kv[0])))
 
     def _warn_runtime_negotiation(self) -> None:
         """Vary: Accept-Language / Cookie means the origin serves a
@@ -1922,6 +1982,25 @@ class Exporter:
             html_tag = soup.find("html")
             if html_tag is not None:
                 rec.lang = (html_tag.get("lang") or "").strip()
+            # translation set, for the generated sitemap's hreflang
+            # annotations. Normalized like canonical_target(): this block
+            # runs BEFORE rewriting, so the hrefs are still origin-absolute
+            for alt in soup.find_all("link", href=True):
+                rel = alt.get("rel") or []
+                if isinstance(rel, str):
+                    rel = rel.split()
+                if "alternate" not in {r.lower() for r in rel}:
+                    continue
+                tag = (alt.get("hreflang") or "").strip()
+                if not tag:
+                    continue
+                href = alt["href"].strip()
+                if not self.is_internal(href):
+                    continue
+                target = self.normalize_page_url(self.to_base_host(href),
+                                                 record_skips=False)
+                if target:
+                    rec.alternates.setdefault(tag, target)
 
         # write file
         target = save_as or self.local_path_for(page_url, is_page=True)
@@ -2334,43 +2413,75 @@ class Exporter:
     # ----------------------------------------------------------------------
 
     def capture_404(self) -> None:
-        token = "".join(random.choices(string.ascii_lowercase + string.digits, k=18))
-        probe = f"{self.scheme}://{self.host}/{TOOL_NAME}-404-probe-{token}/"
+        """Save the origin's themed 404 page -- one per language subtree
+        on a site that puts one language per path, so a visitor who
+        mistypes a French URL gets the French 404."""
+        prefixes = ["/"] + [p for p in self.language_prefixes().values()
+                            if p != "/"]
+        saved = []
+        for prefix in prefixes:
+            path = self._capture_404_at(prefix)
+            if path:
+                saved.append(path)
+        self.error_pages = saved
+        if saved:
+            self.say("[extras] 404 page saved as "
+                     + ", ".join(p.lstrip("/") for p in saved))
+
+    def _capture_404_at(self, prefix: str) -> str:
+        """Probe one subtree; returns the written path ('' on failure).
+        Only the root probe reports soft-404s and HTTP surprises -- a
+        language subtree that behaves differently is a curiosity, not a
+        finding worth a second warning about the same site."""
+        root = prefix == "/"
+        token = "".join(random.choices(string.ascii_lowercase + string.digits,
+                                       k=18))
+        out_path = f"{prefix}404.html"
+        probe = (f"{self.scheme}://{self.host}{prefix}"
+                 f"{TOOL_NAME}-404-probe-{token}/")
         try:
             resp = self.fetch(probe)
         except requests.RequestException as exc:
-            self.warnings.append(f"404 probe failed: {exc}")
-            return
+            if root:
+                self.warnings.append(f"404 probe failed: {exc}")
+            return ""
         if resp.status_code == 404:
-            if "html" in (resp.headers.get("Content-Type") or ""):
-                # parse it too, so the 404 page's own assets are exported --
-                # the crawl is already over, so fetch them right here
-                # (bounded mini-BFS for assets referenced by those assets)
-                _, assets = self.parse_and_save_html(
-                    f"{self.scheme}://{self.host}/404.html", resp.content,
-                    rec=None, save_as=self.public_dir / "404.html")
-                pending = [a for a in assets if a not in self.asset_urls_seen]
-                for _ in range(3):
-                    if not pending:
-                        break
-                    nxt: list[str] = []
-                    for a in pending:
-                        if a in self.asset_urls_seen:
-                            continue
-                        self.asset_urls_seen.add(a)
-                        _, more = self.process_asset(a)
-                        nxt.extend(more)
-                    pending = [a for a in nxt if a not in self.asset_urls_seen]
-                self.say("[extras] 404 page saved as 404.html")
-        elif resp.ok:
-            self.soft_404 = True
-            self.warnings.append(
-                "Site answers HTTP 200 for a nonsense URL (soft 404) -- "
-                "no 404.html captured; check the theme/SEO setup.")
-        else:
+            if "html" not in (resp.headers.get("Content-Type") or ""):
+                return ""
+            # parse it too, so the 404 page's own assets are exported --
+            # the crawl is already over, so fetch them right here
+            # (bounded mini-BFS for assets referenced by those assets)
+            target = self.local_path_for(
+                f"{self.scheme}://{self.host}{out_path}", is_page=False)
+            if target is None:
+                return ""
+            _, assets = self.parse_and_save_html(
+                f"{self.scheme}://{self.host}{out_path}", resp.content,
+                rec=None, save_as=target)
+            pending = [a for a in assets if a not in self.asset_urls_seen]
+            for _ in range(3):
+                if not pending:
+                    break
+                nxt: list[str] = []
+                for a in pending:
+                    if a in self.asset_urls_seen:
+                        continue
+                    self.asset_urls_seen.add(a)
+                    _, more = self.process_asset(a)
+                    nxt.extend(more)
+                pending = [a for a in nxt if a not in self.asset_urls_seen]
+            return out_path
+        if resp.ok:
+            if root:
+                self.soft_404 = True
+                self.warnings.append(
+                    "Site answers HTTP 200 for a nonsense URL (soft 404) -- "
+                    "no 404.html captured; check the theme/SEO setup.")
+        elif root:
             self.warnings.append(
                 f"404 probe answered HTTP {resp.status_code} -- "
                 f"no themed 404.html captured.")
+        return ""
 
     def capture_favicon(self) -> None:
         url = f"{self.scheme}://{self.host}/favicon.ico"
@@ -2450,6 +2561,7 @@ class Exporter:
         sitemaps may list dropped query URLs, noindexed or redirected pages
         -- this one is truthful about what the mirror actually serves."""
         entries: dict[str, str] = {}            # save_url -> lastmod ISO date
+        alternates: dict = {}                   # save_url -> {hreflang: url}
         excluded_noindex = excluded_canonical = 0
         excluded_redirects = excluded_linked = excluded_artifacts = 0
         for p in self.pages:
@@ -2484,6 +2596,8 @@ class Exporter:
                     pass
             if sm_url not in entries or (lastmod and not entries[sm_url]):
                 entries[sm_url] = lastmod
+            if p.alternates:
+                alternates.setdefault(sm_url, {}).update(p.alternates)
 
         if not entries:
             self.warnings.append(
@@ -2494,13 +2608,29 @@ class Exporter:
             return (s.replace("&", "&amp;").replace("<", "&lt;")
                      .replace(">", "&gt;"))
 
+        def attr_escape(s: str) -> str:      # xml_escape is for element text
+            return xml_escape(s).replace('"', "&quot;")
+
         prefix = self._loc_prefix()
+        # only annotate translations the sitemap itself lists -- pointing
+        # hreflang at a page excluded as noindex/artifact is an SEO bug
+        alt_pairs = {url: {tag: target for tag, target in alts.items()
+                           if target in entries}
+                     for url, alts in alternates.items()}
+        has_alts = any(alt_pairs.values())
         lines = ['<?xml version="1.0" encoding="UTF-8"?>',
-                 '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">']
+                 '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"'
+                 + ('\n        xmlns:xhtml="http://www.w3.org/1999/xhtml">'
+                    if has_alts else ">")]
         for url in sorted(entries):
             lines.append("  <url>")
             lines.append(f"    <loc>{xml_escape(prefix + urlsplit(url).path)}"
                          "</loc>")
+            for tag, target in sorted(alt_pairs.get(url, {}).items()):
+                href = attr_escape(prefix + urlsplit(target).path)
+                lines.append(f'    <xhtml:link rel="alternate" '
+                             f'hreflang="{attr_escape(tag)}" '
+                             f'href="{href}"/>')
             if entries[url]:
                 lines.append(f"    <lastmod>{entries[url]}</lastmod>")
             lines.append("  </url>")
@@ -2517,6 +2647,7 @@ class Exporter:
             "excluded_link_discovered": excluded_linked,
             "excluded_artifacts": excluded_artifacts,
             "redirected_source_urls_not_listed": excluded_redirects,
+            "hreflang_annotated_urls": sum(1 for a in alt_pairs.values() if a),
         }
         extras = [f"{n} {label} excluded"
                   for n, label in ((excluded_noindex, "noindex"),
@@ -2833,18 +2964,28 @@ class Exporter:
             try:
                 root = ET.fromstring(
                     (self.public_dir / "sitemap.xml").read_bytes())
-            except (OSError, ET.ParseError):
+            except (OSError, ET.ParseError) as exc:
                 root = None
+                # do not swallow this: an unparsable sitemap would silently
+                # skip the whole cross-check below
+                self.warnings.append(
+                    f"generated sitemap.xml could not be re-read for "
+                    f"verification ({exc.__class__.__name__})")
             if root is not None:
                 for u in root:
-                    loc = next((c.text for c in u
-                                if local_name(c.tag) == "loc"), None)
-                    if not loc:
-                        continue
-                    path = urlsplit(loc.strip()).path or "/"
-                    if not exists_local(path):
-                        self.verify_missing.append(
-                            {"file": "sitemap.xml (generated)", "ref": path})
+                    refs = [c.text for c in u if local_name(c.tag) == "loc"]
+                    # hreflang alternates must resolve too -- a translation
+                    # set pointing at a missing page is an SEO error
+                    refs += [c.get("href") for c in u
+                             if local_name(c.tag) == "link" and c.get("href")]
+                    for ref in refs:
+                        if not ref:
+                            continue
+                        path = urlsplit(ref.strip()).path or "/"
+                        if not exists_local(path):
+                            self.verify_missing.append(
+                                {"file": "sitemap.xml (generated)",
+                                 "ref": path})
 
         # --target-domain promises NO origin reference survives -- that
         # includes robots.txt and any kept origin sitemaps, which the
@@ -3012,6 +3153,27 @@ class Exporter:
     # indexable 200
     location = /404.html { internal; }""" if has_404 else
                       "# no themed 404.html was captured (see report)")
+        # One themed 404 per language subtree. A '^~' prefix location wins
+        # over the regex asset block, so the asset handling is repeated
+        # inside it -- otherwise files under /fr/ would lose their cache
+        # headers. add_header is all-or-nothing per level, hence hdr_lines
+        # again in the nested block.
+        lang_404 = [p for p in self.error_pages if p != "/404.html"]
+        lang_error_pages = "\n".join(
+            f"""
+    location ^~ {p.rsplit("404.html", 1)[0]} {{
+        error_page 404 {p};
+        location = {p} {{ internal; }}
+        location ~* \\.(css|js|mjs|png|jpe?g|gif|svg|webp|avif|ico|woff2?|ttf|otf)$ {{
+            expires 30d;
+            add_header Cache-Control "public";
+{asset_hdrs}
+        }}
+        if (-d $request_filename) {{
+            rewrite ^(.*[^/])$ $1/ permanent;
+        }}
+        try_files $uri $uri/ =404;
+    }}""" for p in lang_404)
         if not has_404:
             self.warnings.append(
                 "no 404.html in the export -- the nginx/Apache configs fall "
@@ -3060,7 +3222,7 @@ server {{
 {self._sub_filter_lines()}
 
     {error_page}
-
+{lang_error_pages}
     include /etc/nginx/conf.d/redirects.inc;
 
     location / {{
@@ -3138,12 +3300,23 @@ COPY public/ /usr/share/nginx/html/
                          "</IfModule>"]
         (self.public_dir / ".htaccess").write_text(
             "\n".join(htaccess) + "\n", encoding="utf-8")
+        # a per-language 404 needs its own ErrorDocument, and Apache reads
+        # that from the .htaccess of the directory it applies to (needs
+        # AllowOverride FileInfo). Netlify needs nothing: a 404.html inside
+        # a directory is served there automatically.
+        for page in lang_404:
+            sub = self.public_dir / page.strip("/").rsplit("/", 1)[0]
+            if sub.is_dir():
+                (sub / ".htaccess").write_text(
+                    f"# generated -- themed 404 for this language subtree\n"
+                    f"ErrorDocument 404 {page}\n", encoding="utf-8")
 
         self.deploy_info = {
             "nginx_sub_filter_hosts": self._sub_filter_hosts(),
             "redirects_301": len(redirect_rules),
             "netlify_redirects": "public/_redirects",
             "apache_htaccess": "public/.htaccess",
+            "error_pages": list(self.error_pages),
             "staging_noindex_header": self.cfg.staging,
         }
 
@@ -3328,6 +3501,7 @@ esac
                 "pages_without_meta_description": [p.url for p in no_desc],
                 "pages_without_viewport_meta": [p.url for p in no_viewport],
                 "languages": self.language_counts(),
+                "language_prefixes": self.language_prefixes(),
                 "runtime_negotiated_pages": sorted(self.negotiated_pages),
                 "folded_internal_hosts": dict(sorted(
                     self.folded_hosts.items())),

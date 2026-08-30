@@ -1,5 +1,47 @@
 # Changelog
 
+## 2.11.0 (2026-08-30)
+
+Multilingual step 2: the language-shaped output is now actually per
+language. (Step 1 in 2.10.0 stopped the silent failures.)
+
+### Added
+- **`Exporter.language_prefixes()`** derives the site's layout from the
+  URLs: each language's shared path prefix, the default language at `/`.
+  Handles both `/de/` + `/en/` and Polylang's unrewritten
+  `/language/de/`; refuses to guess (and says so) when two languages
+  share a prefix. Reported as `seo.language_prefixes`.
+- **The site search is per language.** One results page per language,
+  each harvested from *that* language's own `/xx/?s=` endpoint, so it
+  carries its own chrome, heading, `<title>` pattern and "nothing found"
+  block. Every page's search form, JSON-LD `SearchAction` and `?s=`
+  redirect point at the results page of its own language, chosen from
+  the page's `<html lang>`. The shared index tags every document with
+  its language and a results page only offers its own — as Polylang and
+  WPML filter the live search. The probe budget is split across the
+  languages, so a multilingual export costs no more live requests than a
+  monolingual one, and each language's probe terms come from its own
+  corpus. Index schema `v3`. A collision on one language's path now
+  stands down only that language.
+- **One themed `404.html` per language subtree** (`/404.html`,
+  `/fr/404.html`), with matching `error_page` blocks in the generated
+  nginx config (including a nested asset block, since a `^~` prefix
+  location outranks the regex one) and a per-directory `ErrorDocument`
+  for Apache. Netlify needs nothing. Listed in `deploy.error_pages`.
+- **`hreflang` in the generated `sitemap.xml`**: new
+  `PageRecord.alternates`, collected from each page's own
+  `<link rel="alternate" hreflang>`, emitted as `xhtml:link` and
+  filtered to URLs the sitemap actually lists. Verification now checks
+  those hrefs too — and no longer swallows a sitemap parse error.
+
+### Fixed
+- Two latent bugs a second real theme surfaced: the results-page heading
+  is now the `<h1>` that actually **echoes the query** (a theme printing
+  three `<h1>` would otherwise have had its site title rewritten), and a
+  localized `<time datetime="2. Juni 2026">` no longer poisons the
+  result order — only an ISO-ish value is used as the sort key, else the
+  page's own JSON-LD date.
+
 ## 2.10.0 (2026-08-30)
 
 Multilingual hardening, step 1: stop the silent failure modes and make

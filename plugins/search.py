@@ -20,10 +20,12 @@ Three pieces:
    the indexable pages and `/search-index.json` is written (root-relative;
    `application/json` is already in the generated nginx `gzip_types`).
 
-2. RESULTS PAGE -- generated at `/search/` (`--search-path` overrides;
-   the page's own wording follows `<html lang>`, the URL does not).
-   Its DESIGN IS HARVESTED FROM THE LIVE SITE: a handful of
-   `GET /?s=<term>` probes (at most PROBE_MAX_REQUESTS, all inside
+2. RESULTS PAGE -- one per language, at `/search/` and, for every
+   language the core found a path prefix for, at `<prefix>search/`
+   (`--search-path` renames the segment). Its DESIGN IS HARVESTED FROM
+   THE LIVE SITE, from THAT language's own endpoint: a handful of
+   `GET <prefix>?s=<term>` probes (the PROBE_MAX_REQUESTS budget is
+   split across the languages, all inside
    run_end) give us the theme's own results skeleton, its result-card
    markup -- turned into a template with `%%X%%` slots -- the per-page
    meta WordPress renders (author, date, excerpt) and the theme's own
@@ -438,6 +440,8 @@ def _wrap(el, before: str, after: str) -> None:
 
 DATE_META = ("article:published_time", "article:modified_time")
 DATE_JSONLD = re.compile(r'"datePublished"\s*:\s*"([^"]{4,40})"')
+# the renderer compares dates as strings, so only an ISO-ish value sorts
+ISO_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
 
 
 def page_date(soup) -> str:
@@ -577,8 +581,11 @@ RENDERER_JS = r'''
     return 6;
   }
   function pubdate(d) {
-    var s = d[4] || {};
-    return s.i || "";                    // ISO post_date, "" sorts last
+    // post_date, compared as a string -- so ONLY an ISO-ish value sorts
+    // correctly. Themes that put a localized date in <time datetime>
+    // ("2. Juni 2026") must not poison the order; "" sorts last.
+    var s = d[4] || {}, v = s.i || "";
+    return /^\d{4}-\d{2}-\d{2}/.test(v) ? v : "";
   }
   function clip(s, n) {                  // WP-style auto excerpt
     s = String(s);
@@ -661,6 +668,9 @@ RENDERER_JS = r'''
     if (!ts.length) { ts = [sentence]; }
     for (i = 0; i < docs.length; i++) {
       d = docs[i];
+      // one index serves every language; a results page only offers its
+      // own, exactly as Polylang/WPML filter the live search
+      if (C.lang && (d[4] || {}).l && (d[4] || {}).l !== C.lang) { continue; }
       if (matches(d, ts)) {
         hits.push([rank(d, ts, sentence), pubdate(d), d]);
       }
@@ -756,9 +766,10 @@ class Search(Plugin):
         group.add_argument(
             "--search-path", default="", metavar="PATH",
             help="path of the generated search-results page (default "
-                 "/search/, whatever the site language -- the page's own "
-                 "wording still follows <html lang>). Must start and end "
-                 "with '/'")
+                 "/search/). On a multilingual site this is the DEFAULT "
+                 "language's page; every other language gets the same "
+                 "last segment under its own prefix (/fr/search/). Must "
+                 "start and end with '/'")
         group.add_argument(
             "--search-max-chars", type=int, default=2000, metavar="N",
             help="per-page text cap in the search index (default 2000; "
@@ -803,7 +814,7 @@ class Search(Plugin):
             "pages_without_text": 0, "index_bytes": 0, "index_inlined": False,
             "page_written": False, "page_source": "", "forms_rewritten": 0,
             "pages_wired": 0, "jsonld_search_actions_fixed": 0,
-            "collision": None,
+            "collision": None, "pages": {},   # language -> {path, source}
             "harvest": {"used": False, "reason": "", "probe_requests": 0,
                         "terms": [], "cards": 0, "pages_with_slots": 0,
                         "template": False, "empty_state": False,
@@ -859,62 +870,106 @@ class Search(Plugin):
 
     # -- phase 2: decide (once, after the crawl) -----------------------------
     def settings(self) -> dict:
-        """Language, path and site name -- resolved once, after the crawl,
-        because the wording follows the pages' <html lang>. Also
-        settles the collision question BEFORE any page is wired: if the
-        origin already serves the search path or the index path, the whole
-        feature stands down instead of pointing the forms at a page that
-        cannot answer them."""
+        """The DEFAULT language's configuration, with one entry per
+        language under ["langs"] -- resolved once, after the crawl,
+        because the wording follows the pages' <html lang> and the paths
+        follow the language layout the core derived from the URLs.
+
+        Each entry also settles its own collision question BEFORE any page
+        is wired: if the origin already serves that language's search path,
+        only that language stands down instead of pointing its forms at a
+        page that cannot answer them."""
         if self._settings is not None:
             return self._settings
         indexed = self._selected_pages()
-        langs: dict = {}
-        sites: dict = {}
-        home_lang = ""
-        for url, _rec in indexed:
-            entry = self.docs.get(url) or {}
-            lang = (entry.get("lang") or "").lower()
-            if lang:
-                langs[lang] = langs.get(lang, 0) + 1
-                if urlsplit(url).path == "/":
-                    home_lang = lang
-            site = entry.get("site") or ""
-            if site:
-                sites[site] = sites.get(site, 0) + 1
-        if langs:
-            top = max(langs.values())
-            winners = sorted(k for k, v in langs.items() if v == top)
-            lang = home_lang if home_lang in winners else winners[0]
-            if len({k.split("-")[0] for k in langs}) > 1:
-                self.exp.warnings.append(
-                    f"static search: the site is multilingual "
-                    f"({', '.join(sorted(langs))}) but the exported search "
-                    f"is not: ONE results page is generated, with the "
-                    f"wording, title pattern and harvested chrome of "
-                    f"{lang!r}, and its index holds every language at once "
-                    f"-- a visitor searching in another language sees "
-                    f"{lang!r} labels and can match foreign-language "
-                    f"pages. Use --no-search to leave the search alone")
-        else:
-            lang = ""
-        path = DEFAULT_PATH
+        base = DEFAULT_PATH
         configured = (self.exp.cfg.search_path or "").strip()
         if configured:
             try:
-                path = validate_search_path(configured)
+                base = validate_search_path(configured)
             except ValueError as exc:
                 # programmatic Config(...) bypasses the CLI validation
                 self.exp.warnings.append(
                     f"static search: ignoring invalid search_path "
-                    f"{configured!r} ({exc}) -- using {path}")
-        site = max(sorted(sites), key=sites.get) if sites else ""
-        suffix = title_suffix(
-            [rec.title for _u, rec in indexed if rec.title], site)
-        self._settings = {"lang": lang, "path": path, "site": site,
-                          "suffix": suffix,
-                          "de": lang.lower().startswith("de"),
-                          "collision": self._collision(path)}
+                    f"{configured!r} ({exc}) -- using {base}")
+        prefixes = self.exp.language_prefixes()
+        groups: dict = {}
+        if prefixes:
+            # longest prefix first, so '/' only collects what no language
+            # subtree claims
+            order = sorted(prefixes.items(), key=lambda kv: -len(kv[1]))
+            for url, rec in indexed:
+                path = urlsplit(url).path or "/"
+                for lang, prefix in order:
+                    if path.startswith(prefix):
+                        groups.setdefault(lang, []).append((url, rec))
+                        break
+        if len(groups) < 2:
+            prefixes, groups = {}, {}
+        if not groups:                       # single-language site
+            groups = {self._majority_lang(indexed): indexed}
+            prefixes = {next(iter(groups)): "/"}
+        langs: dict = {}
+        segment = base.strip("/").rsplit("/", 1)[-1] or "search"
+        for lang, pages in groups.items():
+            prefix = prefixes[lang]
+            path = base if prefix == "/" else f"{prefix}{segment}/"
+            sites: dict = {}
+            for url, _rec in pages:
+                site = (self.docs.get(url) or {}).get("site") or ""
+                if site:
+                    sites[site] = sites.get(site, 0) + 1
+            site = max(sorted(sites), key=sites.get) if sites else ""
+            langs[lang] = {
+                "lang": lang, "prefix": prefix, "path": path, "site": site,
+                "suffix": title_suffix([r.title for _u, r in pages if r.title],
+                                       site),
+                "de": lang.lower().startswith("de"),
+                "collision": self._collision(path),
+                "pages": pages,
+            }
+        default = langs.get(next((k for k, v in langs.items()
+                                  if v["prefix"] == "/"), None)) \
+            or next(iter(langs.values()))
+        self._settings = dict(default, langs=langs)
         return self._settings
+
+    def _lang_settings_for(self, soup) -> dict:
+        """The language entry a given page belongs to, read from its own
+        <html lang>; the default language when it says nothing we know."""
+        cfg = self.settings()
+        html = soup.find("html")
+        tag = ((html.get("lang") or "") if html is not None else "").lower()
+        primary = tag.replace("_", "-").split("-")[0]
+        return cfg["langs"].get(tag) or cfg["langs"].get(primary) or cfg
+
+    def _majority_lang(self, indexed: list) -> str:
+        """The site's language when no per-language layout was derived:
+        the most frequent <html lang>, homepage breaking a tie."""
+        counts: dict = {}
+        home = ""
+        for url, rec in indexed:
+            lang = (rec.lang or (self.docs.get(url) or {}).get("lang")
+                    or "").lower()
+            if not lang:
+                continue
+            counts[lang] = counts.get(lang, 0) + 1
+            if (urlsplit(url).path or "/") == "/":
+                home = lang
+        if not counts:
+            return ""
+        top = max(counts.values())
+        winners = sorted(k for k, v in counts.items() if v == top)
+        lang = home if home in winners else winners[0]
+        if len({k.split("-")[0] for k in counts}) > 1:
+            self.exp.warnings.append(
+                f"static search: the site is multilingual "
+                f"({', '.join(sorted(counts))}) but its languages could not "
+                f"be told apart by URL, so ONE results page is generated "
+                f"with the wording of {lang!r} and one index holding every "
+                f"language at once. Use --no-search to leave the search "
+                f"alone")
+        return lang
 
     def _collision(self, path: str) -> str | None:
         """The origin's own content always wins. Overwriting it would break
@@ -975,10 +1030,14 @@ class Search(Plugin):
         built from the site language, which is only known once the crawl
         is over. postprocess_html() iterates exactly the pages the
         core re-serialized (every real page plus 404.html, no redirect
-        stubs) and is already gated on cfg.rewrite."""
+        stubs) and is already gated on cfg.rewrite.
+
+        The hook gets no URL, so a page's language comes from its own
+        <html lang> -- that is what decides WHICH results page its search
+        box, its JSON-LD SearchAction and its ?s= redirect point at."""
         if not self.enabled:
             return False
-        cfg = self.settings()
+        cfg = self._lang_settings_for(soup)
         if cfg["collision"]:
             return False        # no results page will exist -- wire nothing
         path = cfg["path"]
@@ -1085,34 +1144,69 @@ class Search(Plugin):
         self.stats["path"] = cfg["path"]
         self.stats["lang"] = cfg["lang"]
         self.stats["ui_language"] = "de" if cfg["de"] else "en"
-        if cfg["collision"]:
-            self.stats["collision"] = cfg["collision"]
-            return              # warned in settings(); NO probing either
-        self._path_hint = cfg["path"]
-        # 1) harvest the live design (the ONLY place probes happen, so
-        #    --no-rewrite / --no-search / a collision cost zero requests)
-        harvest = None
-        if self.exp.cfg.search_harvest:
-            harvest = self._harvest(cfg)
-            if harvest is None and not self.stats["harvest"]["reason"]:
-                self.stats["harvest"]["reason"] = "no usable probe response"
-        else:
-            self.stats["harvest"]["reason"] = "--no-search-harvest"
-        # 2) index (harvested card slots ride along in the docs)
-        docs, data = self._build_index(cfg, harvest)
+        self.stats["languages"] = {k: v["path"] for k, v in
+                                   cfg["langs"].items()}
+        usable = [c for c in cfg["langs"].values() if not c["collision"]]
+        if not usable:
+            # every language's path is taken by origin content: the forms
+            # were never wired, so writing an index nobody reads is litter
+            self.stats["collision"] = cfg["collision"] or next(
+                c["collision"] for c in cfg["langs"].values())
+            return
+        # one probe budget for the whole export, split across the
+        # languages: a multilingual site must not cost more requests
+        n = max(1, len(usable))
+        per_lang = max(4, PROBE_MAX_REQUESTS // n)
+        # 1) harvest the live design per language (the ONLY place probes
+        #    happen, so --no-rewrite / --no-search / a collision are free)
+        harvests: dict = {}
+        for lang, lcfg in cfg["langs"].items():
+            if lcfg["collision"]:
+                self.stats["collision"] = lcfg["collision"]
+                continue        # warned in _collision(); no probing either
+            self._path_hint = lcfg["path"]
+            if self.exp.cfg.search_harvest:
+                self._probe_budget = per_lang
+                harvests[lang] = self._harvest(lcfg)
+            else:
+                harvests[lang] = None
+                self.stats["harvest"]["reason"] = "--no-search-harvest"
+        if (self.exp.cfg.search_harvest and not any(harvests.values())
+                and not self.stats["harvest"]["reason"]):
+            self.stats["harvest"]["reason"] = "no usable probe response"
+        # 2) index -- one file for every language, each document tagged
+        #    with its own so a results page can filter to its language
+        docs, data = self._build_index(cfg, harvests)
         self._write_index(data)
-        # 3) results page, 4) the assets only that page references
-        self._write_results_page(cfg, harvest, docs, len(data))
+        # 3) one results page per language, 4) their exclusive assets
+        for lang, lcfg in cfg["langs"].items():
+            if lcfg["collision"]:
+                continue
+            self._path_hint = lcfg["path"]
+            self._write_results_page(lcfg, harvests.get(lang), docs,
+                                     len(data))
         self._download_assets()
 
-    def _build_index(self, cfg: dict, harvest) -> tuple:
+    def _build_index(self, cfg: dict, harvests: dict) -> tuple:
         docs = []
         empty = 0
-        slots = (harvest or {}).get("slots") or {}
+        # every language's harvested card slots, plus which language each
+        # page belongs to -- one index serves all the results pages
+        slots: dict = {}
+        page_lang: dict = {}
+        suffixes: dict = {}
+        for lang, lcfg in cfg["langs"].items():
+            slots.update((harvests.get(lang) or {}).get("slots") or {})
+            suffixes[lang] = lcfg["suffix"]
+            for url, _rec in lcfg["pages"]:
+                page_lang[urlsplit(url).path or "/"] = lang
+        multi = len(cfg["langs"]) > 1
         for url, rec in self._selected_pages():
             entry = self.docs.get(url) or {}
             path = urlsplit(url).path or "/"
-            title = strip_title_suffix(rec.title or "", cfg["suffix"])
+            lang = page_lang.get(path, cfg["lang"])
+            title = strip_title_suffix(rec.title or "",
+                                       suffixes.get(lang, cfg["suffix"]))
             desc, text = entry.get("desc", ""), entry.get("text", "")
             if not (title or desc or text):
                 empty += 1
@@ -1121,10 +1215,17 @@ class Search(Plugin):
                 empty += 1                  # counted, still indexed
             doc = [path, title, desc, text]
             slot = dict(slots.get(path) or {})
-            if not slot.get("i") and entry.get("date"):
-                # no harvested card: the page's own JSON-LD/OpenGraph date
-                # still lets the results sort like WordPress' post_date
-                slot["i"] = entry["date"]
+            if not ISO_DATE_RE.match(slot.get("i") or ""):
+                # No harvested card, or a theme that puts a LOCALIZED date
+                # in <time datetime> ("2. Juni 2026") -- either way the
+                # page's own JSON-LD/OpenGraph date is what lets the
+                # results sort like WordPress' post_date.
+                page = entry.get("date") or ""
+                slot["i"] = page if ISO_DATE_RE.match(page) else ""
+                if not slot["i"]:
+                    slot.pop("i", None)
+            if multi and lang:
+                slot["l"] = lang            # each page's own language
             if slot:
                 doc.append(slot)            # docs without slots stay 4 long
             docs.append(doc)
@@ -1175,8 +1276,14 @@ class Search(Plugin):
                 {"file": "(static search)", "ref": path,
                  "origin_error": False})
             return
-        self.stats["page_written"] = True
-        self.stats["page_source"] = source
+        self.stats["pages"][cfg["lang"] or "?"] = {"path": path,
+                                                   "source": source}
+        if not self.stats["page_written"] or cfg["prefix"] == "/":
+            # the top-level scalars describe the DEFAULT language's page;
+            # stats["pages"] carries one entry per language
+            self.stats["page_written"] = True
+            self.stats["page_source"] = source
+            self.stats["path"] = path
         h = self.stats["harvest"]
         extra = (f", {h['cards']} cards harvested in "
                  f"{h['probe_requests']} requests" if h["used"] else "")
@@ -1186,9 +1293,17 @@ class Search(Plugin):
     def _clone_skeleton(self, cfg: dict):
         """A themed page skeleton: the exported 404 page first (full theme
         chrome, near-empty content well), else the homepage, else a minimal
-        self-contained page."""
-        for name, source in (("404.html", "404.html"),
-                             ("index.html", "index.html (homepage)")):
+        self-contained page -- each taken from THIS language's subtree
+        first, so a fallback page is never built from another language's
+        chrome."""
+        prefix = (cfg.get("prefix") or "/").strip("/")
+        names = []
+        if prefix:
+            names += [(f"{prefix}/404.html", f"{prefix}/404.html"),
+                      (f"{prefix}/index.html", f"{prefix}/index.html")]
+        names += [("404.html", "404.html"),
+                  ("index.html", "index.html (homepage)")]
+        for name, source in names:
             candidate = self.exp.public_dir / name
             try:
                 if not candidate.is_file():
@@ -1364,7 +1479,8 @@ class Search(Plugin):
                  if s.get("e")]
         inline = index_bytes <= INLINE_MAX_BYTES
         self.stats["index_inlined"] = inline
-        conf = {"de": bool(cfg["de"]), "idx": INDEX_PATH, "max": 50,
+        conf = {"de": bool(cfg["de"]), "lang": cfg.get("lang") or "",
+                "idx": INDEX_PATH, "max": 50,
                 "snip": max(180, min(600, max(snips))) if snips else 300,
                 "sfx": cfg["suffix"], "tpl": h.get("tpl") or "",
                 "cls": h.get("cls") or "", "empty": h.get("empty") or "",
@@ -1426,9 +1542,12 @@ class Search(Plugin):
                 f"design ({reason}) -- the results page uses the exported "
                 f"404 page and built-in markup instead")
 
-    def _search_url(self, term: str) -> str:
-        return (f"{self.exp.scheme}://{self.exp.host}"
-                f"/?s={quote(term, safe='')}")
+    def _search_url(self, term: str, prefix: str = "/") -> str:
+        """The live search endpoint OF ONE LANGUAGE: WordPress serves the
+        translated results (and, with Polylang/WPML, only that language's
+        hits) under the language's own path prefix."""
+        return (f"{self.exp.scheme}://{self.exp.host}{prefix}"
+                f"?s={quote(term, safe='')}")
 
     @staticmethod
     def _echoes(soup, term: str) -> bool:
@@ -1710,7 +1829,10 @@ class Search(Plugin):
         """Skeleton + card template + per-page slots + empty state, taken
         from the live search endpoint. None when nothing usable came back
         (every rung of the caller's ladder still works)."""
-        indexed = self._selected_pages()
+        # only THIS language's pages: its endpoint returns only those, and
+        # probe terms taken from another language would just burn budget
+        indexed = cfg.get("pages") or self._selected_pages()
+        prefix = cfg.get("prefix") or "/"
         paths, texts = {}, {}
         for url, rec in indexed:
             p = urlsplit(url).path or "/"
@@ -1760,7 +1882,7 @@ class Search(Plugin):
             return None
         used_terms.add(rare)
         rare_probe = forms.get(rare, rare)
-        soup = self._probe(self._search_url(rare_probe))
+        soup = self._probe(self._search_url(rare_probe, prefix))
         if soup is None:
             return None                      # _probe already explained why
         if not self._echoes(soup, rare_probe):
@@ -1784,7 +1906,7 @@ class Search(Plugin):
             used_terms.add(folded)
             term = forms.get(folded, folded)
             before = len(h["slots"])
-            url, seen, hops = self._search_url(term), set(), 0
+            url, seen, hops = self._search_url(term, prefix), set(), 0
             while url and hops < PROBE_MAX_PAGES and self._probe_budget > 1:
                 seen.add(url)
                 hops += 1
@@ -1806,14 +1928,18 @@ class Search(Plugin):
         # 3) empty-state probe (same token idiom as capture_404)
         token = "".join(random.choices(string.ascii_lowercase + string.digits,
                                        k=18))
-        soup = self._probe(self._search_url(token))
+        soup = self._probe(self._search_url(token, prefix))
         if soup is not None and self._echoes(soup, token):
             h["empty"] = self._take_empty(soup, cfg, token)
+        # accumulate: on a multilingual site this runs once per language
         st = self.stats["harvest"]
-        st.update(used=True, terms=sorted(used_terms), cards=len(h["slots"]),
-                  pages_with_slots=len(h["slots"]), template=bool(h["tpl"]),
-                  empty_state=bool(h["empty"]),
-                  title_pattern=h["title"] is not None)
+        st["used"] = True
+        st["terms"] = sorted(set(st["terms"]) | used_terms)
+        st["cards"] += len(h["slots"])
+        st["pages_with_slots"] += len(h["slots"])
+        st["template"] = st["template"] or bool(h["tpl"])
+        st["empty_state"] = st["empty_state"] or bool(h["empty"])
+        st["title_pattern"] = st["title_pattern"] or h["title"] is not None
         return h
 
     # -- assembling the harvested page ---------------------------------------
@@ -1886,9 +2012,14 @@ class Search(Plugin):
         """Keep the theme's static prefix ('Suchergebnisse f\u00fcr: ') VERBATIM
         -- that string is the whole point of harvesting -- and leave an
         empty marker the renderer fills with the real query."""
-        h1 = next((c for c in soup.find_all("h1")
+        # A theme may print several <h1> (site name, tagline, page title).
+        # The one to rewrite is the one that ECHOES the query -- only fall
+        # back to "first heading outside the content well" when none does.
+        outside = [c for c in soup.find_all("h1")
                    if root is None or (c is not root
-                                       and root not in c.parents)), None)
+                                       and root not in c.parents)]
+        h1 = next((c for c in outside if term in c.get_text()),
+                  outside[0] if outside else None)
         if h1 is None:
             return
         span = next((s for s in h1.find_all("span")

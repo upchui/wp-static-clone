@@ -153,12 +153,13 @@ For non-Docker nginx, check the module with `nginx -V 2>&1 | grep -o with-http_s
 
 **Supported: one language per URL path on one host** — `/de/…` + `/en/…`, the Polylang and WPML default. The crawl is purely path-based, so every language tree is exported like any other subtree; per-language sitemaps inside a sitemap index are followed, `hreflang` links and `<html lang>` survive untouched, and a `/` → `/de/` redirect produces the usual stub plus a 301 rule in all three deploy formats. `report.txt`/`report.json` list the exported pages per language.
 
-Two things are generated **once, in one language**, and are announced as warnings when the site turns out to be multilingual:
+The language layout is derived from the URLs themselves (each language's shared path prefix, the default language at `/`) and reported as `seo.language_prefixes`. Everything language-shaped follows from it:
 
-- **the site search** — one results page with the chrome and wording of the majority language, and one index holding every language at once (so a search in one language can match pages in another). `--no-search` opts out.
-- **the captured `404.html`** and the `error_page`/`ErrorDocument` rules pointing at it.
+- **The site search is per language.** One results page per language, each harvested from *that* language's own `/xx/?s=` endpoint, so it carries that language's chrome, heading, `<title>` pattern and "nothing found" block. Every page's search form, JSON-LD `SearchAction` and `?s=` redirect point at the results page of **its own** language, chosen from the page's `<html lang>`. One index serves them all, but each document is tagged with its language and a results page only offers its own — exactly as Polylang and WPML filter the live search. The probe budget is split across the languages, so a multilingual export costs no more requests than a monolingual one.
+- **One themed `404.html` per language subtree** (`/404.html`, `/fr/404.html`), with matching `error_page` blocks in the generated nginx config and a per-directory `ErrorDocument` for Apache. Netlify picks up a subdirectory `404.html` by itself.
+- **`hreflang` annotations survive into the generated `/sitemap.xml`** as `xhtml:link` elements, built from the pages' own `<link rel="alternate" hreflang>` and filtered to the URLs the sitemap actually lists (so an annotation never points at a `noindex` or artifact page).
 
-Also lost today: the `xhtml:link hreflang` annotations of the origin sitemaps do not survive into the generated `/sitemap.xml`. `--no-generate-sitemap` keeps the origin sitemap files verbatim, annotations included — the better choice for a multilingual site that relies on them.
+If the languages cannot be told apart by URL, the exporter says so and falls back to single-language behaviour instead of guessing.
 
 **Not supported: one host per language** (`de.example.com` / `example.fr`). Those hosts are either not exported at all, or — with `--internal-host` — folded into the *same* output tree, where the first page written to a path wins and the other language is silently lost. The exporter warns when it folds links from another internal host. Export each language host separately instead.
 

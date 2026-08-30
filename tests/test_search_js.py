@@ -123,11 +123,11 @@ console.log(JSON.stringify(out));
 """
 
 
-def _run(mod, tmp_path, docs, queries):
+def _run(mod, tmp_path, docs, queries, lang=""):
     s = mod.PLUGIN_MODULES["search"]
     rjsmin = __import__("rjsmin")
     cfg = {"de": True, "idx": "/search-index.json", "max": 50, "snip": 180,
-           "sfx": " - Huthansl", "cls": "post",
+           "sfx": " - Huthansl", "cls": "post", "lang": lang,
            # a template whose only job here is to expose the ORDER
            "tpl": '<div data-wpse-path="%%U%%">%%T%%</div>',
            "empty": "<p>nix</p>", "tt": None, "docs": docs}
@@ -160,6 +160,23 @@ def test_ranking_matches_the_live_wordpress_order(mod, tmp_path):
     for query, expected in sorted(LIVE_ORDER.items()):
         assert got[query] == expected, (
             f"{query!r}\n  live:   {expected}\n  static: {got[query]}")
+
+
+def test_a_results_page_only_offers_its_own_language(mod, tmp_path):
+    """One index serves every language; each results page filters to its
+    own, the way Polylang/WPML filter the live search."""
+    docs = [["/malerarbeiten/", "Malerarbeiten", "", "Fassaden streichen",
+             {"t": "Malerarbeiten", "i": "2017-10-05T17:43:55+02:00",
+              "l": "de"}],
+            ["/en/painting/", "Painting", "", "Painting facades",
+             {"t": "Painting", "i": "2018-01-09T09:00:00+01:00", "l": "en"}]]
+    both = _run(mod, tmp_path, docs, ["fassaden", "painting"], lang="")
+    assert both["fassaden"] == ["/malerarbeiten/"]
+    assert both["painting"] == ["/en/painting/"]
+    de = _run(mod, tmp_path, docs, ["painting"], lang="de")
+    assert de["painting"] == []              # English page stays hidden
+    en = _run(mod, tmp_path, docs, ["fassaden", "painting"], lang="en")
+    assert en["fassaden"] == [] and en["painting"] == ["/en/painting/"]
 
 
 def test_ranking_is_stable_without_dates(mod, tmp_path):

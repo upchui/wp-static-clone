@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 TOOL_NAME = "wp-static-export"
-VERSION = "2.10.0"
+VERSION = "2.11.0"
 
 
 @dataclass
@@ -68,6 +68,12 @@ class PageRecord:
     lang: str = ""                   # the page's <html lang> (BCP-47), for
                                      # the report's language breakdown and
                                      # multilingual diagnostics
+    alternates: dict = field(default_factory=dict)
+                                     # hreflang -> normalized internal URL,
+                                     # from the page's own
+                                     # <link rel="alternate" hreflang>:
+                                     # re-emitted as xhtml:link in the
+                                     # generated sitemap.xml
     save_url: str = ""               # canonical URL the content was saved under
                                      # (differs from url for redirect sources)
     is_stub: bool = False            # only a redirect stub was written here

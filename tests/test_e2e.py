@@ -31,10 +31,13 @@ def _make_handler(root: Path):
         def do_GET(self):
             path = self.path.split("?", 1)[0]
             query = parse_qs(urlsplit(self.path).query)
-            if path in ("/", "/page/2/") and query.get("s"):
+            if path in ("/", "/page/2/", "/en/", "/en/page/2/") \
+                    and query.get("s"):
                 # the WordPress search endpoint the search plugin harvests
-                # its results-page design from
-                self._search_results(query["s"][0], path == "/page/2/")
+                # its results-page design from -- one per language, like
+                # Polylang/WPML, each returning only its own pages
+                self._search_results(query["s"][0], "page/2" in path,
+                                     "en" if path.startswith("/en/") else "de")
                 return
             if path in REDIRECTS and "?" not in self.path:
                 self.send_response(301)
@@ -141,16 +144,35 @@ def _make_handler(root: Path):
         # post meta, a paginator, and the query echoed in <title>, the
         # page-title <h1> and the breadcrumb leaf -- everything the
         # search plugin harvests its design from.
-        HITS = [("/", "Fixture Home", "admin", "2021-11-25T11:05:38+01:00",
-                 "25. November 2021", "Startseite mit Fassaden und "
-                 "Vollwärmeschutz."),
-                ("/ueber-uns/", "Über uns", "admin",
-                 "2017-10-05T17:47:25+02:00", "5. Oktober 2017",
-                 "Wir über uns: Vollwärmeschutz seit 1950.")]
+        # one corpus per language: WordPress with Polylang/WPML returns
+        # only the pages of the language whose endpoint was asked
+        HITS = {
+            "de": [("/", "Fixture Home", "admin",
+                    "2021-11-25T11:05:38+01:00", "25. November 2021",
+                    "Startseite mit Fassaden und Vollwärmeschutz."),
+                   ("/ueber-uns/", "Über uns", "admin",
+                    "2017-10-05T17:47:25+02:00", "5. Oktober 2017",
+                    "Wir über uns: Vollwärmeschutz seit 1950.")],
+            "en": [("/en/", "English Home", "admin",
+                    "2019-03-04T10:00:00+01:00", "4 March 2019",
+                    "Facade insulation and painting services."),
+                   ("/en/about/", "About us", "admin",
+                    "2018-01-09T09:00:00+01:00", "9 January 2018",
+                    "A family business insulating facades since 1950.")],
+        }
+        LABELS = {"de": ("de", "Suchergebnisse für: ", "Ergebnisse für",
+                         "Du hast nach %s gesucht - Fixture",
+                         "Nichts gefunden", "Leider konnten wir nichts "
+                         "finden."),
+                  "en": ("en-US", "Search results for: ", "Results for",
+                         "You searched for %s - Fixture",
+                         "Nothing found", "Sorry, nothing matched.")}
 
-        def _search_results(self, term, page2):
+        def _search_results(self, term, page2, lang="de"):
             origin = f"http://{self.headers.get('Host')}"
-            hits = [h for h in self.HITS
+            base = f"{origin}/en" if lang == "en" else origin
+            code, prefix, crumb, title_pat, none_h, none_p = self.LABELS[lang]
+            hits = [h for h in self.HITS[lang]
                     if term.lower() in (h[1] + " " + h[5]).lower()]
             cards = "".join(
                 f'<div class="wf-cell iso-item" data-post-id="{i + 11}" '
@@ -170,30 +192,31 @@ def _make_handler(root: Path):
                 in enumerate(hits))
             q = quote(term)
             body = (
-                f'<!doctype html><html lang="de"><head><meta charset="utf-8">'
-                f"<title>Du hast nach {term} gesucht - Fixture</title>"
-                f'<meta property="og:url" content="{origin}/?s={q}">'
+                f'<!doctype html><html lang="{code}"><head>'
+                f'<meta charset="utf-8">'
+                f"<title>{title_pat % term}</title>"
+                f'<meta property="og:url" content="{base}/?s={q}">'
                 f'<script src="{origin}/wp-includes/js/masonry.min.js">'
                 f"</script></head>"
                 f'<body class="search search-results layout-masonry">'
                 f'<div class="page-title-head hgroup">'
-                f"<h1>Suchergebnisse für: <span>{term}</span></h1></div>"
+                f"<h1>{prefix}<span>{term}</span></h1></div>"
                 f'<div class="page-title-breadcrumbs"><ol class="breadcrumbs">'
-                f'<li><a href="{origin}/"><span itemprop="name">Start</span>'
+                f'<li><a href="{base}/"><span itemprop="name">Start</span>'
                 f'</a></li><li class="current"><span itemprop="name">'
-                f'Ergebnisse für "{term}"</span></li></ol></div>'
+                f'{crumb} "{term}"</span></li></ol></div>'
                 f'<div class="content" id="content" role="main">'
                 + (f'<div class="wf-container iso-container" '
                    f'data-padding="10px" data-cur-page="{2 if page2 else 1}" '
                    f'data-columns="3">{cards}</div>'
-                   f'<div class="paginator"><a href="{origin}/page/2/?s={q}" '
+                   f'<div class="paginator"><a href="{base}/page/2/?s={q}" '
                    f'class="page-numbers next">→</a></div>'
                    if hits else
                    f'<article id="post-0" class="post no-results not-found">'
-                   f'<h1 class="entry-title">Nichts gefunden</h1>'
-                   f"<p>Leider konnten wir nichts finden.</p>"
+                   f'<h1 class="entry-title">{none_h}</h1>'
+                   f"<p>{none_p}</p>"
                    f'<form class="searchform" method="get" '
-                   f'action="{origin}/"><input name="s" type="text" '
+                   f'action="{base}/"><input name="s" type="text" '
                    f'value="{term}"></form></article>')
                 + "</div></body></html>").encode("utf-8")
             self.send_response(200)
@@ -334,7 +357,9 @@ def test_multilingual_and_cookie_safety(export):
     assert 'hreflang="de"' in en and 'hreflang="en"' in en
     # per-language breakdown in the report
     langs = report["seo"]["languages"]
-    assert langs["de"] >= 5 and langs["en"] == 1
+    assert langs["de"] >= 5 and langs["en"] == 2
+    # ... and the layout the language-aware output builds on
+    assert report["seo"]["language_prefixes"] == {"de": "/", "en": "/en/"}
     # the cookie pages: /cookie-lang/ sets pll_language and links to
     # /cookie-check/, which is crawled a round later -- it would answer
     # COOKIE-PINNED if the exporter had kept the cookie
@@ -348,6 +373,69 @@ def test_multilingual_and_cookie_safety(export):
     assert any("Vary: Accept-Language" in w for w in report["warnings"])
     # one host, so nothing was folded
     assert report["seo"]["folded_internal_hosts"] == {}
+
+
+def test_search_is_per_language(export):
+    """One results page per language, each in ITS language, and an index
+    that never offers one language's pages to another's search."""
+    pub, report = export["public"], export["report"]
+    stats = report["seo"]["search"]
+    assert stats["pages"] == {
+        "de": {"path": "/search/", "source": "live search page"},
+        "en": {"path": "/en/search/", "source": "live search page"}}
+    de = BeautifulSoup((pub / "search" / "index.html").read_text("utf-8"),
+                       "html.parser")
+    en = BeautifulSoup(
+        (pub / "en" / "search" / "index.html").read_text("utf-8"),
+        "html.parser")
+    # each page carries the chrome, heading and language of ITS language
+    assert de.html["lang"] == "de" and en.html["lang"] == "en-US"
+    assert de.select_one(".page-title-head h1").get_text() \
+        .startswith("Suchergebnisse für:")
+    assert en.select_one(".page-title-head h1").get_text() \
+        .startswith("Search results for:")
+    assert de.title.get_text() == "Suche" and en.title.get_text() == "Search"
+    # ... and tells the renderer which language it may show
+    for soup, want in ((de, "de"), (en, "en")):
+        conf = soup.find("script",
+                         attrs={"data-wpse-search": "renderer"}).string
+        assert f'"lang":"{want}"' in conf.replace(" ", "")
+    # the shared index tags every document with its own language
+    index = json.loads((pub / "search-index.json").read_text("utf-8"))
+    by_lang = {d[0]: (d[4] or {}).get("l") for d in index["docs"]
+               if len(d) > 4}
+    assert by_lang["/"] == "de" and by_lang["/ueber-uns/"] == "de"
+    assert by_lang["/en/"] == "en" and by_lang["/en/about/"] == "en"
+    # every page's ?s= redirect points at the results page of ITS language
+    snippet = BeautifulSoup(
+        (pub / "en" / "index.html").read_text("utf-8"), "html.parser").find(
+            "script", attrs={"data-wpse-search": "redirect"}).string
+    assert '"/en/search/"' in snippet
+    home = BeautifulSoup((pub / "index.html").read_text("utf-8"),
+                         "html.parser")
+    assert '"/search/"' in home.find(
+        "script", attrs={"data-wpse-search": "redirect"}).string
+    assert home.find("form")["action"] == "/search/"
+
+
+def test_hreflang_and_per_language_404(export):
+    pub, report = export["public"], export["report"]
+    xml = (pub / "sitemap.xml").read_text(encoding="utf-8")
+    assert 'xmlns:xhtml="http://www.w3.org/1999/xhtml"' in xml
+    assert 'hreflang="en"' in xml and 'hreflang="de"' in xml
+    assert report["sitemap"]["hreflang_annotated_urls"] >= 2
+    # an alternate must never point at a page the sitemap excludes
+    assert "/geheim/" not in xml
+    # one themed 404 per language, and the deploy configs know about it
+    assert (pub / "404.html").is_file()
+    assert (pub / "en" / "404.html").is_file()
+    assert report["deploy"]["error_pages"] == ["/404.html", "/en/404.html"]
+    conf = (export["out"] / "nginx.conf").read_text(encoding="utf-8")
+    assert "error_page 404 /404.html;" in conf
+    assert "location ^~ /en/ {" in conf and "error_page 404 /en/404.html;" \
+        in conf
+    assert ((pub / "en" / ".htaccess").read_text(encoding="utf-8")
+            .strip().endswith("ErrorDocument 404 /en/404.html"))
 
 
 def test_artifact_pages_excluded_but_exported(export):

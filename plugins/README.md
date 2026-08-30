@@ -202,7 +202,12 @@ pieces plugins actually use:
   `mobile` (mobile_check) and `artifact` (wordpress). The core reads
   them: `artifact` makes `exp.index_exclusion(p)` drop the page from
   `sitemap.xml` **and** the site search, which is the one classifier
-  both outputs consult, so they can never disagree.
+  both outputs consult, so they can never disagree. Core-written fields
+  worth knowing: `lang` (the page's `<html lang>`) and `alternates`
+  (its `hreflang` set), which feed `exp.language_counts()`,
+  `exp.language_prefixes()` — the language→path-prefix map every
+  language-aware feature builds on — and the sitemap's `xhtml:link`
+  annotations.
 * `exp.cfg` — the run's `Config`. The core fields live in
   [`config.py`](../config.py) next to the script (importable as
   `wps_config`); options a plugin owns are declared IN THE PLUGIN via
